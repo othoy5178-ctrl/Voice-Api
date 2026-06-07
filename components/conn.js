@@ -6,7 +6,7 @@ mongoose.set('strictQuery', false);
 
 async function checkConnection() {
 
-  const mongoURI = process.env.MONGO_URI;
+  const mongoURI = process.env.MONGO_URI || process.env.MONGODB_URI;
 
   try {
    await mongoose.connect(mongoURI);
