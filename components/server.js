@@ -57,6 +57,11 @@ io.on('connection', (socket) => {
       profilePic,
       message: `${name} entered the room.`
     });
+    const currentRoomSlots = roomSlotsDatabase[roomId] || defaultSlots; 
+    
+    // Send it back only to this specific socket connection
+    socket.emit('initialize_room_slots', currentRoomSlots);
+
   });
 
   // 2. EVENT: Change/Sit on Mic Slot
