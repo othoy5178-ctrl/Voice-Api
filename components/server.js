@@ -37,34 +37,68 @@ const io = new Server(server, {
   }
 });
 
+// 👇 HELPER: Generates 25 empty slots matching your frontend blueprint structure
+const createCleanSlotsBlueprint = () => Array.from({ length: 25 }, (_, i) => ({
+  id: i + 1,
+  locked: i === 3 || i === 12 || i === 19, // Keeps seats 4, 13, and 20 locked
+  uid: null,
+  username: `${i + 1}`,
+  avatar: null,
+  isMuted: false
+}));
+
 io.on('connection', (socket) => {
   console.log(`User connected to socket cluster: ${socket.id}`);
 
   // 1. EVENT: Join Room
-  socket.on('join_audio_room', ({ roomId, userId, name, profilePic }) => {
-    socket.join(roomId);
+  socket.on('join_audio_room', async ({ roomId, userId, name, profilePic }) => {
+    try {
+      socket.join(roomId);
 
-    socket.roomId = roomId;
-    socket.userId = userId;
-    socket.userName = name;
+      socket.roomId = roomId;
+      socket.userId = userId;
+      socket.userName = name;
 
-    console.log(`${name} joined real-time room channel: ${roomId}`);
+      console.log(`${name} joined real-time room channel: ${roomId}`);
 
-    // Notify everyone else in the room dynamically
-    socket.to(roomId).emit('user_joined_channel', {
-      userId,
-      name,
-      profilePic,
-      message: `${name} entered the room.`
-    });
-    const currentRoomSlots = roomSlotsDatabase[roomId] || defaultSlots; 
-    
-    // Send it back only to this specific socket connection
-    socket.emit('initialize_room_slots', currentRoomSlots);
+      // Notify everyone else in the room dynamically
+      socket.to(roomId).emit('user_joined_channel', {
+        userId,
+        name,
+        profilePic,
+        message: `${name} entered the room.`
+      });
 
+      // 👇 FIXES THE CRASH: Fetch current slots status directly from MongoDB safely!
+      const roomDoc = await AudioRoom.findById(roomId).populate('speakers.userId', 'name profilePic');
+      
+      // Initialize an empty layout structure
+      let completeLayoutMatrix = createCleanSlotsBlueprint();
+
+      if (roomDoc && roomDoc.speakers) {
+        // Map the MongoDB active speakers into their designated slot indexes
+        roomDoc.speakers.forEach(speaker => {
+          const index = speaker.slotIndex;
+          if (index >= 0 && index < 25) {
+            completeLayoutMatrix[index] = {
+              ...completeLayoutMatrix[index],
+              uid: speaker.numericUid || null,
+              username: speaker.userId?.name || "Broadcaster",
+              avatar: speaker.userId?.profilePic || null,
+              isMuted: speaker.isMuted || false
+            };
+          }
+        });
+      }
+
+      // Send the synchronized blueprint back to the specific user connection instantly
+      socket.emit('initialize_room_slots', completeLayoutMatrix);
+
+    } catch (err) {
+      console.log("Error inside join initialization workflow logic: ", err);
+    }
   });
 
-  // 2. EVENT: Change/Sit on Mic Slot
   // 2. EVENT: Change/Sit on Mic Slot or Toggle Mute Status
   socket.on('request_slot_change', async ({ roomId, userId, name, profilePic, targetSlotIndex, numericUid, isMuted }) => {
     try {
@@ -103,7 +137,7 @@ io.on('connection', (socket) => {
           userId,
           username: name,
           avatar: profilePic,
-          isMuted: isMuted || false // 👈 CRITICAL: Emits real-time state change status to all devices
+          isMuted: isMuted || false // Emits real-time state change status to all devices
         }
       });
 
@@ -113,12 +147,12 @@ io.on('connection', (socket) => {
     }
   });
 
+  // 3. EVENT: Chat Messages
   socket.on('send_message', ({ roomId, senderName, text, userId }) => {
     console.log(`[Chat] Message from ${senderName} in room ${roomId}: ${text}`);
 
-    // Broadcast the message to EVERYONE in the room (including the sender)
     io.to(roomId).emit('receive_message', {
-      id: Date.now().toString() + Math.random().toString(), // Added random modifier to make ID 100% unique
+      id: Date.now().toString() + Math.random().toString(), 
       type: 'user',
       sender: senderName,
       text: text,
@@ -126,32 +160,32 @@ io.on('connection', (socket) => {
     });
   });
 
-socket.on('send_gift', ({ roomId, senderName, gift, giftName, avatar, userId, quantity }) => {
+  // 4. EVENT: Gift Broadcasts
+  socket.on('send_gift', ({ roomId, senderName, gift, giftName, avatar, userId, quantity }) => {
     console.log(`[Chat] Gift from ${senderName} in room ${roomId}: ${giftName || gift} (Quantity: ${quantity})`);
 
-    // Broadcast the gift to EVERYONE in the room (including the sender)
     io.to(roomId).emit('receive_gift', {
-        id: Date.now().toString() + Math.random().toString(), // 100% unique ID
+        id: Date.now().toString() + Math.random().toString(), 
         type: 'gift',
         sender: senderName,
-        gift: gift,            // This is your icon PNG / URI asset
-        giftName: giftName,    // Added: Clear text name for actionText prop
-        avatar: avatar,        // Added: Sender's profilePic for avatarUrl prop
+        gift: gift,            
+        giftName: giftName,    
+        avatar: avatar,        
         quantity: quantity,
         userId: userId
     });
-});
+  });
 
-// 3. EVENT: Automatic Disconnect Cleanup
-socket.on('disconnect', () => {
-  if (socket.roomId && socket.userId) {
-    console.log(`${socket.userName} disconnected unexpectedly.`);
-    io.to(socket.roomId).emit('user_left_channel', {
-      userId: socket.userId,
-      message: `${socket.userName} left the room.`
-    });
-  }
-});
+  // 5. EVENT: Automatic Disconnect Cleanup
+  socket.on('disconnect', () => {
+    if (socket.roomId && socket.userId) {
+      console.log(`${socket.userName} disconnected unexpectedly.`);
+      io.to(socket.roomId).emit('user_left_channel', {
+        userId: socket.userId,
+        message: `${socket.userName} left the room.`
+      });
+    }
+  });
 });
 
 app.post('/create', async (req, res) => {
@@ -163,7 +197,7 @@ app.post('/create', async (req, res) => {
       title: title || "Live Audio Room",
       hostId,
       isLive: true,
-      speakers: [{ userId: hostId, isMuted: false, slotIndex: 0 }],
+      speakers: [{ userId: hostId, isMuted: false, slotIndex: 0, numericUid: sanitizedUid }], // Pass numeric ID to DB
       audience: []
     });
     await newRoom.save();
@@ -230,13 +264,12 @@ app.post('/join', async (req, res) => {
 
     const channelName = room._id.toString();
 
-    // FIXED: Generate the token as a PUBLISHER so they have the crypt-key permission to speak later!
     const token = RtcTokenBuilder.buildTokenWithUid(
       appId,
       appCertificate,
       channelName,
       sanitizedUid,
-      RtcRole.PUBLISHER, // 👈 FIXED HERE
+      RtcRole.PUBLISHER, 
       privilegeExpiredTs
     );
 
@@ -367,7 +400,6 @@ app.get('/profile/:id', async (req, res) => {
   }
 });
 
-// CRITICAL: Listen to the server module wrapper, NOT the raw express app instance!
 server.listen(PORT, () => {
   console.log(`Server listening on port ${PORT}`);
 });
