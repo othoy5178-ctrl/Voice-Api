@@ -21,7 +21,7 @@ app.use(express.json({ limit: "100mb" }));
 app.use(express.urlencoded({ extended: true, limit: "100mb" }));
 
 app.use(cors({
-  origin: "*", 
+  origin: "*",
   methods: ["GET", "PATCH", "POST", "PUT", "DELETE", "OPTIONS"],
   allowedHeaders: ["Content-Type", "Authorization"],
   credentials: true
@@ -31,7 +31,7 @@ app.options("*", cors());
 
 const io = new Server(server, {
   cors: {
-    origin: "*", 
+    origin: "*",
     methods: ["GET", "POST"],
     credentials: true
   }
@@ -43,7 +43,7 @@ io.on('connection', (socket) => {
   // 1. EVENT: Join Room
   socket.on('join_audio_room', ({ roomId, userId, name, profilePic }) => {
     socket.join(roomId);
-    
+
     socket.roomId = roomId;
     socket.userId = userId;
     socket.userName = name;
@@ -60,7 +60,7 @@ io.on('connection', (socket) => {
   });
 
   // 2. EVENT: Change/Sit on Mic Slot
- // 2. EVENT: Change/Sit on Mic Slot or Toggle Mute Status
+  // 2. EVENT: Change/Sit on Mic Slot or Toggle Mute Status
   socket.on('request_slot_change', async ({ roomId, userId, name, profilePic, targetSlotIndex, numericUid, isMuted }) => {
     try {
       console.log(`${name} requested slot ${targetSlotIndex}. Mute status: ${isMuted}`);
@@ -79,13 +79,13 @@ io.on('connection', (socket) => {
 
         // Push new record context including the active mute track parameter
         await AudioRoom.findByIdAndUpdate(roomId, {
-          $push: { 
-            speakers: { 
-              userId: userId, 
-              slotIndex: targetSlotIndex, 
+          $push: {
+            speakers: {
+              userId: userId,
+              slotIndex: targetSlotIndex,
               numericUid: parseInt(numericUid, 10),
               isMuted: isMuted || false // Save mic condition to MongoDB
-            } 
+            }
           }
         });
       }
@@ -121,47 +121,63 @@ io.on('connection', (socket) => {
     });
   });
 
-  // 3. EVENT: Automatic Disconnect Cleanup
-  socket.on('disconnect', () => {
-    if (socket.roomId && socket.userId) {
-      console.log(`${socket.userName} disconnected unexpectedly.`);
-      io.to(socket.roomId).emit('user_left_channel', {
-        userId: socket.userId,
-        message: `${socket.userName} left the room.`
-      });
-    }
-  });
+socket.on('send_gift', ({ roomId, senderName, gift, giftName, avatar, userId, quantity }) => {
+    console.log(`[Chat] Gift from ${senderName} in room ${roomId}: ${giftName || gift} (Quantity: ${quantity})`);
+
+    // Broadcast the gift to EVERYONE in the room (including the sender)
+    io.to(roomId).emit('receive_gift', {
+        id: Date.now().toString() + Math.random().toString(), // 100% unique ID
+        type: 'gift',
+        sender: senderName,
+        gift: gift,            // This is your icon PNG / URI asset
+        giftName: giftName,    // Added: Clear text name for actionText prop
+        avatar: avatar,        // Added: Sender's profilePic for avatarUrl prop
+        quantity: quantity,
+        userId: userId
+    });
+});
+
+// 3. EVENT: Automatic Disconnect Cleanup
+socket.on('disconnect', () => {
+  if (socket.roomId && socket.userId) {
+    console.log(`${socket.userName} disconnected unexpectedly.`);
+    io.to(socket.roomId).emit('user_left_channel', {
+      userId: socket.userId,
+      message: `${socket.userName} left the room.`
+    });
+  }
+});
 });
 
 app.post('/create', async (req, res) => {
   try {
-    const { title, hostId, numericUid } = req.body; 
+    const { title, hostId, numericUid } = req.body;
     const sanitizedUid = parseInt(numericUid, 10) || 0;
 
     const newRoom = new AudioRoom({
       title: title || "Live Audio Room",
       hostId,
       isLive: true,
-      speakers: [{ userId: hostId, isMuted: false, slotIndex: 0 }], 
+      speakers: [{ userId: hostId, isMuted: false, slotIndex: 0 }],
       audience: []
     });
     await newRoom.save();
 
     const appId = process.env.AGORA_APP_ID;
     const appCertificate = process.env.AGORA_APP_CERTIFICATE;
-    
-    const expirationTimeInSeconds = 3600; 
+
+    const expirationTimeInSeconds = 3600;
     const currentTimestamp = Math.floor(Date.now() / 1000);
     const privilegeExpiredTs = currentTimestamp + expirationTimeInSeconds;
 
-    const channelName = newRoom._id.toString(); 
+    const channelName = newRoom._id.toString();
 
     const token = RtcTokenBuilder.buildTokenWithUid(
       appId,
       appCertificate,
       channelName,
-      sanitizedUid, 
-      RtcRole.PUBLISHER, 
+      sanitizedUid,
+      RtcRole.PUBLISHER,
       privilegeExpiredTs
     );
 
@@ -202,19 +218,19 @@ app.post('/join', async (req, res) => {
 
     const appId = process.env.AGORA_APP_ID;
     const appCertificate = process.env.AGORA_APP_CERTIFICATE;
-    
-    const expirationTimeInSeconds = 3600; 
+
+    const expirationTimeInSeconds = 3600;
     const currentTimestamp = Math.floor(Date.now() / 1000);
     const privilegeExpiredTs = currentTimestamp + expirationTimeInSeconds;
-    
-    const channelName = room._id.toString(); 
+
+    const channelName = room._id.toString();
 
     // FIXED: Generate the token as a PUBLISHER so they have the crypt-key permission to speak later!
     const token = RtcTokenBuilder.buildTokenWithUid(
       appId,
       appCertificate,
       channelName,
-      sanitizedUid, 
+      sanitizedUid,
       RtcRole.PUBLISHER, // 👈 FIXED HERE
       privilegeExpiredTs
     );
@@ -236,9 +252,9 @@ app.get('/rooms/:roomId', async (req, res) => {
   try {
     const { roomId } = req.params;
     const room = await AudioRoom.findById(roomId)
-      .populate('hostId', 'name profilePic username') 
-      .populate('speakers.userId', 'name profilePic username') 
-      .populate('audience', 'name profilePic username'); 
+      .populate('hostId', 'name profilePic username')
+      .populate('speakers.userId', 'name profilePic username')
+      .populate('audience', 'name profilePic username');
 
     if (!room) return res.status(404).json({ error: "Room not found" });
     if (!room.isLive) return res.status(400).json({ error: "This room is no longer active" });
@@ -281,9 +297,9 @@ app.post('/rooms/end', async (req, res) => {
     }
 
     room.isLive = false;
-    room.endAt = new Date(); 
-    room.speakers = [];      
-    room.audience = [];      
+    room.endAt = new Date();
+    room.speakers = [];
+    room.audience = [];
     await room.save();
 
     return res.status(200).json({ success: true, message: "Room closed cleanly." });
