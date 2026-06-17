@@ -40,7 +40,7 @@ const io = new Server(server, {
 
 const createCleanSlotsBlueprint = () => Array.from({ length: 25 }, (_, i) => ({
   id: i + 1,
-  locked: i === 3 || i === 12 || i === 19, 
+  locked: i === 3 || i === 12 || i === 19,
   uid: null,
   username: `${i + 1}`,
   avatar: null,
@@ -53,43 +53,48 @@ io.on('connection', (socket) => {
   // 1. EVENT: Join Room
   socket.on('join_audio_room', async ({ roomId, userId, name, profilePic }) => {
     try {
-      socket.join(roomId);
-      socket.roomId = roomId;
+      // Ensure we explicitly work with strings for the socket channel tracking room names
+      const stringRoomId = roomId ? roomId.toString() : '';
+      socket.join(stringRoomId);
+      socket.roomId = stringRoomId;
       socket.userId = userId;
       socket.userName = name;
 
-      console.log(`${name} joined real-time room channel: ${roomId}`);
+      console.log(`${name} joined real-time room channel: ${stringRoomId}`);
 
-      socket.to(roomId).emit('user_joined_channel', {
+      socket.to(stringRoomId).emit('user_joined_channel', {
         userId,
         name,
         profilePic,
         message: `${name} entered the room.`
       });
 
-      const isVideoRoom = roomId.startsWith('glix_');
+      const isVideoRoom = stringRoomId.startsWith('glix_');
       let completeLayoutMatrix = createCleanSlotsBlueprint();
 
       if (isVideoRoom) {
-        const videoRoomDoc = await Room.findOne({ channelName: roomId });
+        const videoRoomDoc = await Room.findOne({ channelName: stringRoomId });
         if (videoRoomDoc && videoRoomDoc.slots) {
           completeLayoutMatrix = videoRoomDoc.slots;
         }
       } else {
-        const audioRoomDoc = await AudioRoom.findById(roomId).populate('speakers.userId', 'name profilePic');
-        if (audioRoomDoc && audioRoomDoc.speakers) {
-          audioRoomDoc.speakers.forEach(speaker => {
-            const index = speaker.slotIndex;
-            if (index >= 0 && index < 25) {
-              completeLayoutMatrix[index] = {
-                ...completeLayoutMatrix[index],
-                uid: speaker.numericUid || null,
-                username: speaker.userId?.name || "Broadcaster",
-                avatar: speaker.userId?.profilePic || null,
-                isMuted: speaker.isMuted || false
-              };
-            }
-          });
+        // Enforce safe hex length check before hitting findById
+        if (mongoose.Types.ObjectId.isValid(stringRoomId)) {
+          const audioRoomDoc = await AudioRoom.findById(stringRoomId).populate('speakers.userId', 'name profilePic');
+          if (audioRoomDoc && audioRoomDoc.speakers) {
+            audioRoomDoc.speakers.forEach(speaker => {
+              const index = speaker.slotIndex;
+              if (index >= 0 && index < 25) {
+                completeLayoutMatrix[index] = {
+                  ...completeLayoutMatrix[index],
+                  uid: speaker.numericUid || null,
+                  username: speaker.userId?.name || "Broadcaster",
+                  avatar: speaker.userId?.profilePic || null,
+                  isMuted: speaker.isMuted || false
+                };
+              }
+            });
+          }
         }
       }
 
@@ -103,33 +108,35 @@ io.on('connection', (socket) => {
   // 2. EVENT: Request Slot Change
   socket.on('request_slot_change', async ({ roomId, userId, name, profilePic, targetSlotIndex, numericUid, isMuted }) => {
     try {
-      const isVideoRoom = roomId.startsWith('glix_');
-      const queryFilter = isVideoRoom ? { channelName: roomId } : { _id: roomId };
+      const stringRoomId = roomId ? roomId.toString() : '';
+      const isVideoRoom = stringRoomId.startsWith('glix_');
+      const queryFilter = isVideoRoom ? { channelName: stringRoomId } : { _id: stringRoomId };
 
-      if (profilePic === null) {
-        if (isVideoRoom) {
-          await Room.findOneAndUpdate(queryFilter, {
-            $set: { [`slots.${targetSlotIndex}`]: { id: targetSlotIndex + 1, locked: false, uid: null, username: targetSlotIndex === 0 ? 'Main Host' : `Co-Host ${targetSlotIndex}`, avatar: null, isMe: false, isMuted: false } }
-          });
-        } else {
+      if (isVideoRoom) {
+        const updateData = profilePic === null
+          ? {
+            "slots.$.uid": null,
+            "slots.$.username": targetSlotIndex === 0 ? 'Main Host' : `Co-Host ${targetSlotIndex + 1}`,
+            "slots.$.avatar": null,
+            "slots.$.isMuted": false
+          }
+          : {
+            "slots.$.uid": parseInt(numericUid, 10),
+            "slots.$.username": name,
+            "slots.$.avatar": profilePic,
+            "slots.$.isMuted": !!isMuted
+          };
+
+        await Room.findOneAndUpdate(
+          { channelName: stringRoomId, "slots.id": targetSlotIndex + 1 },
+          { $set: updateData }
+        );
+      } else {
+        if (!mongoose.Types.ObjectId.isValid(stringRoomId)) return;
+
+        if (profilePic === null) {
           await AudioRoom.findOneAndUpdate(queryFilter, {
             $pull: { speakers: { slotIndex: targetSlotIndex } }
-          });
-        }
-      } else {
-        if (isVideoRoom) {
-          await Room.findOneAndUpdate(queryFilter, {
-            $set: {
-              [`slots.${targetSlotIndex}`]: {
-                id: targetSlotIndex + 1,
-                locked: false,
-                uid: parseInt(numericUid, 10),
-                username: name,
-                avatar: profilePic,
-                isMe: false,
-                isMuted: !!isMuted
-              }
-            }
           });
         } else {
           await AudioRoom.findOneAndUpdate(queryFilter, {
@@ -149,7 +156,7 @@ io.on('connection', (socket) => {
         }
       }
 
-      io.to(roomId).emit('slot_state_changed', {
+      io.to(stringRoomId).emit('slot_state_changed', {
         slotIndex: targetSlotIndex,
         user: {
           uid: numericUid ? parseInt(numericUid, 10) : null,
@@ -168,9 +175,9 @@ io.on('connection', (socket) => {
 
   // 3. EVENT: Chat Messages
   socket.on('send_message', ({ roomId, senderName, text, userId }) => {
-    
-    io.to(roomId).emit('receive_message', {
-      id: Date.now().toString() + Math.random().toString(), 
+    const stringRoomId = roomId ? roomId.toString() : '';
+    io.to(stringRoomId).emit('receive_message', {
+      id: Date.now().toString() + Math.random().toString(),
       type: 'user',
       sender: senderName,
       text: text,
@@ -180,42 +187,107 @@ io.on('connection', (socket) => {
 
   // 4. EVENT: Gift Broadcasts
   socket.on('send_gift', ({ roomId, senderName, gift, giftName, avatar, userId, quantity }) => {
-    io.to(roomId).emit('receive_gift', {
-        id: Date.now().toString() + Math.random().toString(), 
-        type: 'gift',
-        sender: senderName,
-        gift: gift,            
-        giftName: giftName,    
-        avatar: avatar,        
-        quantity: quantity,
-        userId: userId
+    const stringRoomId = roomId ? roomId.toString() : '';
+    io.to(stringRoomId).emit('receive_gift', {
+      id: Date.now().toString() + Math.random().toString(),
+      type: 'gift',
+      sender: senderName,
+      gift: gift,
+      giftName: giftName,
+      avatar: avatar,
+      quantity: quantity,
+      userId: userId
     });
   });
+// 5. EVENT: Safe Disconnect Handler
+socket.on('disconnect', async () => {
+  try {
+    // 1. Fail fast if session properties are missing
+    if (!socket.roomId || !socket.userId) return;
 
-  // 5. EVENT: Disconnect
-  socket.on('disconnect', () => {
-    if (socket.roomId && socket.userId) {
-      io.to(socket.roomId).emit('user_left_channel', {
-        userId: socket.userId,
-        message: `${socket.userName} left the room.`
-      });
+    const roomId = socket.roomId.toString();
+    const currentUserId = socket.userId.toString();
+
+    // 🎥 1. VIDEO ROOM DISCONNECT WORKFLOW
+    if (roomId.startsWith('glix_')) {
+      const videoRoomDoc = await Room.findOne({ channelName: roomId });
+
+      if (videoRoomDoc && videoRoomDoc.hostId.toString() === currentUserId) {
+        // Send eviction signal to all audience members immediately
+        io.to(roomId).emit('room_closing', {
+          message: 'Host disconnected. Room closed.'
+        });
+
+        // Asynchronous delay cleanup
+        setTimeout(async () => {
+          // Changed variable name to 'checkRoom' to prevent scope-shadowing conflicts
+          const checkRoom = await Room.findOne({ channelName: roomId });
+          if (!checkRoom) return;
+
+          const members = io.sockets.adapter.rooms.get(roomId);
+          if (!members || members.size === 0) {
+            await Room.deleteOne({ channelName: roomId });
+            console.log(`[Database Cleanup] Video Room ${roomId} dropped successfully.`);
+          }
+        }, 15000);
+
+        console.log(`Video room closed because host disconnected: ${roomId}`);
+      }
+      
+      // Explicit early return to stop video keys from hitting the hex validator below
+      return; 
     }
-  });
+
+    // 🎤 2. AUDIO ROOM DISCONNECT WORKFLOW
+    // Guard clause: Safe string validation check prior to running standard Mongoose operations
+    if (!roomId || roomId.length !== 24 || !/^[0-9a-fA-F]{24}$/.test(roomId)) {
+      console.log(`[Safe Guard] Aborted lookup. ID "${roomId}" is not a valid 24-character hex string.`);
+      return;
+    }
+
+    const audioRoomDoc = await AudioRoom.findById(roomId);
+
+    if (audioRoomDoc && audioRoomDoc.hostId.toString() === currentUserId) {
+      audioRoomDoc.isLive = false;
+      audioRoomDoc.speakers = [];
+      audioRoomDoc.audience = [];
+
+      await audioRoomDoc.save();
+
+      io.to(roomId).emit('audio_room_ended', {
+        message: 'Host disconnected. Room closed.'
+      });
+
+      console.log(`Audio room closed because host disconnected: ${roomId}`);
+    }
+  } catch (err) {
+    console.log('Critical Error logged inside disconnect pipeline:', err);
+  }
 });
-
+});
 // --- HTTP ENDPOINTS ---
-
 app.post('/create-video', async (req, res) => {
   try {
     const appId = process.env.AGORA_APP_ID;
     const appCertificate = process.env.AGORA_APP_CERTIFICATE;
-    const { hostId, title, numericUid } = req.body;
+
+    const { hostId, title, numericUid, name, profilePic } = req.body;
+
     if (!hostId) return res.status(400).json({ success: false, error: 'Host identifier missing' });
+    if (!numericUid) return res.status(400).json({ success: false, error: 'Numeric UID missing for token generation' });
 
     const uniqueChannelName = `glix_${hostId}_${Date.now().toString().slice(-4)}`;
-    
+
     const initialSlots = [
-      { id: 1, locked: false, uid: parseInt(numericUid, 10), username: 'Host', avatar: null, isMe: false, isMuted: false },
+      {
+        id: 1,
+        locked: false,
+        uid: parseInt(numericUid, 10),
+        username: name || 'Main Host',
+        avatar: profilePic || null,
+        isMe: false,
+        isMuted: false
+      },
       { id: 2, locked: false, uid: null, username: 'Co-Host 1', avatar: null, isMe: false, isMuted: false },
       { id: 3, locked: false, uid: null, username: 'Co-Host 2', avatar: null, isMe: false, isMuted: false },
     ];
@@ -226,23 +298,36 @@ app.post('/create-video', async (req, res) => {
       title: title || "Glix Live Room",
       slots: initialSlots
     });
+
     await newRoom.save();
 
     const expirationTimeInSeconds = 3600;
     const currentTimestamp = Math.floor(Date.now() / 1000);
     const privilegeExpiredTs = currentTimestamp + expirationTimeInSeconds;
 
-    const token = RtcTokenBuilder.buildTokenWithUid(appId, appCertificate, uniqueChannelName, parseInt(numericUid, 10), RtcRole.PUBLISHER, privilegeExpiredTs);
+    const token = RtcTokenBuilder.buildTokenWithUid(
+      appId,
+      appCertificate,
+      uniqueChannelName,
+      parseInt(numericUid, 10),
+      RtcRole.PUBLISHER,
+      privilegeExpiredTs
+    );
 
     return res.status(200).json({
       success: true,
-      room: { hostId: newRoom.hostId, _id: newRoom._id },
+      room: {
+        hostId: newRoom.hostId,
+        _id: uniqueChannelName
+      },
       channelName: uniqueChannelName,
       agoraToken: token,
       appId: appId
     });
+
   } catch (error) {
-    res.status(500).json({ success: false, error: error.message });
+    console.error("Database save crash logs:", error.message);
+    return res.status(500).json({ success: false, error: error.message });
   }
 });
 
@@ -255,7 +340,7 @@ app.post('/create', async (req, res) => {
       title: title || "Live Audio Room",
       hostId,
       isLive: true,
-      speakers: [{ userId: hostId, isMuted: false, slotIndex: 0, numericUid: sanitizedUid }], 
+      speakers: [{ userId: hostId, isMuted: false, slotIndex: 0, numericUid: sanitizedUid }],
       audience: []
     });
     await newRoom.save();
@@ -287,7 +372,8 @@ app.post('/join', async (req, res) => {
     if (!roomId || !userId || !numericUid) return res.status(400).json({ error: "Missing required fields" });
 
     const sanitizedUid = parseInt(numericUid, 10) || 0;
-    const isVideoRoom = roomId.startsWith('glix_');
+    const stringRoomId = roomId.toString();
+    const isVideoRoom = stringRoomId.startsWith('glix_');
 
     const appId = process.env.AGORA_APP_ID;
     const appCertificate = process.env.AGORA_APP_CERTIFICATE;
@@ -298,10 +384,11 @@ app.post('/join', async (req, res) => {
     let roomObj = null;
 
     if (isVideoRoom) {
-      roomObj = await Room.findOne({ channelName: roomId });
+      roomObj = await Room.findOne({ channelName: stringRoomId });
       if (!roomObj) return res.status(404).json({ error: "Video room not found" });
     } else {
-      roomObj = await AudioRoom.findById(roomId);
+      if (!mongoose.Types.ObjectId.isValid(stringRoomId)) return res.status(400).json({ error: "Invalid Room ID layout signature format" });
+      roomObj = await AudioRoom.findById(stringRoomId);
       if (!roomObj) return res.status(404).json({ error: "Audio room not found" });
       if (!roomObj.isLive) return res.status(400).json({ error: "This room has already ended" });
 
@@ -313,13 +400,18 @@ app.post('/join', async (req, res) => {
       }
     }
 
-    const token = RtcTokenBuilder.buildTokenWithUid(appId, appCertificate, roomId, sanitizedUid, RtcRole.PUBLISHER, privilegeExpiredTs);
+    const token = RtcTokenBuilder.buildTokenWithUid(appId, appCertificate, stringRoomId, sanitizedUid, RtcRole.PUBLISHER, privilegeExpiredTs);
 
     return res.status(200).json({
       success: true,
-      room: { hostId: roomObj.hostId },
+      room: {
+        hostId: roomObj.hostId,
+        _id: isVideoRoom
+          ? roomObj.channelName
+          : roomObj._id.toString()
+      },
       agoraToken: token,
-      channelName: roomId,
+      channelName: stringRoomId,
       appId: appId
     });
   } catch (error) {
@@ -330,15 +422,69 @@ app.post('/join', async (req, res) => {
 app.post('/rooms/end', async (req, res) => {
   try {
     const { roomId, hostId } = req.body;
-    if (roomId.startsWith('glix_')) {
-      await Room.deleteOne({ channelName: roomId, hostId });
+    if (!roomId || !hostId) return res.status(400).json({ success: false, error: "Missing properties context" });
+
+    const stringRoomId = roomId.toString();
+
+    if (stringRoomId.startsWith('glix_')) {
+      // await Room.deleteOne({ channelName: stringRoomId, hostId });
+      const room = await Room.findOne({
+        channelName: stringRoomId
+      });
+
+      if (!room) {
+        return res.status(404).json({
+          success: false,
+          error: 'Room not found'
+        });
+      }
+
+      if (room.hostId.toString() !== hostId.toString()) {
+        return res.status(403).json({
+          success: false,
+          error: 'Unauthorized'
+        });
+      }
+
+      io.to(stringRoomId).emit('room_closing', {
+        message: 'The host has ended the video live stream.'
+      });
+
+      await Room.deleteOne({
+        channelName: stringRoomId
+      });
+
+      await new Promise(resolve => setTimeout(resolve, 500));
+
     } else {
-      const room = await AudioRoom.findById(roomId);
+      if (!mongoose.Types.ObjectId.isValid(stringRoomId)) return res.status(400).json({ error: "Malformed ID schema validation layout structure" });
+
+      const room = await AudioRoom.findById(stringRoomId);
       if (room && room.hostId.toString() === hostId) {
+
+        const members = io.sockets.adapter.rooms.get(stringRoomId);
+
+        console.log(
+          'Room:',
+          stringRoomId,
+          'Members:',
+          members?.size || 0
+        );
+
+        io.in(stringRoomId).emit('audio_room_ended', {
+          message: 'The live audio room has been closed by the host.'
+        });
+
         room.isLive = false;
         room.speakers = [];
         room.audience = [];
         await room.save();
+
+        // 🚀 CRITICAL FIX: Forces string channel targets so Socket.io routes eviction packets safely to everyone
+        io.to(stringRoomId).emit('audio_room_ended', {
+          message: "The live audio room has been closed by the host."
+        });
+        console.log(`[Realtime Sync] Audio Room ${stringRoomId} cleaned up. Eviction packet dispatched safely down pipelines.`);
       }
     }
     return res.status(200).json({ success: true, message: "Room closed cleanly." });
@@ -347,10 +493,11 @@ app.post('/rooms/end', async (req, res) => {
   }
 });
 
-// ... keep all other routes unmodified (profile, register, rooms listing)
 app.get('/rooms/:roomId', async (req, res) => {
   try {
     const { roomId } = req.params;
+    if (!mongoose.Types.ObjectId.isValid(roomId)) return res.status(400).json({ error: "Malformed Object reference sequence" });
+
     const room = await AudioRoom.findById(roomId)
       .populate('hostId', 'name profilePic username')
       .populate('speakers.userId', 'name profilePic username')
@@ -365,7 +512,7 @@ app.get('/rooms/:roomId', async (req, res) => {
 
 app.get('/video-rooms', async (req, res) => {
   try {
-    const liveRooms = await Room.find().populate('hostId', 'name profilePic username').sort({ createdAt: -1 });
+    const liveRooms = await Room.find().sort({ createdAt: -1 });
     return res.status(200).json({ success: true, rooms: liveRooms });
   } catch (error) {
     return res.status(500).json({ error: error.message });
@@ -406,7 +553,9 @@ app.post('/register', async (req, res) => {
 
 app.get('/profile/:id', async (req, res) => {
   try {
-    const user = await User.findById(req.params.id).select('-password');
+    const { id } = req.params;
+    if (!mongoose.Types.ObjectId.isValid(id)) return res.status(400).json({ error: "Invalid layout structure mapping identity sequence ID format" });
+    const user = await User.findById(id).select('-password');
     return res.status(200).json(user);
   } catch (error) {
     return res.status(500).json({ message: error.message });
