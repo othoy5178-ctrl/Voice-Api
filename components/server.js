@@ -51,59 +51,67 @@ io.on('connection', (socket) => {
   console.log(`User connected to socket cluster: ${socket.id}`);
 
   // 1. EVENT: Join Room
-  socket.on('join_audio_room', async ({ roomId, userId, name, profilePic }) => {
-    try {
-      // Ensure we explicitly work with strings for the socket channel tracking room names
-      const stringRoomId = roomId ? roomId.toString() : '';
-      socket.join(stringRoomId);
-      socket.roomId = stringRoomId;
-      socket.userId = userId;
-      socket.userName = name;
+  // 1. Destructure entryVideoUrl from the incoming arguments
+socket.on('join_audio_room', async ({ roomId, userId, name, profilePic, entryVideoUrl }) => {
+  try {
+    // Ensure we explicitly work with strings for the socket channel tracking room names
+    const stringRoomId = roomId ? roomId.toString() : '';
+    socket.join(stringRoomId);
+    socket.roomId = stringRoomId;
+    socket.userId = userId;
+    socket.userName = name;
 
-      console.log(`${name} joined real-time room channel: ${stringRoomId}`);
+    console.log(`${name} joined real-time room channel: ${stringRoomId}`);
 
-      socket.to(stringRoomId).emit('user_joined_channel', {
-        userId,
-        name,
-        profilePic,
-        message: `${name} entered the room.`
-      });
+    // 2. Broadcast the entryVideoUrl to everyone ELSE already in the room
+    socket.to(stringRoomId).emit('user_joined_channel', {
+      userId,
+      name,
+      profilePic,
+      entryVideoUrl: entryVideoUrl || null, // Falls back to null if they don't have a premium entry
+      message: `${name} entered the room.`
+    });
 
-      const isVideoRoom = stringRoomId.startsWith('glix_');
-      let completeLayoutMatrix = createCleanSlotsBlueprint();
+    // 3. Play the video for the joining user themselves so they see their purchased effect
+    if (entryVideoUrl) {
+      socket.emit('play_my_own_entry_effect', { entryVideoUrl });
+    }
 
-      if (isVideoRoom) {
-        const videoRoomDoc = await Room.findOne({ channelName: stringRoomId });
-        if (videoRoomDoc && videoRoomDoc.slots) {
-          completeLayoutMatrix = videoRoomDoc.slots;
-        }
-      } else {
-        // Enforce safe hex length check before hitting findById
-        if (mongoose.Types.ObjectId.isValid(stringRoomId)) {
-          const audioRoomDoc = await AudioRoom.findById(stringRoomId).populate('speakers.userId', 'name profilePic');
-          if (audioRoomDoc && audioRoomDoc.speakers) {
-            audioRoomDoc.speakers.forEach(speaker => {
-              const index = speaker.slotIndex;
-              if (index >= 0 && index < 25) {
-                completeLayoutMatrix[index] = {
-                  ...completeLayoutMatrix[index],
-                  uid: speaker.numericUid || null,
-                  username: speaker.userId?.name || "Broadcaster",
-                  avatar: speaker.userId?.profilePic || null,
-                  isMuted: speaker.isMuted || false
-                };
-              }
-            });
-          }
+    const isVideoRoom = stringRoomId.startsWith('glix_');
+    let completeLayoutMatrix = createCleanSlotsBlueprint();
+
+    if (isVideoRoom) {
+      const videoRoomDoc = await Room.findOne({ channelName: stringRoomId });
+      if (videoRoomDoc && videoRoomDoc.slots) {
+        completeLayoutMatrix = videoRoomDoc.slots;
+      }
+    } else {
+      // Enforce safe hex length check before hitting findById
+      if (mongoose.Types.ObjectId.isValid(stringRoomId)) {
+        const audioRoomDoc = await AudioRoom.findById(stringRoomId).populate('speakers.userId', 'name profilePic');
+        if (audioRoomDoc && audioRoomDoc.speakers) {
+          audioRoomDoc.speakers.forEach(speaker => {
+            const index = speaker.slotIndex;
+            if (index >= 0 && index < 25) {
+              completeLayoutMatrix[index] = {
+                ...completeLayoutMatrix[index],
+                uid: speaker.numericUid || null,
+                username: speaker.userId?.name || "Broadcaster",
+                avatar: speaker.userId?.profilePic || null,
+                isMuted: speaker.isMuted || false
+              };
+            }
+          });
         }
       }
-
-      socket.emit('initialize_room_slots', completeLayoutMatrix);
-
-    } catch (err) {
-      console.log("Error inside join initialization workflow logic: ", err);
     }
-  });
+
+    socket.emit('initialize_room_slots', completeLayoutMatrix);
+
+  } catch (err) {
+    console.log("Error inside join initialization workflow logic: ", err);
+  }
+});
 
   // 2. EVENT: Request Slot Change
   socket.on('request_slot_change', async ({ roomId, userId, name, profilePic, targetSlotIndex, numericUid, isMuted }) => {

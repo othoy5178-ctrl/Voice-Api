@@ -24,6 +24,10 @@ const userSchema = new mongoose.Schema({
     type: String,
     default: '' // Points to a CDN URL or remains empty string until uploaded
   },
+  entryVideoUrl: {
+    type: String,
+    default: '' 
+  },
   googleId: {
     type: String,
     default: null,
