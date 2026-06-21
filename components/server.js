@@ -38,6 +38,9 @@ const io = new Server(server, {
   }
 });
 
+// Real-time globally synchronized active tracking matrix map (userId -> socket.id)
+const activeUsers = {};
+
 const createCleanSlotsBlueprint = () => Array.from({ length: 25 }, (_, i) => ({
   id: i + 1,
   locked: i === 3 || i === 12 || i === 19,
@@ -51,67 +54,67 @@ io.on('connection', (socket) => {
   console.log(`User connected to socket cluster: ${socket.id}`);
 
   // 1. EVENT: Join Room
-  // 1. Destructure entryVideoUrl from the incoming arguments
-socket.on('join_audio_room', async ({ roomId, userId, name, profilePic, entryVideoUrl }) => {
-  try {
-    // Ensure we explicitly work with strings for the socket channel tracking room names
-    const stringRoomId = roomId ? roomId.toString() : '';
-    socket.join(stringRoomId);
-    socket.roomId = stringRoomId;
-    socket.userId = userId;
-    socket.userName = name;
+  socket.on('join_audio_room', async ({ roomId, userId, name, profilePic, entryVideoUrl }) => {
+    try {
+      const stringRoomId = roomId ? roomId.toString() : '';
+      socket.join(stringRoomId);
+      socket.roomId = stringRoomId;
+      socket.userId = userId;
+      socket.userName = name;
 
-    console.log(`${name} joined real-time room channel: ${stringRoomId}`);
-
-    // 2. Broadcast the entryVideoUrl to everyone ELSE already in the room
-    socket.to(stringRoomId).emit('user_joined_channel', {
-      userId,
-      name,
-      profilePic,
-      entryVideoUrl: entryVideoUrl || null, // Falls back to null if they don't have a premium entry
-      message: `${name} entered the room.`
-    });
-
-    // 3. Play the video for the joining user themselves so they see their purchased effect
-    if (entryVideoUrl) {
-      socket.emit('play_my_own_entry_effect', { entryVideoUrl });
-    }
-
-    const isVideoRoom = stringRoomId.startsWith('glix_');
-    let completeLayoutMatrix = createCleanSlotsBlueprint();
-
-    if (isVideoRoom) {
-      const videoRoomDoc = await Room.findOne({ channelName: stringRoomId });
-      if (videoRoomDoc && videoRoomDoc.slots) {
-        completeLayoutMatrix = videoRoomDoc.slots;
+      // Map connection instance to verify host mappings directly on requests
+      if (userId) {
+        activeUsers[userId.toString()] = socket.id;
       }
-    } else {
-      // Enforce safe hex length check before hitting findById
-      if (mongoose.Types.ObjectId.isValid(stringRoomId)) {
-        const audioRoomDoc = await AudioRoom.findById(stringRoomId).populate('speakers.userId', 'name profilePic');
-        if (audioRoomDoc && audioRoomDoc.speakers) {
-          audioRoomDoc.speakers.forEach(speaker => {
-            const index = speaker.slotIndex;
-            if (index >= 0 && index < 25) {
-              completeLayoutMatrix[index] = {
-                ...completeLayoutMatrix[index],
-                uid: speaker.numericUid || null,
-                username: speaker.userId?.name || "Broadcaster",
-                avatar: speaker.userId?.profilePic || null,
-                isMuted: speaker.isMuted || false
-              };
-            }
-          });
+
+      console.log(`${name} joined real-time room channel: ${stringRoomId}`);
+
+      socket.to(stringRoomId).emit('user_joined_channel', {
+        userId,
+        name,
+        profilePic,
+        entryVideoUrl: entryVideoUrl || null,
+        message: `${name} entered the room.`
+      });
+
+      if (entryVideoUrl) {
+        socket.emit('play_my_own_entry_effect', { entryVideoUrl });
+      }
+
+      const isVideoRoom = stringRoomId.startsWith('glix_');
+      let completeLayoutMatrix = createCleanSlotsBlueprint();
+
+      if (isVideoRoom) {
+        const videoRoomDoc = await Room.findOne({ channelName: stringRoomId });
+        if (videoRoomDoc && videoRoomDoc.slots) {
+          completeLayoutMatrix = videoRoomDoc.slots;
+        }
+      } else {
+        if (mongoose.Types.ObjectId.isValid(stringRoomId)) {
+          const audioRoomDoc = await AudioRoom.findById(stringRoomId).populate('speakers.userId', 'name profilePic');
+          if (audioRoomDoc && audioRoomDoc.speakers) {
+            audioRoomDoc.speakers.forEach(speaker => {
+              const index = speaker.slotIndex;
+              if (index >= 0 && index < 25) {
+                completeLayoutMatrix[index] = {
+                  ...completeLayoutMatrix[index],
+                  uid: speaker.numericUid || null,
+                  username: speaker.userId?.name || "Broadcaster",
+                  avatar: speaker.userId?.profilePic || null,
+                  isMuted: speaker.isMuted || false
+                };
+              }
+            });
+          }
         }
       }
+
+      socket.emit('initialize_room_slots', completeLayoutMatrix);
+
+    } catch (err) {
+      console.log("Error inside join initialization workflow logic: ", err);
     }
-
-    socket.emit('initialize_room_slots', completeLayoutMatrix);
-
-  } catch (err) {
-    console.log("Error inside join initialization workflow logic: ", err);
-  }
-});
+  });
 
   // 2. EVENT: Request Slot Change
   socket.on('request_slot_change', async ({ roomId, userId, name, profilePic, targetSlotIndex, numericUid, isMuted }) => {
@@ -207,72 +210,98 @@ socket.on('join_audio_room', async ({ roomId, userId, name, profilePic, entryVid
       userId: userId
     });
   });
-// 5. EVENT: Safe Disconnect Handler
-socket.on('disconnect', async () => {
-  try {
-    // 1. Fail fast if session properties are missing
-    if (!socket.roomId || !socket.userId) return;
 
-    const roomId = socket.roomId.toString();
-    const currentUserId = socket.userId.toString();
+  // 5. EVENT: Audience Mic Requests (Correctly Un-nested now)
+  socket.on('audience_join_request', (data) => {
+    if (!data.hostId) return;
+    const hostSocketId = activeUsers[data.hostId.toString()];
 
-    // 🎥 1. VIDEO ROOM DISCONNECT WORKFLOW
-    if (roomId.startsWith('glix_')) {
-      const videoRoomDoc = await Room.findOne({ channelName: roomId });
+    if (hostSocketId) {
+      io.to(hostSocketId).emit('receive_join_request', data);
+    } else {
+      io.to(data.roomId.toString()).emit('receive_join_request', data);
+    }
+  });
 
-      if (videoRoomDoc && videoRoomDoc.hostId.toString() === currentUserId) {
-        // Send eviction signal to all audience members immediately
-        io.to(roomId).emit('room_closing', {
+  // 6. EVENT: Host Acceptance Decision System Handler
+  socket.on('host_request_response', (data) => {
+    const stringRoomId = data.roomId ? data.roomId.toString() : '';
+    io.to(stringRoomId).emit('join_request_result', data);
+
+    if (data.accepted && data.user) {
+      io.to(stringRoomId).emit('slot_state_changed', {
+        slotIndex: data.requestedSlotIndex,
+        user: {
+          uid: data.user.uid,
+          username: data.user.username,
+          avatar: data.user.avatar,
+          isMuted: false
+        }
+      });
+    }
+  });
+
+  // 7. EVENT: Safe Disconnect Handler
+  socket.on('disconnect', async () => {
+    try {
+      if (socket.userId) {
+        delete activeUsers[socket.userId.toString()];
+      }
+
+      if (!socket.roomId || !socket.userId) return;
+
+      const roomId = socket.roomId.toString();
+      const currentUserId = socket.userId.toString();
+
+      if (roomId.startsWith('glix_')) {
+        const videoRoomDoc = await Room.findOne({ channelName: roomId });
+
+        if (videoRoomDoc && videoRoomDoc.hostId.toString() === currentUserId) {
+          io.to(roomId).emit('room_closing', {
+            message: 'Host disconnected. Room closed.'
+          });
+
+          setTimeout(async () => {
+            const checkRoom = await Room.findOne({ channelName: roomId });
+            if (!checkRoom) return;
+
+            const members = io.sockets.adapter.rooms.get(roomId);
+            if (!members || members.size === 0) {
+              await Room.deleteOne({ channelName: roomId });
+              console.log(`[Database Cleanup] Video Room ${roomId} dropped successfully.`);
+            }
+          }, 15000);
+
+          console.log(`Video room closed because host disconnected: ${roomId}`);
+        }
+        return;
+      }
+
+      if (!roomId || roomId.length !== 24 || !/^[0-9a-fA-F]{24}$/.test(roomId)) {
+        return;
+      }
+
+      const audioRoomDoc = await AudioRoom.findById(roomId);
+
+      if (audioRoomDoc && audioRoomDoc.hostId.toString() === currentUserId) {
+        audioRoomDoc.isLive = false;
+        audioRoomDoc.speakers = [];
+        audioRoomDoc.audience = [];
+
+        await audioRoomDoc.save();
+
+        io.to(roomId).emit('audio_room_ended', {
           message: 'Host disconnected. Room closed.'
         });
 
-        // Asynchronous delay cleanup
-        setTimeout(async () => {
-          // Changed variable name to 'checkRoom' to prevent scope-shadowing conflicts
-          const checkRoom = await Room.findOne({ channelName: roomId });
-          if (!checkRoom) return;
-
-          const members = io.sockets.adapter.rooms.get(roomId);
-          if (!members || members.size === 0) {
-            await Room.deleteOne({ channelName: roomId });
-            console.log(`[Database Cleanup] Video Room ${roomId} dropped successfully.`);
-          }
-        }, 15000);
-
-        console.log(`Video room closed because host disconnected: ${roomId}`);
+        console.log(`Audio room closed because host disconnected: ${roomId}`);
       }
-      
-      // Explicit early return to stop video keys from hitting the hex validator below
-      return; 
+    } catch (err) {
+      console.log('Critical Error logged inside disconnect pipeline:', err);
     }
-
-    // 🎤 2. AUDIO ROOM DISCONNECT WORKFLOW
-    // Guard clause: Safe string validation check prior to running standard Mongoose operations
-    if (!roomId || roomId.length !== 24 || !/^[0-9a-fA-F]{24}$/.test(roomId)) {
-      console.log(`[Safe Guard] Aborted lookup. ID "${roomId}" is not a valid 24-character hex string.`);
-      return;
-    }
-
-    const audioRoomDoc = await AudioRoom.findById(roomId);
-
-    if (audioRoomDoc && audioRoomDoc.hostId.toString() === currentUserId) {
-      audioRoomDoc.isLive = false;
-      audioRoomDoc.speakers = [];
-      audioRoomDoc.audience = [];
-
-      await audioRoomDoc.save();
-
-      io.to(roomId).emit('audio_room_ended', {
-        message: 'Host disconnected. Room closed.'
-      });
-
-      console.log(`Audio room closed because host disconnected: ${roomId}`);
-    }
-  } catch (err) {
-    console.log('Critical Error logged inside disconnect pipeline:', err);
-  }
+  });
 });
-});
+
 // --- HTTP ENDPOINTS ---
 app.post('/create-video', async (req, res) => {
   try {
@@ -395,7 +424,7 @@ app.post('/join', async (req, res) => {
       roomObj = await Room.findOne({ channelName: stringRoomId });
       if (!roomObj) return res.status(404).json({ error: "Video room not found" });
     } else {
-      if (!mongoose.Types.ObjectId.isValid(stringRoomId)) return res.status(400).json({ error: "Invalid Room ID layout signature format" });
+      if (!mongoose.Types.ObjectId.isValid(stringRoomId)) return res.status(400).json({ error: "Invalid Room ID format" });
       roomObj = await AudioRoom.findById(stringRoomId);
       if (!roomObj) return res.status(404).json({ error: "Audio room not found" });
       if (!roomObj.isLive) return res.status(400).json({ error: "This room has already ended" });
@@ -408,8 +437,14 @@ app.post('/join', async (req, res) => {
       }
     }
 
-    const token = RtcTokenBuilder.buildTokenWithUid(appId, appCertificate, stringRoomId, sanitizedUid, RtcRole.PUBLISHER, privilegeExpiredTs);
-
+    const token = RtcTokenBuilder.buildTokenWithUid(
+      appId,
+      appCertificate,
+      stringRoomId,
+      sanitizedUid,
+      RtcRole.SUBSCRIBER,
+      privilegeExpiredTs
+    );
     return res.status(200).json({
       success: true,
       room: {
@@ -435,64 +470,28 @@ app.post('/rooms/end', async (req, res) => {
     const stringRoomId = roomId.toString();
 
     if (stringRoomId.startsWith('glix_')) {
-      // await Room.deleteOne({ channelName: stringRoomId, hostId });
-      const room = await Room.findOne({
-        channelName: stringRoomId
-      });
+      const room = await Room.findOne({ channelName: stringRoomId });
 
-      if (!room) {
-        return res.status(404).json({
-          success: false,
-          error: 'Room not found'
-        });
-      }
+      if (!room) return res.status(404).json({ success: false, error: 'Room not found' });
+      if (room.hostId.toString() !== hostId.toString()) return res.status(403).json({ success: false, error: 'Unauthorized' });
 
-      if (room.hostId.toString() !== hostId.toString()) {
-        return res.status(403).json({
-          success: false,
-          error: 'Unauthorized'
-        });
-      }
-
-      io.to(stringRoomId).emit('room_closing', {
-        message: 'The host has ended the video live stream.'
-      });
-
-      await Room.deleteOne({
-        channelName: stringRoomId
-      });
-
+      io.to(stringRoomId).emit('room_closing', { message: 'The host has ended the video live stream.' });
+      await Room.deleteOne({ channelName: stringRoomId });
       await new Promise(resolve => setTimeout(resolve, 500));
 
     } else {
-      if (!mongoose.Types.ObjectId.isValid(stringRoomId)) return res.status(400).json({ error: "Malformed ID schema validation layout structure" });
+      if (!mongoose.Types.ObjectId.isValid(stringRoomId)) return res.status(400).json({ error: "Malformed ID structure" });
 
       const room = await AudioRoom.findById(stringRoomId);
       if (room && room.hostId.toString() === hostId) {
-
-        const members = io.sockets.adapter.rooms.get(stringRoomId);
-
-        console.log(
-          'Room:',
-          stringRoomId,
-          'Members:',
-          members?.size || 0
-        );
-
-        io.in(stringRoomId).emit('audio_room_ended', {
-          message: 'The live audio room has been closed by the host.'
-        });
-
         room.isLive = false;
         room.speakers = [];
         room.audience = [];
         await room.save();
 
-        // 🚀 CRITICAL FIX: Forces string channel targets so Socket.io routes eviction packets safely to everyone
         io.to(stringRoomId).emit('audio_room_ended', {
           message: "The live audio room has been closed by the host."
         });
-        console.log(`[Realtime Sync] Audio Room ${stringRoomId} cleaned up. Eviction packet dispatched safely down pipelines.`);
       }
     }
     return res.status(200).json({ success: true, message: "Room closed cleanly." });
@@ -504,7 +503,7 @@ app.post('/rooms/end', async (req, res) => {
 app.get('/rooms/:roomId', async (req, res) => {
   try {
     const { roomId } = req.params;
-    if (!mongoose.Types.ObjectId.isValid(roomId)) return res.status(400).json({ error: "Malformed Object reference sequence" });
+    if (!mongoose.Types.ObjectId.isValid(roomId)) return res.status(400).json({ error: "Malformed Object reference ID" });
 
     const room = await AudioRoom.findById(roomId)
       .populate('hostId', 'name profilePic username')
@@ -562,7 +561,7 @@ app.post('/register', async (req, res) => {
 app.get('/profile/:id', async (req, res) => {
   try {
     const { id } = req.params;
-    if (!mongoose.Types.ObjectId.isValid(id)) return res.status(400).json({ error: "Invalid layout structure mapping identity sequence ID format" });
+    if (!mongoose.Types.ObjectId.isValid(id)) return res.status(400).json({ error: "Invalid identity sequence format" });
     const user = await User.findById(id).select('-password');
     return res.status(200).json(user);
   } catch (error) {
