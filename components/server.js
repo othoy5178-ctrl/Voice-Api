@@ -10,6 +10,7 @@ import pkg from "agora-token";
 import User from "./User.js";
 import AudioRoom from "./AudioRoom.js";
 import Room from "./RoomSchema.js";
+import DirectMessage from "./DirectMessage.js";
 import bcrypt from "bcryptjs";
 
 const { RtcTokenBuilder, RtcRole } = pkg;
@@ -241,11 +242,176 @@ io.on('connection', (socket) => {
     }
   });
 
+  socket.on('register_user', (userId) => {
+    if (userId) {
+      socket.join(userId.toString());
+      console.log(`✅ SUCCESS: User ${userId} joined room: ${userId}`);
+      // Send a confirmation back to the client to verify connection
+      socket.emit('system_message', `Successfully joined room: ${userId}`);
+    } else {
+      console.log("❌ ERROR: Attempted to join room with empty userId");
+    }
+  });
+
+  socket.on('send_direct_message', async (data) => {
+    const { senderId, receiverId, text, senderName, time, localId } = data;
+
+    console.log('DM:', data);
+
+    try {
+      const dm = new DirectMessage({ senderId, receiverId, text, senderName, time });
+      const savedMessage = await dm.save();
+      const serverPayload = {
+        _id: savedMessage._id.toString(),
+        senderId,
+        receiverId,
+        text,
+        senderName,
+        time
+      };
+
+      // TARGET THE ROOM NAME
+      io.to(receiverId.toString()).emit('receive_direct_message', serverPayload);
+
+      // Echo back to sender
+      socket.emit('message_sent_ack', { localId, _id: savedMessage._id.toString() });
+
+    } catch (err) {
+      console.error('DB Error:', err);
+    }
+  });
+
+  // Add this to your io.on('connection', (socket) => { ... })
+  socket.on('mark_messages_read', async ({ userId, partnerId }) => {
+    try {
+      // 1. Update all messages sent by the partner to me that are currently unread
+      await DirectMessage.updateMany(
+        { senderId: partnerId, receiverId: userId, isRead: false },
+        { $set: { isRead: true } }
+      );
+
+      // 2. Notify the sender (partner) that their messages have been read
+      // So the sender can update their UI in real-time
+      const partnerSocketId = activeUsers[partnerId];
+      if (partnerSocketId) {
+        io.to(partnerSocketId).emit('messages_read_receipt', { readerId: userId });
+      }
+
+      console.log(`Marked messages from ${partnerId} as read by ${userId}`);
+    } catch (err) {
+      console.error('Error marking messages as read:', err);
+    }
+  });
+
+  socket.on('get_chat_history', async ({ userId, partnerId }) => {
+    console.log(`Fetching history for: ${userId} <-> ${partnerId}`);
+    try {
+      const history = await DirectMessage.find({
+        $or: [
+          { senderId: userId, receiverId: partnerId },
+          { senderId: partnerId, receiverId: userId }
+        ]
+      })
+        .sort({ createdAt: 1 })
+        .limit(100);
+
+      console.log(`Found ${history.length} messages.`);
+      socket.emit('load_chat_history', history);
+    } catch (err) {
+      console.error('Error fetching history:', err);
+    }
+  });
+
+  socket.on('get_chat_list', async ({ userId }) => {
+    console.log("🔍 Server received request for chat list. UserID:", userId);
+    try {
+      const chatList = await DirectMessage.aggregate([
+        { $match: { $or: [{ senderId: userId }, { receiverId: userId }] } },
+        { $sort: { createdAt: -1 } },
+        {
+          $group: {
+            _id: {
+              $cond: [{ $eq: ["$senderId", userId] }, "$receiverId", "$senderId"]
+            },
+            lastMessage: { $first: "$text" },
+            lastTimestamp: { $first: "$time" },
+            unreadCount: {
+              $sum: {
+                $cond: [
+                  { $and: [{ $eq: ["$receiverId", userId] }, { $eq: ["$isRead", false] }] },
+                  1,
+                  0
+                ]
+              }
+            }
+          }
+        },
+        // 4. Lookup: Fetch user details from 'users' collection
+        {
+          $lookup: {
+            from: 'users',
+            let: { pId: "$_id" },
+            pipeline: [
+              {
+                $match: {
+                  $expr: {
+                    $eq: [
+                      "$_id",
+                      {
+                        $convert: {
+                          input: "$$pId",
+                          to: "objectId",
+                          onError: null, // <--- THIS PREVENTS THE CRASH
+                          onNull: null
+                        }
+                      }
+                    ]
+                  }
+                }
+              }
+            ],
+            as: 'partnerDetails'
+          }
+        },
+
+        // 5. Flatten: Convert array to object
+        { $unwind: { path: "$partnerDetails", preserveNullAndEmptyArrays: true } },
+
+        // 6. Project: Clean up the output
+        {
+          $project: {
+            _id: 0,
+            partnerId: "$_id",
+            lastMessage: 1,
+            lastTimestamp: 1,
+            unreadCount: 1,
+            partnerName: { $ifNull: ["$partnerDetails.name", "Unknown User"] },
+            profilePic: { $ifNull: ["$partnerDetails.profilePic", ""] }
+          }
+        },
+        { $sort: { lastTimestamp: -1 } }
+      ]);
+
+      socket.emit('load_chat_list', chatList);
+      console.log('chat List:', chatList);
+    } catch (err) {
+      console.error('Error fetching chat list:', err);
+      socket.emit('error_notice', { message: 'Failed to load chat list.' });
+    }
+  });
+
   // 7. EVENT: Safe Disconnect Handler
   socket.on('disconnect', async () => {
     try {
       if (socket.userId) {
         delete activeUsers[socket.userId.toString()];
+      } else {
+        // Find key by value (the socket.id) to clean up if we didn't store userId on socket object
+        for (const userId in activeUsers) {
+          if (activeUsers[userId] === socket.id) {
+            delete activeUsers[userId];
+          }
+        }
       }
 
       if (!socket.roomId || !socket.userId) return;
