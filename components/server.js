@@ -11,6 +11,7 @@ import User from "./User.js";
 import AudioRoom from "./AudioRoom.js";
 import Room from "./RoomSchema.js";
 import DirectMessage from "./DirectMessage.js";
+import Follow from './Follow.js';
 import bcrypt from "bcryptjs";
 
 const { RtcTokenBuilder, RtcRole } = pkg;
@@ -57,6 +58,9 @@ io.on('connection', (socket) => {
   // 1. EVENT: Join Room
   socket.on('join_audio_room', async ({ roomId, userId, name, profilePic, entryVideoUrl }) => {
     try {
+      const userData = await User.findById(userId).select('frameUrl');
+      const frameUrl = userData?.frameUrl || null;
+
       const stringRoomId = roomId ? roomId.toString() : '';
       socket.join(stringRoomId);
       socket.roomId = stringRoomId;
@@ -75,6 +79,7 @@ io.on('connection', (socket) => {
         name,
         profilePic,
         entryVideoUrl: entryVideoUrl || null,
+        frameUrl: frameUrl || null,
         message: `${name} entered the room.`
       });
 
@@ -102,6 +107,7 @@ io.on('connection', (socket) => {
                   uid: speaker.numericUid || null,
                   username: speaker.userId?.name || "Broadcaster",
                   avatar: speaker.userId?.profilePic || null,
+                  frameUrl: speaker.frameUrl || null,
                   isMuted: speaker.isMuted || false
                 };
               }
@@ -118,8 +124,17 @@ io.on('connection', (socket) => {
   });
 
   // 2. EVENT: Request Slot Change
-  socket.on('request_slot_change', async ({ roomId, userId, name, profilePic, targetSlotIndex, numericUid, isMuted }) => {
+  socket.on('request_slot_change', async ({ roomId, userId, name, profilePic, frameUrl, targetSlotIndex, numericUid, isMuted }) => {
     try {
+
+      let finalFrameUrl = frameUrl;
+
+      // Fetch from DB only if the client didn't send a frameUrl
+      if (!finalFrameUrl) {
+        const dbUser = await User.findById(userId).select('frameUrl');
+        finalFrameUrl = dbUser?.frameUrl || null;
+      }
+
       const stringRoomId = roomId ? roomId.toString() : '';
       const isVideoRoom = stringRoomId.startsWith('glix_');
       const queryFilter = isVideoRoom ? { channelName: stringRoomId } : { _id: stringRoomId };
@@ -130,12 +145,14 @@ io.on('connection', (socket) => {
             "slots.$.uid": null,
             "slots.$.username": targetSlotIndex === 0 ? 'Main Host' : `Co-Host ${targetSlotIndex + 1}`,
             "slots.$.avatar": null,
+            "slots.$.frameUrl": null,
             "slots.$.isMuted": false
           }
           : {
             "slots.$.uid": parseInt(numericUid, 10),
             "slots.$.username": name,
             "slots.$.avatar": profilePic,
+            "slots.$.frameUrl": finalFrameUrl,
             "slots.$.isMuted": !!isMuted
           };
 
@@ -161,7 +178,8 @@ io.on('connection', (socket) => {
                 userId: userId,
                 slotIndex: targetSlotIndex,
                 numericUid: parseInt(numericUid, 10),
-                isMuted: isMuted || false
+                isMuted: isMuted || false,
+                frameUrl: frameUrl
               }
             }
           });
@@ -175,6 +193,7 @@ io.on('connection', (socket) => {
           userId,
           username: name,
           avatar: profilePic,
+          frameUrl: finalFrameUrl,
           isMuted: isMuted || false
         }
       });
@@ -197,8 +216,44 @@ io.on('connection', (socket) => {
     });
   });
 
-  // 4. EVENT: Gift Broadcasts
-  socket.on('send_gift', ({ roomId, senderName, gift, giftName, avatar, userId, quantity }) => {
+  socket.on('send_gift', async ({ roomId, senderName, hostId, gift, giftName, avatar, userId, quantity, coins }) => {
+    console.log('gift data:', userId, roomId, hostId, coins);
+
+    if (!hostId) {
+      console.error("Backend Error: Received null hostId!");
+      socket.emit('gift_error', { message: "Invalid host ID received." });
+      return;
+    }
+
+    const totalCost = coins * quantity;
+    const session = await mongoose.startSession();
+    session.startTransaction();
+
+    try {
+      const sender = await User.findByIdAndUpdate(
+        userId,
+        { $inc: { daimon: -totalCost } },
+        { new: true, session }
+      );
+
+      if (!sender || sender.daimon < 0) throw new Error("Insufficient funds");
+
+      // 2. Add to Receiver (Host)
+      await User.findByIdAndUpdate(
+        hostId,
+        { $inc: { daimon: totalCost } },
+        { session }
+      );
+
+      await session.commitTransaction();
+
+    } catch (error) {
+      await session.abortTransaction();
+      // Emit error back to the sender only
+      socket.emit('gift_error', { message: error.message });
+    } finally {
+      session.endSession();
+    }
     const stringRoomId = roomId ? roomId.toString() : '';
     io.to(stringRoomId).emit('receive_gift', {
       id: Date.now().toString() + Math.random().toString(),
@@ -236,6 +291,7 @@ io.on('connection', (socket) => {
           uid: data.user.uid,
           username: data.user.username,
           avatar: data.user.avatar,
+          frameUrl: data.user.frameUrl || null,
           isMuted: false
         }
       });
@@ -467,6 +523,109 @@ io.on('connection', (socket) => {
     }
   });
 });
+
+
+app.post('/Follow', async (req, res) => {
+  const { followerId, followingId } = req.body;
+
+  if (!followerId || !followingId) {
+    return res.status(400).json({ message: "Both followerId and followingId are required." });
+  }
+
+  if (followerId === followingId) {
+    return res.status(400).json({ message: "You cannot follow yourself." });
+  }
+
+  const session = await mongoose.startSession();
+  session.startTransaction();
+
+  try {
+    const existingFollow = await Follow.findOne({
+      followerId,
+      followingId,
+    }).session(session);
+
+    if (existingFollow) {
+      await session.abortTransaction();
+      return res.status(400).json({ message: "Already following this user." });
+    }
+
+    await Follow.create([{ followerId, followingId }], { session });
+
+    await User.findByIdAndUpdate(
+      followerId,
+      { $inc: { followingCount: 1 } },
+      { session }
+    );
+
+    await User.findByIdAndUpdate(
+      followingId,
+      { $inc: { followersCount: 1 } },
+      { session }
+    );
+
+    await session.commitTransaction();
+
+    res.status(200).json({ message: "Followed successfully!" });
+  } catch (err) {
+    await session.abortTransaction();
+    res.status(500).json({ message: "Server error", error: err.message });
+  } finally {
+    session.endSession();
+  }
+});
+
+app.get('/Friends/:userId', async (req, res) => {
+  try {
+    const { userId } = req.params;
+
+    // 1. Fetch user basic info
+    const user = await User.findById(userId).select('-password'); // Exclude password for security
+
+    if (!user) {
+      return res.status(404).json({ message: "User not found" });
+    }
+
+    // 2. Aggregate to find mutual friends count
+    const result = await Follow.aggregate([
+      { $match: { follower: new mongoose.Types.ObjectId(userId) } },
+      {
+        $lookup: {
+          from: 'follows',
+          let: { followingId: '$following' },
+          pipeline: [
+            {
+              $match: {
+                $expr: {
+                  $and: [
+                    { $eq: ['$follower', '$$followingId'] },
+                    { $eq: ['$following', new mongoose.Types.ObjectId(userId)] }
+                  ]
+                }
+              }
+            }
+          ],
+          as: 'isMutual'
+        }
+      },
+      { $match: { 'isMutual.0': { $exists: true } } },
+      { $count: 'friendCount' }
+    ]);
+
+    const friendCount = result.length > 0 ? result[0].friendCount : 0;
+
+    // 3. Return the combined data
+    res.status(200).json({
+      ...user._doc,
+      friends: friendCount // This matches your profile UI needs
+    });
+
+  } catch (error) {
+    res.status(500).json({ message: "Server error", error: error.message });
+  }
+});
+
+
 
 // --- HTTP ENDPOINTS ---
 app.post('/create-video', async (req, res) => {
@@ -732,6 +891,27 @@ app.get('/profile/:id', async (req, res) => {
     return res.status(200).json(user);
   } catch (error) {
     return res.status(500).json({ message: error.message });
+  }
+});
+
+
+app.post('/check-follow', async (req, res) => {
+  try {
+    const { followerId, followingId } = req.body;
+
+    const isFollowing = await Follow.exists({
+      followerId,
+      followingId,
+    });
+
+    res.status(200).json({
+      isFollowing: !!isFollowing,
+    });
+  } catch (err) {
+    res.status(500).json({
+      message: "Server error",
+      error: err.message,
+    });
   }
 });
 

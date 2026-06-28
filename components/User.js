@@ -15,9 +15,8 @@ const userSchema = new mongoose.Schema({
   },
   password: {
     type: String,
-    // Optional because OAuth/Google users won't have a password initially
-    required: function() {
-      return !this.googleId; 
+    required: function () {
+      return !this.googleId;
     }
   },
   profilePic: {
@@ -26,14 +25,17 @@ const userSchema = new mongoose.Schema({
   },
   entryVideoUrl: {
     type: String,
-    default: '' 
+    default: ''
+  },
+  frameUrl: {
+    type: String,
+    default: ''
   },
   googleId: {
     type: String,
     default: null,
     unique: true,
-    // sparse allows multiple documents to have 'null' googleId without triggering duplicate key errors
-    sparse: true 
+    sparse: true
   },
   createdAt: {
     type: Date,
@@ -42,7 +44,11 @@ const userSchema = new mongoose.Schema({
   lastLogin: {
     type: Date,
     default: Date.now
-  }
+  },
+  followersCount: { type: Number, default: 0 },
+  followingCount: { type: Number, default: 0 },
+  daimon: { type: Number, default: 0 },
+  chang: { type: Number, default: 0 },
 });
 
 // Changed model name to 'User' to follow standard naming conventions
