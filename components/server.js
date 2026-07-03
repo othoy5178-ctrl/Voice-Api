@@ -12,6 +12,7 @@ import AudioRoom from "./AudioRoom.js";
 import Room from "./RoomSchema.js";
 import DirectMessage from "./DirectMessage.js";
 import Follow from './Follow.js';
+import GiftTransaction from './GiftTransation.js';
 import bcrypt from "bcryptjs";
 
 const { RtcTokenBuilder, RtcRole } = pkg;
@@ -217,6 +218,7 @@ io.on('connection', (socket) => {
   });
 
   socket.on('send_gift', async ({ roomId, senderName, hostId, gift, giftName, avatar, userId, quantity, coins }) => {
+
     console.log('gift data:', userId, roomId, hostId, coins);
 
     if (!hostId) {
@@ -226,8 +228,10 @@ io.on('connection', (socket) => {
     }
 
     const totalCost = coins * quantity;
+
     const session = await mongoose.startSession();
     session.startTransaction();
+
 
     try {
       const sender = await User.findByIdAndUpdate(
@@ -244,6 +248,18 @@ io.on('connection', (socket) => {
         { $inc: { daimon: totalCost } },
         { session }
       );
+
+      await GiftTransaction.create({
+        roomId,
+        senderId: userId,
+        receiverId: hostId,
+        giftName,
+        giftImage: gift,
+        coinPrice: coins,
+        quantity,
+        totalCost
+      });
+
 
       await session.commitTransaction();
 
@@ -263,6 +279,7 @@ io.on('connection', (socket) => {
       giftName: giftName,
       avatar: avatar,
       quantity: quantity,
+      totalCost,
       userId: userId
     });
   });
@@ -690,6 +707,80 @@ app.post('/create-video', async (req, res) => {
   } catch (error) {
     console.error("Database save crash logs:", error.message);
     return res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+app.get('/gift-history/room/:roomId', async (req, res) => {
+  try {
+    const { roomId } = req.params;
+
+    const result = await GiftTransaction.aggregate([
+      {
+        $match: {
+          roomId: new mongoose.Types.ObjectId(roomId)
+        }
+      },
+      {
+        $group: {
+          _id: "$roomId",
+          totalCoins: { $sum: "$totalCost" },
+          totalGifts: { $sum: "$quantity" },
+          totalTransactions: { $sum: 1 }
+        }
+      }
+    ]);
+
+    res.status(200).json({
+      success: true,
+      data: result[0] || {
+        totalCoins: 0,
+        totalGifts: 0,
+        totalTransactions: 0
+      }
+    });
+
+  } catch (error) {
+    res.status(500).json({
+      success: false,
+      message: error.message
+    });
+  }
+});
+
+app.get('/gift-history/host/:hostId', async (req, res) => {
+  try {
+    const { hostId } = req.params;
+
+    const result = await GiftTransaction.aggregate([
+      {
+        $match: {
+          receiverId: new mongoose.Types.ObjectId(hostId)
+        }
+      },
+      {
+        $group: {
+          _id: "$receiverId",
+          totalCoins: { $sum: "$totalCost" },
+          totalGifts: { $sum: "$quantity" },
+          totalTransactions: { $sum: 1 }
+        }
+      }
+    ]);
+
+    res.status(200).json({
+      success: true,
+      data: result[0] || {
+        totalCoins: 0,
+        totalGifts: 0,
+        totalTransactions: 0
+      }
+    });
+
+  } catch (error) {
+    res.status(500).json({
+      success: false,
+      message: error.message
+    });
   }
 });
 

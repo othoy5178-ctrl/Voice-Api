@@ -7,9 +7,10 @@ const SlotSchema = new mongoose.Schema({
   uid: { type: Number, default: null },
   username: { type: String, default: null },
   avatar: { type: String, default: null },
+  frameUrl: { type: String, default: null },
   isMe: { type: Boolean, default: false },
   isMuted: { type: Boolean, default: false }
-}, { _id: false }); // Prevents Mongoose from adding _id to every single slot
+}, { _id: false }); 
 
 const RoomSchema = new mongoose.Schema({
   channelName: { type: String, required: true, unique: true },
