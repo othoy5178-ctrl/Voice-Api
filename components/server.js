@@ -100,7 +100,7 @@ io.on('connection', (socket) => {
         if (mongoose.Types.ObjectId.isValid(stringRoomId)) {
           const audioRoomDoc = await AudioRoom.findById(stringRoomId).populate('speakers.userId', 'name profilePic');
           if (audioRoomDoc && audioRoomDoc.speakers) {
-            audioRoomDoc.speakers.forEach(speaker => {
+            audioRoomDoc.speakers.filter(speaker => speaker && speaker.userId).forEach(speaker => {
               const index = speaker.slotIndex;
               if (index >= 0 && index < 25) {
                 completeLayoutMatrix[index] = {
@@ -286,32 +286,84 @@ io.on('connection', (socket) => {
 
   // 5. EVENT: Audience Mic Requests (Correctly Un-nested now)
   socket.on('audience_join_request', (data) => {
-    if (!data.hostId) return;
-    const hostSocketId = activeUsers[data.hostId.toString()];
+    if (!data?.hostId || !data?.roomId) return;
+    const hostSocketId = activeUsers[String(data.hostId)];
 
     if (hostSocketId) {
       io.to(hostSocketId).emit('receive_join_request', data);
     } else {
-      io.to(data.roomId.toString()).emit('receive_join_request', data);
+      io.to(String(data.roomId)).emit('receive_join_request', data);
     }
   });
 
   // 6. EVENT: Host Acceptance Decision System Handler
-  socket.on('host_request_response', (data) => {
-    const stringRoomId = data.roomId ? data.roomId.toString() : '';
-    io.to(stringRoomId).emit('join_request_result', data);
+  socket.on('host_request_response', async (data) => {
+    try {
+      const stringRoomId = data.roomId?.toString();
 
-    if (data.accepted && data.user) {
+      // Send response to all users
+      io.to(stringRoomId).emit('join_request_result', data);
+
+      // If request rejected, stop here
+      if (!data.accepted || !data.user) return;
+      const acceptedUserId = data.user.userId || data.user._id || data.user.id || data.userId;
+      if (!acceptedUserId) {
+        console.warn('Accepted mic request missing database userId:', data);
+        return;
+      }
+
+      // ===========================
+      // UPDATE DATABASE
+      // ===========================
+
+      await AudioRoom.findByIdAndUpdate(data.roomId, {
+        $pull: {
+          audience: acceptedUserId
+        }
+      });
+
+      await AudioRoom.findByIdAndUpdate(data.roomId, {
+        $pull: {
+          speakers: {
+            $or: [
+              { userId: acceptedUserId },
+              { userId: { $exists: false } },
+              { userId: null }
+            ]
+          }
+        }
+      });
+
+      await AudioRoom.findByIdAndUpdate(data.roomId, {
+        $push: {
+          speakers: {
+            userId: acceptedUserId,
+            slotIndex: data.requestedSlotIndex,
+            numericUid: data.user.uid,
+            frameUrl: data.user.frameUrl || null,
+            isMuted: false
+          }
+        }
+      });
+
+      // ===========================
+      // UPDATE ALL CLIENTS
+      // ===========================
+
       io.to(stringRoomId).emit('slot_state_changed', {
         slotIndex: data.requestedSlotIndex,
         user: {
           uid: data.user.uid,
+          userId: acceptedUserId,
           username: data.user.username,
           avatar: data.user.avatar,
           frameUrl: data.user.frameUrl || null,
           isMuted: false
         }
       });
+
+    } catch (err) {
+      console.log("Host response error:", err);
     }
   });
 
@@ -492,10 +544,47 @@ io.on('connection', (socket) => {
       const roomId = socket.roomId.toString();
       const currentUserId = socket.userId.toString();
 
+
+      const room = await AudioRoom.findById(roomId);
+
+      const speaker = room?.speakers?.find(
+        s => String(s.userId) === currentUserId
+      );
+
+      const oldSlotIndex = speaker?.slotIndex;
+
+      await AudioRoom.findByIdAndUpdate(roomId, {
+        $pull: {
+          speakers: {
+            userId: currentUserId
+          },
+          audience: currentUserId
+        }
+      });
+
+
+      if (oldSlotIndex !== undefined) {
+        io.to(roomId).emit("slot_state_changed", {
+          slotIndex: oldSlotIndex,
+          user: {
+            uid: null,
+            userId: null,
+            username: "",
+            avatar: null,
+            frameUrl: null,
+            isMuted: false
+          }
+        });
+      }
+
       if (roomId.startsWith('glix_')) {
         const videoRoomDoc = await Room.findOne({ channelName: roomId });
 
-        if (videoRoomDoc && videoRoomDoc.hostId.toString() === currentUserId) {
+        if (
+          videoRoomDoc &&
+          videoRoomDoc.hostId &&
+          videoRoomDoc.hostId.toString() === currentUserId
+        ) {
           io.to(roomId).emit('room_closing', {
             message: 'Host disconnected. Room closed.'
           });
@@ -522,7 +611,11 @@ io.on('connection', (socket) => {
 
       const audioRoomDoc = await AudioRoom.findById(roomId);
 
-      if (audioRoomDoc && audioRoomDoc.hostId.toString() === currentUserId) {
+      if (
+        audioRoomDoc &&
+        audioRoomDoc.hostId &&
+        audioRoomDoc.hostId.toString() === currentUserId
+      ) {
         audioRoomDoc.isLive = false;
         audioRoomDoc.speakers = [];
         audioRoomDoc.audience = [];
@@ -824,6 +917,8 @@ app.post('/join', async (req, res) => {
     const { roomId, userId, numericUid } = req.body;
     if (!roomId || !userId || !numericUid) return res.status(400).json({ error: "Missing required fields" });
 
+
+
     const sanitizedUid = parseInt(numericUid, 10) || 0;
     const stringRoomId = roomId.toString();
     const isVideoRoom = stringRoomId.startsWith('glix_');
@@ -835,6 +930,7 @@ app.post('/join', async (req, res) => {
     const privilegeExpiredTs = currentTimestamp + expirationTimeInSeconds;
 
     let roomObj = null;
+    let userRole = RtcRole.SUBSCRIBER; // Default role for audio rooms
 
     if (isVideoRoom) {
       roomObj = await Room.findOne({ channelName: stringRoomId });
@@ -845,9 +941,33 @@ app.post('/join', async (req, res) => {
       if (!roomObj) return res.status(404).json({ error: "Audio room not found" });
       if (!roomObj.isLive) return res.status(400).json({ error: "This room has already ended" });
 
-      const isAlreadySpeaker = roomObj.speakers.some(s => s.userId === userId);
-      const isAlreadyAudience = roomObj.audience.includes(userId);
-      if (!isAlreadySpeaker && !isAlreadyAudience) {
+      await AudioRoom.findByIdAndUpdate(roomId, {
+        $pull: {
+          speakers: { userId }
+        }
+      });
+
+      roomObj = await AudioRoom.findById(roomId);
+
+      const currentSpeakers = Array.isArray(roomObj.speakers) ? roomObj.speakers : [];
+      const currentAudience = Array.isArray(roomObj.audience) ? roomObj.audience : [];
+      const validSpeakers = currentSpeakers.filter(s => s && s.userId);
+      const validAudience = currentAudience.filter(Boolean);
+      if (validSpeakers.length !== currentSpeakers.length || validAudience.length !== currentAudience.length) {
+        roomObj.speakers = validSpeakers;
+        roomObj.audience = validAudience;
+        await roomObj.save();
+      }
+
+      // Check if user is already a speaker
+      const isAlreadySpeaker = validSpeakers.some(s => String(s.userId) === String(userId));
+      const isAlreadyAudience = validAudience.some(id => String(id) === String(userId));
+
+      if (isAlreadySpeaker) {
+        // User is a speaker - give them PUBLISHER role so they can transmit audio
+        userRole = RtcRole.PUBLISHER;
+      } else if (!isAlreadyAudience) {
+        // New audience member - add them
         roomObj.audience.push(userId);
         await roomObj.save();
       }
@@ -858,7 +978,7 @@ app.post('/join', async (req, res) => {
       appCertificate,
       stringRoomId,
       sanitizedUid,
-      RtcRole.SUBSCRIBER,
+      userRole,
       privilegeExpiredTs
     );
     return res.status(200).json({
@@ -871,7 +991,45 @@ app.post('/join', async (req, res) => {
       },
       agoraToken: token,
       channelName: stringRoomId,
-      appId: appId
+      appId: appId,
+      userRole: userRole === RtcRole.PUBLISHER ? 'speaker' : 'audience'
+    });
+  } catch (error) {
+    return res.status(500).json({ error: error.message });
+  }
+});
+
+// NEW: Regenerate token when user is promoted to speaker
+app.post('/regenerate-token', async (req, res) => {
+  try {
+    const { roomId, userId, numericUid, isBecomingSpeaker } = req.body;
+    if (!roomId || !userId || !numericUid) return res.status(400).json({ error: "Missing required fields" });
+
+    const sanitizedUid = parseInt(numericUid, 10) || 0;
+    const stringRoomId = roomId.toString();
+
+    const appId = process.env.AGORA_APP_ID;
+    const appCertificate = process.env.AGORA_APP_CERTIFICATE;
+    const expirationTimeInSeconds = 3600;
+    const currentTimestamp = Math.floor(Date.now() / 1000);
+    const privilegeExpiredTs = currentTimestamp + expirationTimeInSeconds;
+
+    // Determine role based on whether user is becoming a speaker
+    const userRole = isBecomingSpeaker ? RtcRole.PUBLISHER : RtcRole.SUBSCRIBER;
+
+    const token = RtcTokenBuilder.buildTokenWithUid(
+      appId,
+      appCertificate,
+      stringRoomId,
+      sanitizedUid,
+      userRole,
+      privilegeExpiredTs
+    );
+
+    return res.status(200).json({
+      success: true,
+      agoraToken: token,
+      userRole: isBecomingSpeaker ? 'speaker' : 'audience'
     });
   } catch (error) {
     return res.status(500).json({ error: error.message });
@@ -889,7 +1047,11 @@ app.post('/rooms/end', async (req, res) => {
       const room = await Room.findOne({ channelName: stringRoomId });
 
       if (!room) return res.status(404).json({ success: false, error: 'Room not found' });
-      if (room.hostId.toString() !== hostId.toString()) return res.status(403).json({ success: false, error: 'Unauthorized' });
+      if (
+        !room.hostId ||
+        !hostId ||
+        room.hostId.toString() !== String(hostId))
+        return res.status(403).json({ success: false, error: 'Unauthorized' });
 
       io.to(stringRoomId).emit('room_closing', { message: 'The host has ended the video live stream.' });
       await Room.deleteOne({ channelName: stringRoomId });
@@ -899,7 +1061,7 @@ app.post('/rooms/end', async (req, res) => {
       if (!mongoose.Types.ObjectId.isValid(stringRoomId)) return res.status(400).json({ error: "Malformed ID structure" });
 
       const room = await AudioRoom.findById(stringRoomId);
-      if (room && room.hostId.toString() === hostId) {
+      if (room && room.hostId && room.hostId.toString() === hostId) {
         room.isLive = false;
         room.speakers = [];
         room.audience = [];
