@@ -23,6 +23,12 @@ const userSchema = new mongoose.Schema({
     type: String,
     default: '' // Points to a CDN URL or remains empty string until uploaded
   },
+  glixId: {
+    type: String,
+    unique: true,
+    sparse: true,
+    index: true
+  },
   entryVideoUrl: {
     type: String,
     default: ''
@@ -31,6 +37,25 @@ const userSchema = new mongoose.Schema({
     type: String,
     default: ''
   },
+  settings: {
+    floatingPlayer: { type: Boolean, default: true },
+    newMessageNotifications: { type: Boolean, default: true },
+    liveNotifications: { type: Boolean, default: true },
+    giftNotifications: { type: Boolean, default: true },
+    showOnlineStatus: { type: Boolean, default: true },
+    allowMessagesFrom: {
+      type: String,
+      enum: ['everyone', 'following', 'none'],
+      default: 'everyone'
+    },
+    allowRoomInvites: { type: Boolean, default: true },
+    showProfileVisits: { type: Boolean, default: true },
+    language: { type: String, default: 'English' }
+  },
+  blacklistedUsers: [{
+    type: mongoose.Schema.Types.ObjectId,
+    ref: 'User'
+  }],
   googleId: {
     type: String,
     default: null,

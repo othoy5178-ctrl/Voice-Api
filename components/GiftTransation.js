@@ -2,8 +2,7 @@ import mongoose from "mongoose";
 
 const GiftTransactionSchema = new mongoose.Schema({
   roomId: {
-    type: mongoose.Schema.Types.ObjectId,
-    ref: "Room",
+    type: mongoose.Schema.Types.Mixed,
     required: true,
     index: true
   },
