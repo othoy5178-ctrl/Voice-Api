@@ -7,7 +7,7 @@ const storeItemSchema = new mongoose.Schema({
   section: { type: String, default: 'New This Month', index: true },
   type: { type: String, required: true, index: true },
   price: { type: Number, required: true, min: 0 },
-  currency: { type: String, enum: ['daimon', 'chang'], default: 'daimon' },
+  currency: { type: String, enum: ['daimon', 'chang'], default: 'chang' },
   durationDays: { type: Number, default: 0 },
   imageUrl: { type: String, default: '' },
   previewUrl: { type: String, default: '' },

@@ -59,15 +59,15 @@ const createCleanSlotsBlueprint = () => Array.from({ length: 25 }, (_, i) => ({
 
 
 const DEFAULT_STORE_ITEMS = [
-  { itemKey: 'toyota_ride', name: 'Toyota', category: 'Ride', section: 'New This Month', type: 'ride', price: 400, currency: 'daimon', durationDays: 30, assetKey: 'Ride', sortOrder: 1 },
-  { itemKey: 'premium_badge', name: 'Premium', category: 'Honor', section: 'New This Month', type: 'badge', price: 30, currency: 'daimon', durationDays: 1, assetKey: 'premium', sortOrder: 2 },
-  { itemKey: 'jupiter_rare_id', name: 'Jupiter', category: 'Rare ID', section: 'New This Month', type: 'rareId', price: 12, currency: 'daimon', durationDays: 7, assetKey: 'RareId', sortOrder: 3 },
-  { itemKey: 'gilded_precious_frame', name: 'Gilded Precious', category: 'Profile', section: 'Avatar Frame', type: 'frame', price: 400, currency: 'daimon', durationDays: 30, assetKey: 'profileBadge', equipValue: 'profileBadge', sortOrder: 4 },
-  { itemKey: 'panther_frame', name: 'Panther', category: 'Profile', section: 'Avatar Frame', type: 'frame', price: 400, currency: 'daimon', durationDays: 30, assetKey: 'higher', equipValue: 'higher', sortOrder: 5 },
-  { itemKey: 'lion_king_frame', name: 'Lion King', category: 'Profile', section: 'Avatar Frame', type: 'frame', price: 400, currency: 'daimon', durationDays: 30, assetKey: 'special', equipValue: 'special', sortOrder: 6 },
-  { itemKey: 'honor_star', name: 'Honor Star', category: 'Honor', section: 'Avatar Frame', type: 'badge', price: 250, currency: 'daimon', durationDays: 15, assetKey: 'honor-star', sortOrder: 7 },
-  { itemKey: 'popular_flower', name: 'Flower Aura', category: 'Popular', section: 'Avatar Frame', type: 'frame', price: 180, currency: 'daimon', durationDays: 30, assetKey: 'flower', equipValue: 'flower', sortOrder: 8 },
-  { itemKey: 'star_entry_effect', name: 'Star Entry', category: 'Popular', section: 'New This Month', type: 'entryVideo', price: 300, currency: 'daimon', durationDays: 30, assetKey: 'star', previewUrl: 'https://www.w3schools.com/html/mov_bbb.mp4', equipValue: 'https://www.w3schools.com/html/mov_bbb.mp4', sortOrder: 9 }
+  { itemKey: 'toyota_ride', name: 'Toyota', category: 'Ride', section: 'New This Month', type: 'ride', price: 400, currency: 'chang', durationDays: 30, assetKey: 'Ride', sortOrder: 1 },
+  { itemKey: 'premium_badge', name: 'Premium', category: 'Honor', section: 'New This Month', type: 'badge', price: 30, currency: 'chang', durationDays: 1, assetKey: 'premium', sortOrder: 2 },
+  { itemKey: 'jupiter_rare_id', name: 'Jupiter', category: 'Rare ID', section: 'New This Month', type: 'rareId', price: 12, currency: 'chang', durationDays: 7, assetKey: 'RareId', sortOrder: 3 },
+  { itemKey: 'gilded_precious_frame', name: 'Gilded Precious', category: 'Profile', section: 'Avatar Frame', type: 'frame', price: 400, currency: 'chang', durationDays: 30, assetKey: 'profileBadge', equipValue: 'profileBadge', sortOrder: 4 },
+  { itemKey: 'panther_frame', name: 'Panther', category: 'Profile', section: 'Avatar Frame', type: 'frame', price: 400, currency: 'chang', durationDays: 30, assetKey: 'higher', equipValue: 'higher', sortOrder: 5 },
+  { itemKey: 'lion_king_frame', name: 'Lion King', category: 'Profile', section: 'Avatar Frame', type: 'frame', price: 400, currency: 'chang', durationDays: 30, assetKey: 'special', equipValue: 'special', sortOrder: 6 },
+  { itemKey: 'honor_star', name: 'Honor Star', category: 'Honor', section: 'Avatar Frame', type: 'badge', price: 250, currency: 'chang', durationDays: 15, assetKey: 'honor-star', sortOrder: 7 },
+  { itemKey: 'popular_flower', name: 'Flower Aura', category: 'Popular', section: 'Avatar Frame', type: 'frame', price: 180, currency: 'chang', durationDays: 30, assetKey: 'flower', equipValue: 'flower', sortOrder: 8 },
+  { itemKey: 'star_entry_effect', name: 'Star Entry', category: 'Popular', section: 'New This Month', type: 'entryVideo', price: 300, currency: 'chang', durationDays: 30, assetKey: 'star', previewUrl: 'https://www.w3schools.com/html/mov_bbb.mp4', equipValue: 'https://www.w3schools.com/html/mov_bbb.mp4', sortOrder: 9 }
 ];
 
 const ensureDefaultStoreItems = async () => {
@@ -222,7 +222,6 @@ const getRewardDayRange = (date = new Date()) => {
   end.setDate(end.getDate() + 1);
   return { start, end, dayKey: start.toISOString().slice(0, 10) };
 };
-
 const DAILY_CHECK_IN_COOLDOWN_MS = 24 * 60 * 60 * 1000;
 
 const getDailyCheckInAvailability = async (userId, now = new Date()) => {
@@ -546,22 +545,30 @@ io.on('connection', (socket) => {
       return;
     }
 
-    const totalCost = coins * quantity;
+    const coinPrice = Number(coins);
+    const giftQuantity = Number(quantity);
+
+    if (!Number.isFinite(coinPrice) || !Number.isFinite(giftQuantity) || coinPrice <= 0 || giftQuantity <= 0) {
+      socket.emit('gift_error', { message: "Invalid gift cost received." });
+      return;
+    }
+
+    const totalCost = coinPrice * giftQuantity;
 
     const session = await mongoose.startSession();
     session.startTransaction();
 
 
     try {
-      const sender = await User.findByIdAndUpdate(
-        userId,
-        { $inc: { daimon: -totalCost } },
+      const sender = await User.findOneAndUpdate(
+        { _id: userId, chang: { $gte: totalCost } },
+        { $inc: { chang: -totalCost } },
         { new: true, session }
       );
 
-      if (!sender || sender.daimon < 0) throw new Error("Insufficient funds");
+      if (!sender) throw new Error("Insufficient coins");
 
-      // 2. Add to Receiver (Host)
+      // 2. Add earned diamonds to Receiver (Host)
       await User.findByIdAndUpdate(
         hostId,
         { $inc: { daimon: totalCost } },
@@ -574,8 +581,8 @@ io.on('connection', (socket) => {
         receiverId: hostId,
         giftName,
         giftImage: gift,
-        coinPrice: coins,
-        quantity,
+        coinPrice,
+        quantity: giftQuantity,
         totalCost
       }], { session });
 
@@ -599,7 +606,7 @@ io.on('connection', (socket) => {
       gift: gift,
       giftName: giftName,
       avatar: avatar,
-      quantity: quantity,
+      quantity: giftQuantity,
       totalCost,
       userId: userId
     });
@@ -1674,13 +1681,13 @@ app.post('/store/purchase', async (req, res) => {
       return res.status(400).json({ success: false, message: 'Item already owned' });
     }
 
-    const user = await User.findByIdAndUpdate(
-      userId,
-      { $inc: { [item.currency]: -item.price } },
+    const user = await User.findOneAndUpdate(
+      { _id: userId, chang: { $gte: item.price } },
+      { $inc: { chang: -item.price } },
       { new: true, session }
     );
 
-    if (!user || user[item.currency] < 0) throw new Error('Insufficient balance');
+    if (!user) throw new Error('Insufficient coins');
 
     const expiresAt = getStoreExpiry(item);
     await UserStoreItem.findOneAndUpdate(
@@ -2152,6 +2159,7 @@ app.post('/check-follow', async (req, res) => {
 server.listen(PORT, () => {
   console.log(`Server listening on port ${PORT}`);
 });
+
 
 
 
