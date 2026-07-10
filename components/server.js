@@ -19,6 +19,7 @@ import RewardClaim from './RewardClaim.js';
 import StoreItem from './StoreItem.js';
 import UserStoreItem from './UserStoreItem.js';
 import Withdrawal from './Withdrawal.js';
+import AuthSession from './AuthSession.js';
 import cloudinary from './utils/cloudinary.js';
 import bcrypt from "bcryptjs";
 
@@ -58,97 +59,55 @@ const WITHDRAW_METHODS = ['Easypaisa', 'JazzCash', 'Bank'];
 const MIN_WITHDRAW_AMOUNT = 1000;
 const TOKEN_TTL_SECONDS = 60 * 60 * 24 * 30;
 
-const getEnvValue = (key) => {
-  const value = process.env[key];
-  return typeof value === 'string' ? value.trim() : '';
-};
+const TOKEN_TTL_MS = TOKEN_TTL_SECONDS * 1000;
 
-const getTokenSecret = () => getEnvValue('JWT_SECRET') || getEnvValue('AUTH_TOKEN_SECRET');
-
-const base64UrlEncode = (value) => Buffer.from(value)
+const createAuthTokenValue = () => crypto
+  .randomBytes(48)
   .toString('base64')
   .replace(/=/g, '')
   .replace(/\+/g, '-')
   .replace(/\//g, '_');
 
-const base64UrlDecode = (value) => Buffer.from(
-  value.replace(/-/g, '+').replace(/_/g, '/'),
-  'base64'
-).toString('utf8');
+const hashAuthToken = (token) => crypto
+  .createHash('sha256')
+  .update(String(token || ''))
+  .digest('hex');
 
-const signAuthToken = (user) => {
-  const secret = getTokenSecret();
-  if (!secret) {
-    const error = new Error('JWT_SECRET or AUTH_TOKEN_SECRET is not configured');
-    error.statusCode = 500;
-    throw error;
-  }
+const signAuthToken = async (user) => {
+  const token = createAuthTokenValue();
+  await AuthSession.create({
+    userId: user._id,
+    tokenHash: hashAuthToken(token),
+    expiresAt: new Date(Date.now() + TOKEN_TTL_MS)
+  });
 
-  const now = Math.floor(Date.now() / 1000);
-  const header = { alg: 'HS256', typ: 'JWT' };
-  const payload = {
-    sub: user._id.toString(),
-    role: user.role || 'user',
-    iat: now,
-    exp: now + TOKEN_TTL_SECONDS
-  };
-  const encodedHeader = base64UrlEncode(JSON.stringify(header));
-  const encodedPayload = base64UrlEncode(JSON.stringify(payload));
-  const signature = crypto
-    .createHmac('sha256', secret)
-    .update(`${encodedHeader}.${encodedPayload}`)
-    .digest('base64')
-    .replace(/=/g, '')
-    .replace(/\+/g, '-')
-    .replace(/\//g, '_');
-
-  return `${encodedHeader}.${encodedPayload}.${signature}`;
+  return token;
 };
 
-const verifyAuthToken = (token) => {
-  const secret = getTokenSecret();
-  if (!secret) {
-    const error = new Error('JWT_SECRET or AUTH_TOKEN_SECRET is not configured');
-    error.statusCode = 500;
-    throw error;
-  }
-
-  const [encodedHeader, encodedPayload, signature] = String(token || '').split('.');
-  if (!encodedHeader || !encodedPayload || !signature) {
+const verifyAuthToken = async (token) => {
+  const tokenValue = String(token || '').trim();
+  if (!tokenValue) {
     const error = new Error('Invalid auth token');
     error.statusCode = 401;
     throw error;
   }
 
-  const expected = crypto
-    .createHmac('sha256', secret)
-    .update(`${encodedHeader}.${encodedPayload}`)
-    .digest('base64')
-    .replace(/=/g, '')
-    .replace(/\+/g, '-')
-    .replace(/\//g, '_');
+  const session = await AuthSession.findOneAndUpdate(
+    {
+      tokenHash: hashAuthToken(tokenValue),
+      expiresAt: { $gt: new Date() }
+    },
+    { $set: { lastUsedAt: new Date() } },
+    { new: true }
+  ).select('userId').lean();
 
-  const expectedBuffer = Buffer.from(expected);
-  const receivedBuffer = Buffer.from(signature);
-  if (expectedBuffer.length !== receivedBuffer.length || !crypto.timingSafeEqual(expectedBuffer, receivedBuffer)) {
+  if (!session?.userId || !mongoose.Types.ObjectId.isValid(session.userId)) {
     const error = new Error('Invalid auth token');
     error.statusCode = 401;
     throw error;
   }
 
-  const payload = JSON.parse(base64UrlDecode(encodedPayload));
-  if (!payload?.sub || !mongoose.Types.ObjectId.isValid(payload.sub)) {
-    const error = new Error('Invalid auth token');
-    error.statusCode = 401;
-    throw error;
-  }
-  if (payload.exp && payload.exp < Math.floor(Date.now() / 1000)) {
-    const error = new Error('Auth token expired');
-    error.statusCode = 401;
-    throw error;
-  }
-
-  return payload;
+  return { sub: session.userId.toString() };
 };
 
 const requireAuthUser = async (req, res) => {
@@ -160,7 +119,7 @@ const requireAuthUser = async (req, res) => {
   }
 
   try {
-    const payload = verifyAuthToken(token);
+    const payload = await verifyAuthToken(token);
     const user = await User.findById(payload.sub).select('_id role hostStatus').lean();
     if (!user) {
       res.status(401).json({ success: false, message: 'Authentication user not found' });
@@ -2468,7 +2427,7 @@ app.post('/register', async (req, res) => {
       if (!user.glixId) {
         user = await ensureUserPublicId(user);
       }
-      const token = signAuthToken(user);
+      const token = await signAuthToken(user);
       return res.status(200).json({
         message: 'Login successful!',
         token,
@@ -2487,7 +2446,7 @@ app.post('/register', async (req, res) => {
       glixId: await createUniqueUserPublicId()
     });
     await newUser.save();
-    const token = signAuthToken(newUser);
+    const token = await signAuthToken(newUser);
     return res.status(201).json({
       message: 'Registered!',
       token,
@@ -2523,7 +2482,7 @@ app.post('/login', async (req, res) => {
     user.lastLogin = new Date();
     await user.save();
 
-    const token = signAuthToken(user);
+    const token = await signAuthToken(user);
     return res.status(200).json({
       success: true,
       message: 'Login successful!',
@@ -3148,6 +3107,11 @@ app.get('/settings/:userId/diagnostics', async (req, res) => {
 app.post('/settings/:userId/logout', async (req, res) => {
   try {
     const { userId } = req.params;
+    const authorization = req.headers.authorization || '';
+    const token = authorization.startsWith('Bearer ') ? authorization.slice(7).trim() : '';
+    if (token) {
+      await AuthSession.deleteOne({ tokenHash: hashAuthToken(token) });
+    }
     if (mongoose.Types.ObjectId.isValid(userId)) {
       await User.findByIdAndUpdate(userId, { $set: { lastLogin: new Date() } });
     }
