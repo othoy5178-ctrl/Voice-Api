@@ -2451,6 +2451,51 @@ app.post('/register', async (req, res) => {
   }
 });
 
+app.post('/login', async (req, res) => {
+  try {
+    const { email, password } = req.body;
+    const normalizedEmail = email?.toLowerCase().trim();
+
+    if (!normalizedEmail) return res.status(400).json({ message: 'Email is required' });
+    if (!password) return res.status(400).json({ message: 'Password is required' });
+
+    let user = await User.findOne({ email: normalizedEmail });
+    if (!user || !user.password) {
+      return res.status(401).json({ message: 'Invalid email or password' });
+    }
+
+    const passwordMatches = await bcrypt.compare(password, user.password);
+    if (!passwordMatches) {
+      return res.status(401).json({ message: 'Invalid email or password' });
+    }
+
+    if (!user.glixId) {
+      user = await ensureUserPublicId(user);
+    }
+
+    user.lastLogin = new Date();
+    await user.save();
+
+    const token = signAuthToken(user);
+    return res.status(200).json({
+      success: true,
+      message: 'Login successful!',
+      token,
+      user: {
+        id: user._id,
+        name: user.name,
+        email: user.email,
+        glixId: user.glixId,
+        profilePic: user.profilePic || '',
+        role: user.role || 'user',
+        hostStatus: user.hostStatus || 'none'
+      }
+    });
+  } catch (error) {
+    return res.status(500).json({ message: error.message });
+  }
+});
+
 
 
 const getRankPeriodMatch = (period) => {
