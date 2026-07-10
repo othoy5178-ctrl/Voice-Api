@@ -53,7 +53,6 @@ const activeUsers = {};
 const roomMembers = new Map();
 const pendingHostDisconnects = new Map();
 const HOST_RECONNECT_GRACE_MS = 30000;
-const LIVE_CREATOR_ROLES = ['agency', 'manager', 'admin'];
 const HOST_REVIEWER_ROLES = ['manager', 'admin'];
 const WITHDRAW_METHODS = ['Easypaisa', 'JazzCash', 'Bank'];
 const MIN_WITHDRAW_AMOUNT = 1000;
@@ -171,10 +170,14 @@ const requireAuthUser = async (req, res) => {
 
 const canCreateLiveRoom = async (userId) => {
   if (!mongoose.Types.ObjectId.isValid(userId)) return false;
+  const user = await User.findById(userId).select('_id').lean();
+  return !!user;
+};
+
+const canClaimRewards = async (userId) => {
+  if (!mongoose.Types.ObjectId.isValid(userId)) return false;
   const user = await User.findById(userId).select('role hostStatus').lean();
-  if (!user) return false;
-  if (LIVE_CREATOR_ROLES.includes(user.role)) return true;
-  return user.role === 'host' && user.hostStatus === 'approved';
+  return user?.role === 'host' && user.hostStatus === 'approved';
 };
 
 const canReviewHostRequests = async (userId) => {
@@ -1405,7 +1408,7 @@ app.post('/create-video', async (req, res) => {
     if (!hostId) return res.status(400).json({ success: false, error: 'Host identifier missing' });
     if (!numericUid) return res.status(400).json({ success: false, error: 'Numeric UID missing for token generation' });
     if (!(await canCreateLiveRoom(hostId))) {
-      return res.status(403).json({ success: false, error: 'Only approved host, agency, manager, or admin accounts can create live rooms.' });
+      return res.status(403).json({ success: false, error: 'Login is required to create live rooms.' });
     }
 
     const uniqueChannelName = `glix_${hostId}_${Date.now().toString().slice(-4)}`;
@@ -1549,7 +1552,7 @@ app.post('/create', async (req, res) => {
     const { title, hostId, numericUid } = req.body;
     if (!hostId) return res.status(400).json({ success: false, error: 'Host identifier missing' });
     if (!(await canCreateLiveRoom(hostId))) {
-      return res.status(403).json({ success: false, error: 'Only approved host, agency, manager, or admin accounts can create live rooms.' });
+      return res.status(403).json({ success: false, error: 'Login is required to create live rooms.' });
     }
     const sanitizedUid = parseInt(numericUid, 10) || 0;
 
@@ -2774,6 +2777,9 @@ app.post('/rewards/claim', async (req, res) => {
     const task = REWARD_TASKS.find(item => item.key === taskKey);
     if (!task) return res.status(404).json({ success: false, message: 'Reward task not found' });
     if (!mongoose.Types.ObjectId.isValid(userId)) return res.status(400).json({ success: false, message: 'Invalid user id' });
+    if (!(await canClaimRewards(userId))) {
+      return res.status(403).json({ success: false, message: 'Only approved hosts can claim rewards' });
+    }
 
     const now = new Date();
     const { start, end, dayKey } = getRewardDayRange(now);
