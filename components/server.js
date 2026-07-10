@@ -58,7 +58,12 @@ const WITHDRAW_METHODS = ['Easypaisa', 'JazzCash', 'Bank'];
 const MIN_WITHDRAW_AMOUNT = 1000;
 const TOKEN_TTL_SECONDS = 60 * 60 * 24 * 30;
 
-const getTokenSecret = () => process.env.JWT_SECRET || process.env.AUTH_TOKEN_SECRET || '';
+const getEnvValue = (key) => {
+  const value = process.env[key];
+  return typeof value === 'string' ? value.trim() : '';
+};
+
+const getTokenSecret = () => getEnvValue('JWT_SECRET') || getEnvValue('AUTH_TOKEN_SECRET');
 
 const base64UrlEncode = (value) => Buffer.from(value)
   .toString('base64')
@@ -74,7 +79,7 @@ const base64UrlDecode = (value) => Buffer.from(
 const signAuthToken = (user) => {
   const secret = getTokenSecret();
   if (!secret) {
-    const error = new Error('JWT_SECRET is not configured');
+    const error = new Error('JWT_SECRET or AUTH_TOKEN_SECRET is not configured');
     error.statusCode = 500;
     throw error;
   }
@@ -103,7 +108,7 @@ const signAuthToken = (user) => {
 const verifyAuthToken = (token) => {
   const secret = getTokenSecret();
   if (!secret) {
-    const error = new Error('JWT_SECRET is not configured');
+    const error = new Error('JWT_SECRET or AUTH_TOKEN_SECRET is not configured');
     error.statusCode = 500;
     throw error;
   }
