@@ -365,11 +365,69 @@ const clearHostDisconnectClosure = (roomId, hostId) => {
 const createCleanSlotsBlueprint = () => Array.from({ length: 25 }, (_, i) => ({
   id: i + 1,
   locked: i === 3 || i === 12 || i === 19,
+  userId: null,
   uid: null,
   username: `${i + 1}`,
   avatar: null,
+  frameUrl: null,
   isMuted: false
 }));
+
+const buildRoomSlotsSnapshot = async (roomId) => {
+  const stringRoomId = roomId ? roomId.toString() : '';
+  const slots = createCleanSlotsBlueprint();
+
+  if (stringRoomId.startsWith('glix_')) {
+    const videoRoomDoc = await Room.findOne({ channelName: stringRoomId }).lean();
+    if (videoRoomDoc?.slots) {
+      videoRoomDoc.slots.slice(0, 25).forEach((slot, index) => {
+        slots[index] = {
+          ...slots[index],
+          ...slot,
+          userId: slot.userId || null,
+          uid: slot.uid ?? slot.numericUid ?? null,
+          username: slot.username || slot.name || slots[index].username,
+          avatar: slot.avatar || slot.profilePic || null,
+          frameUrl: slot.frameUrl || null,
+          isMuted: !!slot.isMuted
+        };
+      });
+    }
+    return slots;
+  }
+
+  if (!mongoose.Types.ObjectId.isValid(stringRoomId)) return slots;
+
+  const audioRoomDoc = await AudioRoom.findById(stringRoomId)
+    .populate('speakers.userId', 'name profilePic')
+    .lean();
+
+  if (!audioRoomDoc?.speakers) return slots;
+
+  audioRoomDoc.speakers.filter(speaker => speaker && speaker.userId).forEach(speaker => {
+    const index = speaker.slotIndex;
+    if (index < 0 || index >= 25) return;
+    const speakerUserId = speaker.userId?._id || speaker.userId;
+    slots[index] = {
+      ...slots[index],
+      userId: speakerUserId ? speakerUserId.toString() : null,
+      uid: speaker.numericUid || null,
+      username: speaker.userId?.name || 'Broadcaster',
+      avatar: speaker.userId?.profilePic || null,
+      frameUrl: speaker.frameUrl || null,
+      isMuted: !!speaker.isMuted
+    };
+  });
+
+  return slots;
+};
+
+const emitRoomSlotsSnapshot = async (roomId) => {
+  const stringRoomId = roomId ? roomId.toString() : '';
+  if (!stringRoomId) return;
+  const slots = await buildRoomSlotsSnapshot(stringRoomId);
+  io.to(stringRoomId).emit('room_slots_updated', slots);
+};
 
 
 const DEFAULT_STORE_ITEMS = [
@@ -739,34 +797,7 @@ io.on('connection', (socket) => {
         socket.emit('play_my_own_entry_effect', { entryVideoUrl: finalEntryVideoUrl });
       }
 
-      const isVideoRoom = stringRoomId.startsWith('glix_');
-      let completeLayoutMatrix = createCleanSlotsBlueprint();
-
-      if (isVideoRoom) {
-        const videoRoomDoc = await Room.findOne({ channelName: stringRoomId });
-        if (videoRoomDoc && videoRoomDoc.slots) {
-          completeLayoutMatrix = videoRoomDoc.slots;
-        }
-      } else {
-        if (mongoose.Types.ObjectId.isValid(stringRoomId)) {
-          const audioRoomDoc = await AudioRoom.findById(stringRoomId).populate('speakers.userId', 'name profilePic');
-          if (audioRoomDoc && audioRoomDoc.speakers) {
-            audioRoomDoc.speakers.filter(speaker => speaker && speaker.userId).forEach(speaker => {
-              const index = speaker.slotIndex;
-              if (index >= 0 && index < 25) {
-                completeLayoutMatrix[index] = {
-                  ...completeLayoutMatrix[index],
-                  uid: speaker.numericUid || null,
-                  username: speaker.userId?.name || "Broadcaster",
-                  avatar: speaker.userId?.profilePic || null,
-                  frameUrl: speaker.frameUrl || null,
-                  isMuted: speaker.isMuted || false
-                };
-              }
-            });
-          }
-        }
-      }
+      const completeLayoutMatrix = await buildRoomSlotsSnapshot(stringRoomId);
 
       socket.emit('initialize_room_slots', completeLayoutMatrix);
       await emitRoomStats(stringRoomId);
@@ -777,8 +808,17 @@ io.on('connection', (socket) => {
   });
 
   // 2. EVENT: Request Slot Change
-  socket.on('request_slot_change', async ({ roomId, userId, name, profilePic, frameUrl, targetSlotIndex, numericUid, isMuted }) => {
+  socket.on('request_slot_change', async ({ roomId, userId, name, profilePic, frameUrl, targetSlotIndex, numericUid, isMuted, locked }) => {
     try {
+      const stringRoomId = roomId ? roomId.toString() : '';
+
+      if (typeof locked === 'boolean') {
+        io.to(stringRoomId).emit('slot_lock_changed', {
+          slotIndex: targetSlotIndex,
+          locked
+        });
+        return;
+      }
 
       let finalFrameUrl = frameUrl;
 
@@ -788,7 +828,6 @@ io.on('connection', (socket) => {
         finalFrameUrl = dbUser?.frameUrl || null;
       }
 
-      const stringRoomId = roomId ? roomId.toString() : '';
       const isVideoRoom = stringRoomId.startsWith('glix_');
       const queryFilter = isVideoRoom ? { channelName: stringRoomId } : { _id: stringRoomId };
 
@@ -850,6 +889,7 @@ io.on('connection', (socket) => {
           isMuted: isMuted || false
         }
       });
+      await emitRoomSlotsSnapshot(stringRoomId);
 
     } catch (error) {
       console.log("Socket array persistence exception error:", error);
@@ -1035,6 +1075,7 @@ io.on('connection', (socket) => {
           isMuted: false
         }
       });
+      await emitRoomSlotsSnapshot(stringRoomId);
 
     } catch (err) {
       console.log("Host response error:", err);
@@ -1275,6 +1316,7 @@ io.on('connection', (socket) => {
             isMuted: false
           }
         });
+        await emitRoomSlotsSnapshot(roomId);
       }
 
       if (!roomId || roomId.length !== 24 || !/^[0-9a-fA-F]{24}$/.test(roomId)) {

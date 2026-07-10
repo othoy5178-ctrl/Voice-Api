@@ -9,7 +9,8 @@ const audioRoomSchema = new mongoose.Schema({
     userId: { type: mongoose.Schema.Types.ObjectId, ref: 'User' },
     isMuted: { type: Boolean, default: false },
     slotIndex: { type: Number },
-    numericUid: { type: Number }
+    numericUid: { type: Number },
+    frameUrl: { type: String, default: null }
   }],
 
   // Track everyone currently listening
