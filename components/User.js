@@ -74,6 +74,109 @@ const userSchema = new mongoose.Schema({
   followingCount: { type: Number, default: 0 },
   daimon: { type: Number, default: 0 },
   chang: { type: Number, default: 0 },
+  role: {
+    type: String,
+    enum: ['user', 'host', 'agency', 'manager', 'admin'],
+    default: 'user',
+    index: true
+  },
+  agencyId: {
+    type: mongoose.Schema.Types.ObjectId,
+    ref: 'User',
+    default: null,
+    index: true
+  },
+  agencyCode: {
+    type: String,
+    trim: true,
+    uppercase: true,
+    sparse: true,
+    index: true
+  },
+  managerPermissions: {
+    type: [String],
+    default: []
+  },
+  commissionBalance: { type: Number, default: 0 },
+  revenueBalance: { type: Number, default: 0 },
+  totalHostCoins: { type: Number, default: 0 },
+  hostStatus: {
+    type: String,
+    enum: ['none', 'pending', 'approved', 'rejected'],
+    default: 'none',
+    index: true
+  },
+  hostRejectionReason: { type: String, trim: true, default: '' },
+  hostRegistration: {
+    fullName: { type: String, trim: true, default: '' },
+    gender: {
+      type: String,
+      enum: ['Male', 'Female', 'Other', ''],
+      default: ''
+    },
+    hostType: {
+      type: String,
+      enum: ['Video Live Host', 'Voice Live Host', ''],
+      default: ''
+    },
+    agencySelection: {
+      type: String,
+      enum: ['Official', 'Other Agency', ''],
+      default: ''
+    },
+    agencyCode: { type: String, trim: true, uppercase: true, default: '' },
+    phoneCountryCode: { type: String, trim: true, default: '' },
+    phoneNumber: { type: String, trim: true, default: '' },
+    profilePhotoUrl: { type: String, default: '' },
+    idFrontUrl: { type: String, default: '' },
+    idBackUrl: { type: String, default: '' },
+    selfiePhotoUrl: { type: String, default: '' },
+    status: {
+      type: String,
+      enum: ['none', 'pending', 'approved', 'rejected'],
+      default: 'none'
+    },
+    rejectionReason: { type: String, trim: true, default: '' },
+    reviewedBy: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: 'User',
+      default: null
+    },
+    reviewedAt: { type: Date, default: null },
+    acceptedTerms: { type: Boolean, default: false },
+    registeredAt: { type: Date, default: null }
+  },
+  agencyStatus: {
+    type: String,
+    enum: ['none', 'pending', 'approved', 'rejected'],
+    default: 'none',
+    index: true
+  },
+  agencyRejectionReason: { type: String, trim: true, default: '' },
+  agencyRegistration: {
+    agencyName: { type: String, trim: true, default: '' },
+    ownerName: { type: String, trim: true, default: '' },
+    requestedAgencyCode: { type: String, trim: true, uppercase: true, default: '' },
+    phoneCountryCode: { type: String, trim: true, default: '' },
+    phoneNumber: { type: String, trim: true, default: '' },
+    city: { type: String, trim: true, default: '' },
+    expectedHosts: { type: Number, default: 0 },
+    experience: { type: String, trim: true, default: '' },
+    status: {
+      type: String,
+      enum: ['none', 'pending', 'approved', 'rejected'],
+      default: 'none'
+    },
+    rejectionReason: { type: String, trim: true, default: '' },
+    reviewedBy: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: 'User',
+      default: null
+    },
+    reviewedAt: { type: Date, default: null },
+    acceptedTerms: { type: Boolean, default: false },
+    registeredAt: { type: Date, default: null }
+  },
 });
 
 // Changed model name to 'User' to follow standard naming conventions
