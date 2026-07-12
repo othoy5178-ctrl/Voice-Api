@@ -20,6 +20,7 @@ import StoreItem from './StoreItem.js';
 import UserStoreItem from './UserStoreItem.js';
 import Withdrawal from './Withdrawal.js';
 import AuthSession from './AuthSession.js';
+import ProfileVisit from './ProfileVisit.js';
 import cloudinary from './utils/cloudinary.js';
 import bcrypt from "bcryptjs";
 
@@ -53,6 +54,7 @@ const io = new Server(server, {
 const activeUsers = {};
 const roomMembers = new Map();
 const pendingHostDisconnects = new Map();
+const audioRoomControllers = new Map();
 const HOST_RECONNECT_GRACE_MS = 30000;
 const HOST_REVIEWER_ROLES = ['manager', 'admin'];
 const WITHDRAW_METHODS = ['Easypaisa', 'JazzCash', 'Bank'];
@@ -279,6 +281,7 @@ const closeRoomAfterHostTimeout = async (roomId, hostId) => {
   audioRoomDoc.audience = [];
   await audioRoomDoc.save();
   roomMembers.delete(roomId);
+  audioRoomControllers.delete(roomId);
 
   io.to(roomId).emit('audio_room_ended', {
     message: 'Host disconnected. Room closed.'
@@ -391,6 +394,48 @@ const emitRoomSlotsSnapshot = async (roomId) => {
   if (!stringRoomId) return;
   const slots = await buildRoomSlotsSnapshot(stringRoomId);
   io.to(stringRoomId).emit('room_slots_updated', slots);
+};
+
+const getSpeakerMatch = (speakers = [], { targetUserId, targetUid, targetSlotIndex }) => {
+  const hasTargetSlot = targetSlotIndex !== null && targetSlotIndex !== undefined;
+  const normalizedSlotIndex = hasTargetSlot ? Number(targetSlotIndex) : null;
+
+  if (targetUserId) {
+    const speaker = speakers.find(item => {
+      const speakerUserId = item?.userId?._id || item?.userId;
+      return speakerUserId && String(speakerUserId) === String(targetUserId);
+    });
+    if (speaker) return speaker;
+  }
+
+  if (targetUid !== null && targetUid !== undefined) {
+    const speaker = speakers.find(item => (
+      item?.numericUid !== null &&
+      item?.numericUid !== undefined &&
+      String(item.numericUid) === String(targetUid)
+    ));
+    if (speaker) return speaker;
+  }
+
+  if (Number.isInteger(normalizedSlotIndex)) {
+    return speakers.find(item => Number(item?.slotIndex) === normalizedSlotIndex) || null;
+  }
+
+  return null;
+};
+
+const isAudioRoomController = (roomId, userId) => {
+  if (!roomId || !userId) return false;
+  const controllers = audioRoomControllers.get(roomId.toString());
+  return !!controllers?.has(userId.toString());
+};
+
+const addAudioRoomController = (roomId, userId) => {
+  if (!roomId || !userId) return;
+  const stringRoomId = roomId.toString();
+  const controllers = audioRoomControllers.get(stringRoomId) || new Set();
+  controllers.add(userId.toString());
+  audioRoomControllers.set(stringRoomId, controllers);
 };
 
 
@@ -824,6 +869,15 @@ io.on('connection', (socket) => {
             $pull: { speakers: { slotIndex: targetSlotIndex } }
           });
         } else {
+          if (!finalFrameUrl) {
+            const existingRoom = await AudioRoom.findById(stringRoomId).select('speakers').lean();
+            const existingSpeaker = existingRoom?.speakers?.find(speaker => (
+              (speaker?.userId && String(speaker.userId) === String(userId)) ||
+              Number(speaker?.slotIndex) === Number(targetSlotIndex)
+            ));
+            finalFrameUrl = existingSpeaker?.frameUrl || null;
+          }
+
           await AudioRoom.findOneAndUpdate(queryFilter, {
             $pull: { speakers: { userId: userId } }
           });
@@ -835,7 +889,7 @@ io.on('connection', (socket) => {
                 slotIndex: targetSlotIndex,
                 numericUid: parseInt(numericUid, 10),
                 isMuted: isMuted || false,
-                frameUrl: frameUrl
+                frameUrl: finalFrameUrl
               }
             }
           });
@@ -861,9 +915,179 @@ io.on('connection', (socket) => {
     }
   });
 
+  socket.on('assign_audio_room_host', async ({ roomId, requesterId, targetUserId, targetUid, targetSlotIndex }) => {
+    try {
+      const stringRoomId = roomId ? roomId.toString() : '';
+      const actingUserId = requesterId || socket.userId;
+
+      if (!mongoose.Types.ObjectId.isValid(stringRoomId)) {
+        socket.emit('error_notice', { message: 'Invalid audio room.' });
+        return;
+      }
+
+      const room = await AudioRoom.findById(stringRoomId)
+        .populate('speakers.userId', 'name profilePic')
+        .select('hostId speakers isLive');
+
+      if (!room || !room.isLive) {
+        socket.emit('error_notice', { message: 'Audio room is not live.' });
+        return;
+      }
+
+      if (!actingUserId || String(room.hostId) !== String(actingUserId)) {
+        socket.emit('error_notice', { message: 'Only the current host can assign hosting.' });
+        return;
+      }
+
+      const targetSpeaker = getSpeakerMatch(room.speakers, { targetUserId, targetUid, targetSlotIndex });
+      const nextHostUserId = targetSpeaker?.userId?._id || targetSpeaker?.userId;
+
+      if (!targetSpeaker || !nextHostUserId) {
+        socket.emit('error_notice', { message: 'Selected user must be on a mic slot.' });
+        return;
+      }
+
+      addAudioRoomController(stringRoomId, nextHostUserId);
+
+      const pending = pendingHostDisconnects.get(stringRoomId);
+      if (pending) {
+        clearTimeout(pending.timer);
+        pendingHostDisconnects.delete(stringRoomId);
+      }
+
+      const assignedHostPayload = {
+        roomId: stringRoomId,
+        hostId: room.hostId.toString(),
+        assignedHostId: nextHostUserId.toString(),
+        assignedByUserId: actingUserId.toString(),
+        controller: {
+          userId: nextHostUserId.toString(),
+          uid: targetSpeaker.numericUid ?? null,
+          username: targetSpeaker.userId?.name || 'Host',
+          avatar: targetSpeaker.userId?.profilePic || null,
+          frameUrl: targetSpeaker.frameUrl || null,
+          slotIndex: targetSpeaker.slotIndex,
+        },
+        message: `${targetSpeaker.userId?.name || 'A mic user'} can now manage this room with the host.`
+      };
+
+      io.to(stringRoomId).emit('audio_room_host_assigned', assignedHostPayload);
+      await emitRoomSlotsSnapshot(stringRoomId);
+    } catch (error) {
+      console.log('Assign audio room host error:', error);
+      socket.emit('error_notice', { message: 'Failed to assign room host.' });
+    }
+  });
+
+  socket.on('remove_audio_mic_user', async ({ roomId, requesterId, targetUserId, targetUid, targetSlotIndex }) => {
+    try {
+      const stringRoomId = roomId ? roomId.toString() : '';
+      const actingUserId = requesterId || socket.userId;
+
+      if (!mongoose.Types.ObjectId.isValid(stringRoomId)) {
+        socket.emit('error_notice', { message: 'Invalid audio room.' });
+        return;
+      }
+
+      const room = await AudioRoom.findById(stringRoomId)
+        .populate('speakers.userId', 'name profilePic')
+        .select('hostId speakers isLive');
+
+      if (!room || !room.isLive) {
+        socket.emit('error_notice', { message: 'Audio room is not live.' });
+        return;
+      }
+
+      const actingSpeaker = getSpeakerMatch(room.speakers, { targetUserId: actingUserId });
+      const actingUserIsHost = actingUserId && String(room.hostId) === String(actingUserId);
+      const actingUserIsController = isAudioRoomController(stringRoomId, actingUserId) && !!actingSpeaker;
+
+      if (!actingUserIsHost && !actingUserIsController) {
+        socket.emit('error_notice', { message: 'Only the host or assigned controller can remove users from mic.' });
+        return;
+      }
+
+      const targetSpeaker = getSpeakerMatch(room.speakers, { targetUserId, targetUid, targetSlotIndex });
+      const removedUserId = targetSpeaker?.userId?._id || targetSpeaker?.userId;
+
+      if (!targetSpeaker || !removedUserId) {
+        socket.emit('error_notice', { message: 'Selected user is not on a mic slot.' });
+        return;
+      }
+
+      if (String(removedUserId) === String(room.hostId)) {
+        socket.emit('error_notice', { message: 'Host cannot be removed from mic using this option.' });
+        return;
+      }
+
+      await AudioRoom.findByIdAndUpdate(stringRoomId, {
+        $pull: { speakers: { userId: removedUserId } },
+        $addToSet: { audience: removedUserId }
+      });
+
+      const removedSlotIndex = targetSpeaker.slotIndex;
+      const removedPayload = {
+        roomId: stringRoomId,
+        targetUserId: removedUserId.toString(),
+        targetUid: targetSpeaker.numericUid ?? null,
+        targetSlotIndex: removedSlotIndex,
+        message: 'The host removed you from the mic slot.'
+      };
+
+      io.to(stringRoomId).emit('audio_mic_user_removed', removedPayload);
+      io.to(stringRoomId).emit('slot_state_changed', {
+        slotIndex: removedSlotIndex,
+        user: {
+          uid: null,
+          userId: null,
+          username: "",
+          avatar: null,
+          frameUrl: null,
+          isMuted: false
+        }
+      });
+      await emitRoomSlotsSnapshot(stringRoomId);
+    } catch (error) {
+      console.log('Remove audio mic user error:', error);
+      socket.emit('error_notice', { message: 'Failed to remove mic user.' });
+    }
+  });
+
+  socket.on('send_expressive_emoji', (payload = {}) => {
+    const stringRoomId = payload.roomId ? payload.roomId.toString() : '';
+    if (!stringRoomId) return;
+
+    io.to(stringRoomId).emit('receive_expressive_emoji', {
+      ...payload,
+      id: payload.id || Date.now().toString() + Math.random().toString(),
+      type: 'expressive_emoji',
+      emoji: payload.emoji || payload.text,
+      text: payload.text || payload.emoji,
+      animationKey: payload.animationKey || payload.emojiId || null,
+      emojiId: payload.emojiId || payload.animationKey || null
+    });
+  });
+
   // 3. EVENT: Chat Messages
-  socket.on('send_message', ({ roomId, senderName, text, userId }) => {
+  socket.on('send_message', ({ roomId, senderName, text, userId, type, emoji, animationKey, emojiId, numericUid, targetSlotIndex }) => {
     const stringRoomId = roomId ? roomId.toString() : '';
+    if (type === 'expressive_emoji') {
+      io.to(stringRoomId).emit('receive_message', {
+        id: Date.now().toString() + Math.random().toString(),
+        type: 'expressive_emoji',
+        sender: senderName,
+        senderName,
+        text: text || emoji,
+        emoji: emoji || text,
+        animationKey: animationKey || emojiId || null,
+        emojiId: emojiId || animationKey || null,
+        userId,
+        numericUid,
+        targetSlotIndex
+      });
+      return;
+    }
+
     io.to(stringRoomId).emit('receive_message', {
       id: Date.now().toString() + Math.random().toString(),
       type: 'user',
@@ -1756,6 +1980,7 @@ app.post('/rooms/end', async (req, res) => {
         room.speakers = [];
         room.audience = [];
         await room.save();
+        audioRoomControllers.delete(stringRoomId);
 
         io.to(stringRoomId).emit('audio_room_ended', {
           message: "The live audio room has been closed by the host."
@@ -3010,6 +3235,28 @@ app.post('/settings/:userId/profile-picture', async (req, res) => {
   }
 });
 
+app.post('/settings/:userId/profile-name', async (req, res) => {
+  try {
+    const { userId } = req.params;
+    const cleanName = typeof req.body?.name === 'string' ? req.body.name.trim() : '';
+
+    if (!mongoose.Types.ObjectId.isValid(userId)) return res.status(400).json({ success: false, message: 'Invalid user id' });
+    if (cleanName.length < 2) return res.status(400).json({ success: false, message: 'Name must be at least 2 characters' });
+    if (cleanName.length > 40) return res.status(400).json({ success: false, message: 'Name must be 40 characters or less' });
+
+    const user = await User.findByIdAndUpdate(
+      userId,
+      { $set: { name: cleanName } },
+      { new: true }
+    ).select(PUBLIC_USER_FIELDS);
+
+    if (!user) return res.status(404).json({ success: false, message: 'User not found' });
+    return res.status(200).json({ success: true, name: user.name, user });
+  } catch (error) {
+    return res.status(500).json({ success: false, message: error.message });
+  }
+});
+
 app.post('/settings/:userId/password', async (req, res) => {
   try {
     const { userId } = req.params;
@@ -3165,6 +3412,192 @@ app.get('/profile/:id', async (req, res) => {
     return res.status(200).json(user);
   } catch (error) {
     return res.status(500).json({ message: error.message });
+  }
+});
+
+app.post('/profile/:profileUserId/visit', async (req, res) => {
+  try {
+    const { profileUserId } = req.params;
+    const { visitorId } = req.body || {};
+
+    if (!mongoose.Types.ObjectId.isValid(profileUserId) || !mongoose.Types.ObjectId.isValid(visitorId)) {
+      return res.status(400).json({ success: false, message: 'Invalid profile visit request' });
+    }
+
+    if (String(profileUserId) === String(visitorId)) {
+      return res.status(200).json({ success: true, recorded: false, message: 'Own profile visit ignored' });
+    }
+
+    const [profileUser, visitorExists] = await Promise.all([
+      User.findById(profileUserId).select('settings'),
+      User.exists({ _id: visitorId })
+    ]);
+
+    if (!profileUser || !visitorExists) {
+      return res.status(404).json({ success: false, message: 'Profile or visitor not found' });
+    }
+
+    if (profileUser.settings?.showProfileVisits === false) {
+      return res.status(200).json({ success: true, recorded: false, visible: false });
+    }
+
+    const now = new Date();
+    await ProfileVisit.findOneAndUpdate(
+      { profileUserId, visitorId },
+      {
+        $set: { visitedAt: now },
+        $inc: { visitCount: 1 }
+      },
+      { upsert: true, new: true, setDefaultsOnInsert: true }
+    );
+
+    return res.status(200).json({ success: true, recorded: true });
+  } catch (error) {
+    return res.status(500).json({ success: false, message: error.message });
+  }
+});
+
+app.get('/profile/:userId/visitors', async (req, res) => {
+  try {
+    const { userId } = req.params;
+    const { viewerId } = req.query;
+    const limit = Math.min(Math.max(parseInt(req.query.limit, 10) || 12, 1), 50);
+
+    if (!mongoose.Types.ObjectId.isValid(userId)) {
+      return res.status(400).json({ success: false, message: 'Invalid user id' });
+    }
+
+    const user = await User.findById(userId).select('settings');
+    if (!user) return res.status(404).json({ success: false, message: 'User not found' });
+
+    if (user.settings?.showProfileVisits === false) {
+      return res.status(200).json({ success: true, visible: false, visitors: [] });
+    }
+
+    const [totalVisitors, visits] = await Promise.all([
+      ProfileVisit.countDocuments({ profileUserId: userId }),
+      ProfileVisit.find({ profileUserId: userId })
+        .sort({ visitedAt: -1 })
+        .limit(limit)
+        .populate('visitorId', 'name profilePic glixId daimon')
+        .lean()
+    ]);
+
+    const visitorIds = visits.map(visit => visit.visitorId?._id?.toString()).filter(Boolean);
+    const followingSet = new Set();
+
+    if (viewerId && mongoose.Types.ObjectId.isValid(viewerId) && visitorIds.length) {
+      const followingRows = await Follow.find({
+        followerId: viewerId,
+        followingId: { $in: visitorIds }
+      }).select('followingId').lean();
+      followingRows.forEach(row => followingSet.add(row.followingId.toString()));
+    }
+
+    const visitors = visits
+      .filter(visit => visit.visitorId)
+      .map(visit => ({
+        id: visit.visitorId._id?.toString(),
+        name: visit.visitorId.name || 'User',
+        profilePic: visit.visitorId.profilePic || '',
+        glixId: visit.visitorId.glixId || '',
+        daimon: visit.visitorId.daimon || 0,
+        visitedAt: visit.visitedAt,
+        visitCount: visit.visitCount || 1,
+        isFollowing: followingSet.has(visit.visitorId._id?.toString())
+      }));
+
+    return res.status(200).json({ success: true, visible: true, totalVisitors, visitors });
+  } catch (error) {
+    return res.status(500).json({ success: false, message: error.message });
+  }
+});
+
+app.get('/profile/:userId/followers', async (req, res) => {
+  try {
+    const { userId } = req.params;
+    const { viewerId } = req.query;
+    const limit = Math.min(Math.max(parseInt(req.query.limit, 10) || 50, 1), 100);
+
+    if (!mongoose.Types.ObjectId.isValid(userId)) {
+      return res.status(400).json({ success: false, message: 'Invalid user id' });
+    }
+
+    const rows = await Follow.find({ followingId: userId })
+      .sort({ createdAt: -1 })
+      .limit(limit)
+      .populate('followerId', 'name profilePic glixId daimon')
+      .lean();
+
+    const followerIds = rows.map(row => row.followerId?._id?.toString()).filter(Boolean);
+    const followingSet = new Set();
+
+    if (viewerId && mongoose.Types.ObjectId.isValid(viewerId) && followerIds.length) {
+      const followingRows = await Follow.find({
+        followerId: viewerId,
+        followingId: { $in: followerIds }
+      }).select('followingId').lean();
+      followingRows.forEach(row => followingSet.add(row.followingId.toString()));
+    }
+
+    const users = rows
+      .filter(row => row.followerId)
+      .map(row => ({
+        id: row.followerId._id?.toString(),
+        name: row.followerId.name || 'User',
+        profilePic: row.followerId.profilePic || '',
+        glixId: row.followerId.glixId || '',
+        daimon: row.followerId.daimon || 0,
+        isFollowing: followingSet.has(row.followerId._id?.toString())
+      }));
+
+    return res.status(200).json({ success: true, users });
+  } catch (error) {
+    return res.status(500).json({ success: false, message: error.message });
+  }
+});
+
+app.get('/profile/:userId/following', async (req, res) => {
+  try {
+    const { userId } = req.params;
+    const { viewerId } = req.query;
+    const limit = Math.min(Math.max(parseInt(req.query.limit, 10) || 50, 1), 100);
+
+    if (!mongoose.Types.ObjectId.isValid(userId)) {
+      return res.status(400).json({ success: false, message: 'Invalid user id' });
+    }
+
+    const rows = await Follow.find({ followerId: userId })
+      .sort({ createdAt: -1 })
+      .limit(limit)
+      .populate('followingId', 'name profilePic glixId daimon')
+      .lean();
+
+    const followingIds = rows.map(row => row.followingId?._id?.toString()).filter(Boolean);
+    const followingSet = new Set();
+
+    if (viewerId && mongoose.Types.ObjectId.isValid(viewerId) && followingIds.length) {
+      const followingRows = await Follow.find({
+        followerId: viewerId,
+        followingId: { $in: followingIds }
+      }).select('followingId').lean();
+      followingRows.forEach(row => followingSet.add(row.followingId.toString()));
+    }
+
+    const users = rows
+      .filter(row => row.followingId)
+      .map(row => ({
+        id: row.followingId._id?.toString(),
+        name: row.followingId.name || 'User',
+        profilePic: row.followingId.profilePic || '',
+        glixId: row.followingId.glixId || '',
+        daimon: row.followingId.daimon || 0,
+        isFollowing: followingSet.has(row.followingId._id?.toString())
+      }));
+
+    return res.status(200).json({ success: true, users });
+  } catch (error) {
+    return res.status(500).json({ success: false, message: error.message });
   }
 });
 
