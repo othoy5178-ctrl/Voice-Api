@@ -374,7 +374,8 @@ const buildRoomSlotsSnapshot = async (roomId) => {
           username: slot.username || slot.name || slots[index].username,
           avatar: slot.avatar || slot.profilePic || null,
           frameUrl: slot.frameUrl || null,
-          isMuted: !!slot.isMuted
+          isMuted: !!slot.isMuted,
+          cameraOn: !!slot.cameraOn
         };
       });
     }
@@ -773,7 +774,7 @@ io.on('connection', (socket) => {
   console.log(`User connected to socket cluster: ${socket.id}`);
 
   // 1. EVENT: Join Room
-  socket.on('join_audio_room', async ({ roomId, userId, name, profilePic, entryVideoUrl }) => {
+  socket.on('join_audio_room', async ({ roomId, userId, numericUid, name, profilePic, entryVideoUrl }) => {
     try {
       await clearExpiredStoreItems(userId);
       const userData = await User.findById(userId).select('frameUrl entryVideoUrl');
@@ -783,6 +784,7 @@ io.on('connection', (socket) => {
       socket.join(stringRoomId);
       socket.roomId = stringRoomId;
       socket.userId = userId;
+      socket.numericUid = numericUid;
       socket.userName = name;
 
       // Map connection instance to verify host mappings directly on requests
@@ -838,7 +840,7 @@ io.on('connection', (socket) => {
   });
 
   // 2. EVENT: Request Slot Change
-  socket.on('request_slot_change', async ({ roomId, userId, name, profilePic, frameUrl, targetSlotIndex, numericUid, isMuted, locked }) => {
+  socket.on('request_slot_change', async ({ roomId, userId, name, profilePic, frameUrl, targetSlotIndex, numericUid, isMuted, locked, cameraOn }) => {
     try {
       const stringRoomId = roomId ? roomId.toString() : '';
 
@@ -862,26 +864,50 @@ io.on('connection', (socket) => {
       const queryFilter = isVideoRoom ? { channelName: stringRoomId } : { _id: stringRoomId };
 
       if (isVideoRoom) {
-        const updateData = profilePic === null
-          ? {
-            "slots.$.uid": null,
-            "slots.$.username": targetSlotIndex === 0 ? 'Main Host' : `Co-Host ${targetSlotIndex + 1}`,
-            "slots.$.avatar": null,
-            "slots.$.frameUrl": null,
-            "slots.$.isMuted": false
-          }
-          : {
-            "slots.$.uid": parseInt(numericUid, 10),
-            "slots.$.username": name,
-            "slots.$.avatar": profilePic,
-            "slots.$.frameUrl": finalFrameUrl,
-            "slots.$.isMuted": !!isMuted
-          };
+        const videoRoom = await Room.findOne({ channelName: stringRoomId });
+        if (!videoRoom) {
+          socket.emit('error_notice', { message: 'Video room not found.' });
+          return;
+        }
 
-        await Room.findOneAndUpdate(
-          { channelName: stringRoomId, "slots.id": targetSlotIndex + 1 },
-          { $set: updateData }
-        );
+        const normalizedTargetSlotIndex = Number(targetSlotIndex);
+        if (normalizedTargetSlotIndex < 0 || normalizedTargetSlotIndex >= 3) {
+          socket.emit('error_notice', { message: 'This video slot is not available.' });
+          return;
+        }
+
+        const incomingUid = numericUid !== null && numericUid !== undefined ? parseInt(numericUid, 10) : null;
+        const incomingUserId = userId ? userId.toString() : null;
+
+        const resetVideoSlotDoc = (slot, index) => {
+          slot.userId = null;
+          slot.uid = null;
+          slot.username = index === 0 ? 'Main Host' : `Co-Host ${index}`;
+          slot.avatar = null;
+          slot.frameUrl = null;
+          slot.isMuted = false;
+          slot.cameraOn = index === 0;
+        };
+
+        videoRoom.slots.forEach((slot, index) => {
+          const sameTarget = index === normalizedTargetSlotIndex;
+          const sameUser = incomingUserId && slot.userId && String(slot.userId) === incomingUserId;
+          const sameUid = incomingUid !== null && slot.uid !== null && slot.uid !== undefined && String(slot.uid) === String(incomingUid);
+          if (sameTarget || sameUser || sameUid) resetVideoSlotDoc(slot, index);
+        });
+
+        if (profilePic !== null) {
+          const targetSlot = videoRoom.slots[normalizedTargetSlotIndex];
+          targetSlot.userId = incomingUserId;
+          targetSlot.uid = incomingUid;
+          targetSlot.username = name || (normalizedTargetSlotIndex === 0 ? 'Main Host' : `Co-Host ${normalizedTargetSlotIndex}`);
+          targetSlot.avatar = profilePic || null;
+          targetSlot.frameUrl = finalFrameUrl || null;
+          targetSlot.isMuted = !!isMuted;
+          targetSlot.cameraOn = typeof cameraOn === 'boolean' ? cameraOn : normalizedTargetSlotIndex === 0;
+        }
+
+        await videoRoom.save();
       } else {
         if (!mongoose.Types.ObjectId.isValid(stringRoomId)) return;
         const roomMeta = await AudioRoom.findById(stringRoomId).select('micSeatCount').lean();
@@ -931,7 +957,8 @@ io.on('connection', (socket) => {
           username: name,
           avatar: profilePic,
           frameUrl: finalFrameUrl,
-          isMuted: isMuted || false
+          isMuted: isMuted || false,
+          cameraOn: !!cameraOn
         }
       });
       await emitRoomSlotsSnapshot(stringRoomId);
@@ -1545,6 +1572,7 @@ io.on('connection', (socket) => {
 
       const roomId = socket.roomId.toString();
       const currentUserId = socket.userId.toString();
+      const currentNumericUid = socket.numericUid;
       removeRoomMember(roomId, currentUserId, socket.id);
 
       if (roomId.startsWith('glix_')) {
@@ -1557,6 +1585,43 @@ io.on('connection', (socket) => {
         ) {
           scheduleHostDisconnectClosure(roomId, currentUserId);
           console.log(`Video room host disconnected, waiting for reconnect: ${roomId}`);
+        } else if (videoRoomDoc?.slots?.length) {
+          const removedSlotIndexes = [];
+          videoRoomDoc.slots.forEach((slot, index) => {
+            const slotMatchesUser = slot.userId && String(slot.userId) === currentUserId;
+            const slotMatchesUid = currentNumericUid !== null && currentNumericUid !== undefined && slot.uid !== null && slot.uid !== undefined && String(slot.uid) === String(currentNumericUid);
+            if (slotMatchesUser || slotMatchesUid) {
+              slot.userId = null;
+              slot.uid = null;
+              slot.username = index === 0 ? 'Main Host' : `Co-Host ${index}`;
+              slot.avatar = null;
+              slot.frameUrl = null;
+              slot.isMuted = false;
+              slot.cameraOn = index === 0;
+              removedSlotIndexes.push(index);
+            }
+          });
+
+          if (removedSlotIndexes.length) {
+            await videoRoomDoc.save();
+            removedSlotIndexes.forEach(slotIndex => {
+              io.to(roomId).emit('slot_state_changed', {
+                slotIndex,
+                user: {
+                  uid: null,
+                  userId: null,
+                  username: slotIndex === 0 ? 'Main Host' : `Co-Host ${slotIndex}`,
+                  avatar: null,
+                  frameUrl: null,
+                  isMuted: false,
+                  cameraOn: slotIndex === 0
+                }
+              });
+            });
+            await emitRoomSlotsSnapshot(roomId);
+          }
+
+          await emitRoomStats(roomId);
         } else {
           await emitRoomStats(roomId);
         }
@@ -1745,14 +1810,16 @@ app.post('/create-video', async (req, res) => {
       {
         id: 1,
         locked: false,
+        userId: hostId,
         uid: parseInt(numericUid, 10),
         username: name || 'Main Host',
         avatar: profilePic || null,
         isMe: false,
-        isMuted: false
+        isMuted: false,
+        cameraOn: true
       },
-      { id: 2, locked: false, uid: null, username: 'Co-Host 1', avatar: null, isMe: false, isMuted: false },
-      { id: 3, locked: false, uid: null, username: 'Co-Host 2', avatar: null, isMe: false, isMuted: false },
+      { id: 2, locked: false, userId: null, uid: null, username: 'Co-Host 1', avatar: null, isMe: false, isMuted: false, cameraOn: false },
+      { id: 3, locked: false, userId: null, uid: null, username: 'Co-Host 2', avatar: null, isMe: false, isMuted: false, cameraOn: false },
     ];
 
     const newRoom = new Room({
@@ -1806,28 +1873,53 @@ app.get('/gift-history/room/:roomId', async (req, res) => {
       roomMatchValues.push(new mongoose.Types.ObjectId(roomId));
     }
 
-    const result = await GiftTransaction.aggregate([
-      {
-        $match: {
-          roomId: { $in: roomMatchValues }
+    const [summaryResult, receiverRows] = await Promise.all([
+      GiftTransaction.aggregate([
+        {
+          $match: {
+            roomId: { $in: roomMatchValues }
+          }
+        },
+        {
+          $group: {
+            _id: "$roomId",
+            totalCoins: { $sum: "$totalCost" },
+            totalGifts: { $sum: "$quantity" },
+            totalTransactions: { $sum: 1 }
+          }
         }
-      },
-      {
-        $group: {
-          _id: "$roomId",
-          totalCoins: { $sum: "$totalCost" },
-          totalGifts: { $sum: "$quantity" },
-          totalTransactions: { $sum: 1 }
+      ]),
+      GiftTransaction.aggregate([
+        {
+          $match: {
+            roomId: { $in: roomMatchValues }
+          }
+        },
+        {
+          $group: {
+            _id: "$receiverId",
+            totalCoins: { $sum: "$totalCost" },
+            totalGifts: { $sum: "$quantity" },
+            totalTransactions: { $sum: 1 }
+          }
         }
-      }
+      ])
     ]);
+
+    const receiverTotals = receiverRows.reduce((totals, row) => {
+      if (row?._id) totals[row._id.toString()] = row.totalCoins || 0;
+      return totals;
+    }, {});
 
     res.status(200).json({
       success: true,
-      data: result[0] || {
-        totalCoins: 0,
-        totalGifts: 0,
-        totalTransactions: 0
+      data: {
+        ...(summaryResult[0] || {
+          totalCoins: 0,
+          totalGifts: 0,
+          totalTransactions: 0
+        }),
+        receiverTotals
       }
     });
 
@@ -1838,7 +1930,6 @@ app.get('/gift-history/room/:roomId', async (req, res) => {
     });
   }
 });
-
 app.get('/gift-history/host/:hostId', async (req, res) => {
   try {
     const { hostId } = req.params;

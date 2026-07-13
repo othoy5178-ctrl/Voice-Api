@@ -4,12 +4,14 @@ import mongoose from 'mongoose';
 const SlotSchema = new mongoose.Schema({
   id: { type: Number, required: true },
   locked: { type: Boolean, default: false },
+  userId: { type: String, default: null },
   uid: { type: Number, default: null },
   username: { type: String, default: null },
   avatar: { type: String, default: null },
   frameUrl: { type: String, default: null },
   isMe: { type: Boolean, default: false },
-  isMuted: { type: Boolean, default: false }
+  isMuted: { type: Boolean, default: false },
+  cameraOn: { type: Boolean, default: false }
 }, { _id: false }); 
 
 const RoomSchema = new mongoose.Schema({
