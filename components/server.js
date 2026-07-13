@@ -208,6 +208,11 @@ const uploadHostVerificationImage = async ({ userId, key, image }) => {
 
   const mimeType = image?.type || 'image/jpeg';
   if (!mimeType.startsWith('image/')) throw new Error(`${key} must be an image`);
+  const missingCloudinaryVars = ['CLOUDINARY_CLOUD_NAME', 'CLOUDINARY_API_KEY', 'CLOUDINARY_API_SECRET']
+    .filter(envKey => !process.env[envKey]);
+  if (missingCloudinaryVars.length) {
+    throw new Error(`Cloudinary is not configured. Missing: ${missingCloudinaryVars.join(', ')}`);
+  }
 
   const folder = `${process.env.CLOUDINARY_FOLDER || 'host-verification'}/${userId}`;
   const result = await cloudinary.uploader.upload(`data:${mimeType};base64,${base64}`, {
@@ -901,7 +906,7 @@ io.on('connection', (socket) => {
           }
 
           await AudioRoom.findOneAndUpdate(queryFilter, {
-            $pull: { speakers: { userId: userId } }
+            $pull: { speakers: { $or: [{ userId: userId }, { slotIndex: targetSlotIndex }] } }
           });
 
           await AudioRoom.findOneAndUpdate(queryFilter, {
@@ -1275,10 +1280,16 @@ io.on('connection', (socket) => {
   // 5. EVENT: Audience Mic Requests (Correctly Un-nested now)
   socket.on('audience_join_request', (data) => {
     if (!data?.hostId || !data?.roomId) return;
-    const hostSocketId = activeUsers[String(data.hostId)];
 
-    if (hostSocketId) {
-      io.to(hostSocketId).emit('receive_join_request', data);
+    const controllerId = data.controllerUserId ? String(data.controllerUserId) : null;
+    const hostSocketId = activeUsers[String(data.hostId)];
+    const controllerSocketId = controllerId ? activeUsers[controllerId] : null;
+    const targetSocketId = data.hostAway && controllerSocketId ? controllerSocketId : hostSocketId;
+
+    if (targetSocketId) {
+      io.to(targetSocketId).emit('receive_join_request', data);
+    } else if (controllerSocketId) {
+      io.to(controllerSocketId).emit('receive_join_request', data);
     } else {
       io.to(String(data.roomId)).emit('receive_join_request', data);
     }
@@ -1315,6 +1326,7 @@ io.on('connection', (socket) => {
           speakers: {
             $or: [
               { userId: acceptedUserId },
+              { slotIndex: data.requestedSlotIndex },
               { userId: { $exists: false } },
               { userId: null }
             ]
