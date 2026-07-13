@@ -16,6 +16,7 @@ const RoomSchema = new mongoose.Schema({
   channelName: { type: String, required: true, unique: true },
   hostId: { type: String, required: true },
   title: { type: String, default: 'Glix Live Audio Room' },
+  isLive: { type: Boolean, default: true },
   createdAt: { type: Date, default: Date.now },
   slots: [SlotSchema] // Uses the sub-schema defined above
 });

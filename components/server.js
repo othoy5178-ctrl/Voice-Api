@@ -266,7 +266,8 @@ const closeRoomAfterHostTimeout = async (roomId, hostId) => {
     io.to(roomId).emit('room_closing', {
       message: 'Host disconnected. Room closed.'
     });
-    await Room.deleteOne({ channelName: roomId });
+    videoRoomDoc.isLive = false;
+    await videoRoomDoc.save();
     roomMembers.delete(roomId);
     console.log(`Video room closed after reconnect grace timeout: ${roomId}`);
     return;
@@ -1746,6 +1747,7 @@ app.post('/create-video', async (req, res) => {
       channelName: uniqueChannelName,
       hostId,
       title: title || "Glix Live Room",
+      isLive: true,
       slots: initialSlots
     });
 
@@ -1928,6 +1930,7 @@ app.post('/join', async (req, res) => {
     if (isVideoRoom) {
       roomObj = await Room.findOne({ channelName: stringRoomId });
       if (!roomObj) return res.status(404).json({ error: "Video room not found" });
+      if (roomObj.isLive === false) return res.status(400).json({ error: "This room has already ended" });
     } else {
       if (!mongoose.Types.ObjectId.isValid(stringRoomId)) return res.status(400).json({ error: "Invalid Room ID format" });
       roomObj = await AudioRoom.findById(stringRoomId);
@@ -2055,7 +2058,8 @@ app.post('/rooms/end', async (req, res) => {
         return res.status(403).json({ success: false, error: 'Unauthorized' });
 
       io.to(stringRoomId).emit('room_closing', { message: 'The host has ended the video live stream.' });
-      await Room.deleteOne({ channelName: stringRoomId });
+      room.isLive = false;
+      await room.save();
       await new Promise(resolve => setTimeout(resolve, 500));
 
     } else {
@@ -2099,11 +2103,12 @@ app.get('/rooms/:roomId', async (req, res) => {
 
 app.get('/video-rooms', async (req, res) => {
   try {
-    const rooms = await Room.find().sort({ createdAt: -1 });
-    const liveRooms = rooms.filter(room => {
-      const socketRoom = io.sockets.adapter.rooms.get(room.channelName);
-      return socketRoom && socketRoom.size > 0;
-    });
+    const rooms = await Room.find({
+      $or: [{ isLive: true }, { isLive: { $exists: false } }]
+    }).sort({ createdAt: -1 });
+    const liveRooms = rooms.filter(room =>
+      room.isLive === true || io.sockets.adapter.rooms.get(room.channelName)?.size > 0
+    );
     return res.status(200).json({ success: true, rooms: liveRooms });
   } catch (error) {
     return res.status(500).json({ error: error.message });
