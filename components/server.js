@@ -329,7 +329,19 @@ const clearHostDisconnectClosure = (roomId, hostId) => {
   return true;
 };
 
-const createCleanSlotsBlueprint = () => Array.from({ length: 25 }, (_, i) => ({
+const AUDIO_MIC_SEAT_COUNTS = [5, 10, 15, 24];
+const AUDIO_LAYOUT_TYPES = ['chatroom', 'dating', 'party', 'birthday'];
+const DEFAULT_AUDIO_MIC_SEAT_COUNT = 15;
+const DEFAULT_AUDIO_LAYOUT_TYPE = 'chatroom';
+const normalizeAudioMicSeatCount = (count) => {
+  const parsed = Number(count);
+  return AUDIO_MIC_SEAT_COUNTS.includes(parsed) ? parsed : DEFAULT_AUDIO_MIC_SEAT_COUNT;
+};
+const normalizeAudioLayoutType = (type) => (
+  AUDIO_LAYOUT_TYPES.includes(type) ? type : DEFAULT_AUDIO_LAYOUT_TYPE
+);
+
+const createCleanSlotsBlueprint = (count = DEFAULT_AUDIO_MIC_SEAT_COUNT) => Array.from({ length: count }, (_, i) => ({
   id: i + 1,
   locked: i === 3 || i === 12 || i === 19,
   userId: null,
@@ -342,9 +354,9 @@ const createCleanSlotsBlueprint = () => Array.from({ length: 25 }, (_, i) => ({
 
 const buildRoomSlotsSnapshot = async (roomId) => {
   const stringRoomId = roomId ? roomId.toString() : '';
-  const slots = createCleanSlotsBlueprint();
 
   if (stringRoomId.startsWith('glix_')) {
+    const slots = createCleanSlotsBlueprint(25);
     const videoRoomDoc = await Room.findOne({ channelName: stringRoomId }).lean();
     if (videoRoomDoc?.slots) {
       videoRoomDoc.slots.slice(0, 25).forEach((slot, index) => {
@@ -363,17 +375,20 @@ const buildRoomSlotsSnapshot = async (roomId) => {
     return slots;
   }
 
-  if (!mongoose.Types.ObjectId.isValid(stringRoomId)) return slots;
+  if (!mongoose.Types.ObjectId.isValid(stringRoomId)) return createCleanSlotsBlueprint();
 
   const audioRoomDoc = await AudioRoom.findById(stringRoomId)
     .populate('speakers.userId', 'name profilePic')
     .lean();
 
+  const seatCount = normalizeAudioMicSeatCount(audioRoomDoc?.micSeatCount);
+  const slots = createCleanSlotsBlueprint(seatCount);
+
   if (!audioRoomDoc?.speakers) return slots;
 
   audioRoomDoc.speakers.filter(speaker => speaker && speaker.userId).forEach(speaker => {
     const index = speaker.slotIndex;
-    if (index < 0 || index >= 25) return;
+    if (index < 0 || index >= seatCount) return;
     const speakerUserId = speaker.userId?._id || speaker.userId;
     slots[index] = {
       ...slots[index],
@@ -863,6 +878,12 @@ io.on('connection', (socket) => {
         );
       } else {
         if (!mongoose.Types.ObjectId.isValid(stringRoomId)) return;
+        const roomMeta = await AudioRoom.findById(stringRoomId).select('micSeatCount').lean();
+        const seatCount = normalizeAudioMicSeatCount(roomMeta?.micSeatCount);
+        if (Number(targetSlotIndex) < 0 || Number(targetSlotIndex) >= seatCount) {
+          socket.emit('error_notice', { message: 'This mic slot is not available in the current arrangement.' });
+          return;
+        }
 
         if (profilePic === null) {
           await AudioRoom.findOneAndUpdate(queryFilter, {
@@ -912,6 +933,70 @@ io.on('connection', (socket) => {
     } catch (error) {
       console.log("Socket array persistence exception error:", error);
       socket.emit('error_notice', { message: 'Failed to synchronize layout seat state.' });
+    }
+  });
+
+  socket.on('update_audio_room_layout', async ({ roomId, requesterId, micSeatCount, micLayoutType }) => {
+    try {
+      const stringRoomId = roomId ? roomId.toString() : '';
+      const actingUserId = requesterId || socket.userId;
+
+      if (!mongoose.Types.ObjectId.isValid(stringRoomId)) {
+        socket.emit('error_notice', { message: 'Invalid audio room.' });
+        return;
+      }
+
+      const room = await AudioRoom.findById(stringRoomId).select('hostId speakers micSeatCount micLayoutType');
+      if (!room) {
+        socket.emit('error_notice', { message: 'Audio room not found.' });
+        return;
+      }
+
+      const canChangeLayout = String(room.hostId) === String(actingUserId) || isAudioRoomController(stringRoomId, actingUserId);
+      if (!canChangeLayout) {
+        socket.emit('error_notice', { message: 'Only the host can change mic arrangement.' });
+        return;
+      }
+
+      const requestedCount = micSeatCount === undefined || micSeatCount === null
+        ? normalizeAudioMicSeatCount(room.micSeatCount)
+        : Number(micSeatCount);
+      if (!AUDIO_MIC_SEAT_COUNTS.includes(Number(requestedCount))) {
+        socket.emit('error_notice', { message: 'Invalid mic seat count.' });
+        return;
+      }
+
+      const nextSeatCount = Number(requestedCount);
+      const nextLayoutType = micLayoutType === undefined || micLayoutType === null
+        ? normalizeAudioLayoutType(room.micLayoutType)
+        : normalizeAudioLayoutType(micLayoutType);
+
+      const occupiedOutsideLayout = (room.speakers || []).some(speaker => (
+        speaker?.userId &&
+        Number(speaker.slotIndex) >= nextSeatCount
+      ));
+
+      if (occupiedOutsideLayout) {
+        socket.emit('error_notice', { message: 'Please clear higher mic slots before reducing seats.' });
+        return;
+      }
+
+      await AudioRoom.findByIdAndUpdate(stringRoomId, {
+        $set: {
+          micSeatCount: nextSeatCount,
+          micLayoutType: nextLayoutType
+        }
+      });
+
+      const slots = await buildRoomSlotsSnapshot(stringRoomId);
+      io.to(stringRoomId).emit('room_layout_changed', {
+        micSeatCount: nextSeatCount,
+        micLayoutType: nextLayoutType,
+        slots
+      });
+    } catch (error) {
+      console.log('Audio room layout update error:', error);
+      socket.emit('error_notice', { message: 'Failed to update mic arrangement.' });
     }
   });
 
@@ -1779,7 +1864,7 @@ app.get('/gift-history/host/:hostId', async (req, res) => {
 
 app.post('/create', async (req, res) => {
   try {
-    const { title, hostId, numericUid } = req.body;
+    const { title, hostId, numericUid, micSeatCount, micLayoutType } = req.body;
     if (!hostId) return res.status(400).json({ success: false, error: 'Host identifier missing' });
     if (!(await canCreateLiveRoom(hostId))) {
       return res.status(403).json({ success: false, error: 'Login is required to create live rooms.' });
@@ -1790,6 +1875,8 @@ app.post('/create', async (req, res) => {
       title: title || "Live Audio Room",
       hostId,
       isLive: true,
+      micSeatCount: normalizeAudioMicSeatCount(micSeatCount),
+      micLayoutType: normalizeAudioLayoutType(micLayoutType),
       speakers: [{ userId: hostId, isMuted: false, slotIndex: 0, numericUid: sanitizedUid }],
       audience: []
     });
@@ -2032,6 +2119,8 @@ app.get('/rooms', async (req, res) => {
       host: room.hostId,
       speakerCount: room.speakers.length,
       audienceCount: room.audience.length,
+      micSeatCount: normalizeAudioMicSeatCount(room.micSeatCount),
+      micLayoutType: normalizeAudioLayoutType(room.micLayoutType),
       createdAt: room.createdAt
     }));
     return res.status(200).json({ success: true, rooms: formattedRooms });
@@ -2073,9 +2162,6 @@ app.post('/host/register', async (req, res) => {
     if (!cleanAgencySelection) return res.status(400).json({ message: 'Agency selection is required' });
     if (!cleanPhone) return res.status(400).json({ message: 'Phone number is required' });
     if (!acceptedTerms) return res.status(400).json({ message: 'Terms acceptance is required' });
-    if (!verificationImages.profilePhoto) return res.status(400).json({ message: 'Profile photo is required' });
-    if (!verificationImages.idFront) return res.status(400).json({ message: 'ID front photo is required' });
-    if (!verificationImages.idBack) return res.status(400).json({ message: 'ID back photo is required' });
     if (!verificationImages.selfiePhoto) return res.status(400).json({ message: 'Selfie verification photo is required' });
 
     let agencyId = null;
@@ -2087,10 +2173,7 @@ app.post('/host/register', async (req, res) => {
     const existingUser = await User.findById(userId).select('role').lean();
     if (!existingUser) return res.status(404).json({ message: 'User not found' });
 
-    const [profilePhotoUrl, idFrontUrl, idBackUrl, selfiePhotoUrl] = await Promise.all([
-      uploadHostVerificationImage({ userId, key: 'profile-photo', image: verificationImages.profilePhoto }),
-      uploadHostVerificationImage({ userId, key: 'id-front', image: verificationImages.idFront }),
-      uploadHostVerificationImage({ userId, key: 'id-back', image: verificationImages.idBack }),
+    const [selfiePhotoUrl] = await Promise.all([
       uploadHostVerificationImage({ userId, key: 'selfie-photo', image: verificationImages.selfiePhoto })
     ]);
 
@@ -2116,9 +2199,9 @@ app.post('/host/register', async (req, res) => {
             agencyCode: submittedAgencyCode,
             phoneCountryCode: cleanCountryCode,
             phoneNumber: cleanPhone,
-            profilePhotoUrl,
-            idFrontUrl,
-            idBackUrl,
+            profilePhotoUrl: '',
+            idFrontUrl: '',
+            idBackUrl: '',
             selfiePhotoUrl,
             status: 'pending',
             rejectionReason: '',
@@ -2217,7 +2300,8 @@ app.post('/agency/register', async (req, res) => {
       city,
       expectedHosts,
       experience,
-      acceptedTerms
+      acceptedTerms,
+      verificationImages = {}
     } = req.body;
 
     const userId = authUser._id;
@@ -2236,9 +2320,20 @@ app.post('/agency/register', async (req, res) => {
     if (!cleanPhone) return res.status(400).json({ success: false, message: 'Phone number is required' });
     if (!cleanCity) return res.status(400).json({ success: false, message: 'City is required' });
     if (!acceptedTerms) return res.status(400).json({ success: false, message: 'Terms acceptance is required' });
+    if (!verificationImages.profilePhoto) return res.status(400).json({ success: false, message: 'Profile photo is required' });
+    if (!verificationImages.idFront) return res.status(400).json({ success: false, message: 'ID front photo is required' });
+    if (!verificationImages.idBack) return res.status(400).json({ success: false, message: 'ID back photo is required' });
+    if (!verificationImages.selfiePhoto) return res.status(400).json({ success: false, message: 'Selfie verification photo is required' });
 
     const existingCode = await User.findOne({ agencyCode: cleanCode, _id: { $ne: userId } }).select('_id').lean();
     if (existingCode) return res.status(400).json({ success: false, message: 'Agency code is already used' });
+
+    const [profilePhotoUrl, idFrontUrl, idBackUrl, selfiePhotoUrl] = await Promise.all([
+      uploadHostVerificationImage({ userId, key: 'agency-profile-photo', image: verificationImages.profilePhoto }),
+      uploadHostVerificationImage({ userId, key: 'agency-id-front', image: verificationImages.idFront }),
+      uploadHostVerificationImage({ userId, key: 'agency-id-back', image: verificationImages.idBack }),
+      uploadHostVerificationImage({ userId, key: 'agency-selfie-photo', image: verificationImages.selfiePhoto })
+    ]);
 
     const user = await User.findByIdAndUpdate(
       userId,
@@ -2255,6 +2350,10 @@ app.post('/agency/register', async (req, res) => {
             city: cleanCity,
             expectedHosts: hostCount,
             experience: cleanExperience,
+            profilePhotoUrl,
+            idFrontUrl,
+            idBackUrl,
+            selfiePhotoUrl,
             status: 'pending',
             rejectionReason: '',
             reviewedBy: null,
@@ -3121,7 +3220,7 @@ app.post('/rewards/claim', async (req, res) => {
   }
 });
 
-const PUBLIC_USER_FIELDS = 'name email profilePic glixId googleId createdAt lastLogin followersCount followingCount daimon chang frameUrl entryVideoUrl settings blacklistedUsers role agencyId agencyCode managerPermissions commissionBalance revenueBalance totalHostCoins hostStatus hostRejectionReason hostRegistration agencyStatus agencyRejectionReason agencyRegistration';
+const PUBLIC_USER_FIELDS = 'name email profilePic gender age birthday countryRegion voiceSignature signature albumPhotos glixId googleId createdAt lastLogin followersCount followingCount daimon chang frameUrl entryVideoUrl settings blacklistedUsers role agencyId agencyCode managerPermissions commissionBalance revenueBalance totalHostCoins hostStatus hostRejectionReason hostRegistration agencyStatus agencyRejectionReason agencyRegistration';
 
 const sanitizeUserSettings = (settings = {}) => {
   const allowedMessagesFrom = ['everyone', 'following', 'none'];
@@ -3252,6 +3351,107 @@ app.post('/settings/:userId/profile-name', async (req, res) => {
 
     if (!user) return res.status(404).json({ success: false, message: 'User not found' });
     return res.status(200).json({ success: true, name: user.name, user });
+  } catch (error) {
+    return res.status(500).json({ success: false, message: error.message });
+  }
+});
+
+app.post('/settings/:userId/profile-info', async (req, res) => {
+  try {
+    const { userId } = req.params;
+    const allowedGenders = ['Male', 'Female', 'Other', ''];
+
+    if (!mongoose.Types.ObjectId.isValid(userId)) return res.status(400).json({ success: false, message: 'Invalid user id' });
+
+    const update = {};
+
+    if (Object.prototype.hasOwnProperty.call(req.body || {}, 'gender')) {
+      const gender = typeof req.body.gender === 'string' ? req.body.gender.trim() : '';
+      if (!allowedGenders.includes(gender)) return res.status(400).json({ success: false, message: 'Invalid gender' });
+      update.gender = gender;
+    }
+
+    if (Object.prototype.hasOwnProperty.call(req.body || {}, 'birthday')) {
+      const birthday = req.body.birthday || '';
+      if (birthday && !/^\d{4}-\d{2}-\d{2}$/.test(birthday)) {
+        return res.status(400).json({ success: false, message: 'Birthday must use YYYY-MM-DD format' });
+      }
+      update.birthday = birthday;
+    }
+
+    if (Object.prototype.hasOwnProperty.call(req.body || {}, 'countryRegion')) {
+      update.countryRegion = typeof req.body.countryRegion === 'string' ? req.body.countryRegion.trim().slice(0, 80) : '';
+    }
+
+    if (Object.prototype.hasOwnProperty.call(req.body || {}, 'voiceSignature')) {
+      update.voiceSignature = typeof req.body.voiceSignature === 'string' ? req.body.voiceSignature.trim().slice(0, 120) : '';
+    }
+
+    if (Object.prototype.hasOwnProperty.call(req.body || {}, 'signature')) {
+      update.signature = typeof req.body.signature === 'string' ? req.body.signature.trim().slice(0, 160) : '';
+    }
+
+    if (!Object.keys(update).length) {
+      return res.status(400).json({ success: false, message: 'No profile info provided' });
+    }
+
+    const user = await User.findByIdAndUpdate(
+      userId,
+      { $set: update },
+      { new: true, runValidators: true }
+    ).select(PUBLIC_USER_FIELDS);
+
+    if (!user) return res.status(404).json({ success: false, message: 'User not found' });
+    return res.status(200).json({ success: true, user });
+  } catch (error) {
+    return res.status(500).json({ success: false, message: error.message });
+  }
+});
+
+app.post('/settings/:userId/album-photo', async (req, res) => {
+  try {
+    const { userId } = req.params;
+    const { image } = req.body;
+    if (!mongoose.Types.ObjectId.isValid(userId)) return res.status(400).json({ success: false, message: 'Invalid user id' });
+    if (!image?.base64) return res.status(400).json({ success: false, message: 'Album photo is required' });
+
+    const userRecord = await User.findById(userId).select('albumPhotos');
+    if (!userRecord) return res.status(404).json({ success: false, message: 'User not found' });
+    if ((userRecord.albumPhotos || []).length >= 12) return res.status(400).json({ success: false, message: 'Album can contain up to 12 photos' });
+
+    const photoUrl = await uploadHostVerificationImage({
+      userId,
+      key: 'album-photo',
+      image
+    });
+
+    const user = await User.findByIdAndUpdate(
+      userId,
+      { $addToSet: { albumPhotos: photoUrl } },
+      { new: true }
+    ).select(PUBLIC_USER_FIELDS);
+
+    return res.status(200).json({ success: true, photoUrl, user });
+  } catch (error) {
+    return res.status(500).json({ success: false, message: error.message });
+  }
+});
+
+app.delete('/settings/:userId/album-photo', async (req, res) => {
+  try {
+    const { userId } = req.params;
+    const { photoUrl } = req.body || {};
+    if (!mongoose.Types.ObjectId.isValid(userId)) return res.status(400).json({ success: false, message: 'Invalid user id' });
+    if (!photoUrl) return res.status(400).json({ success: false, message: 'Photo url is required' });
+
+    const user = await User.findByIdAndUpdate(
+      userId,
+      { $pull: { albumPhotos: photoUrl } },
+      { new: true }
+    ).select(PUBLIC_USER_FIELDS);
+
+    if (!user) return res.status(404).json({ success: false, message: 'User not found' });
+    return res.status(200).json({ success: true, user });
   } catch (error) {
     return res.status(500).json({ success: false, message: error.message });
   }
@@ -3479,7 +3679,7 @@ app.get('/profile/:userId/visitors', async (req, res) => {
       ProfileVisit.find({ profileUserId: userId })
         .sort({ visitedAt: -1 })
         .limit(limit)
-        .populate('visitorId', 'name profilePic glixId daimon')
+        .populate('visitorId', 'name profilePic glixId daimon countryRegion')
         .lean()
     ]);
 
@@ -3502,6 +3702,7 @@ app.get('/profile/:userId/visitors', async (req, res) => {
         profilePic: visit.visitorId.profilePic || '',
         glixId: visit.visitorId.glixId || '',
         daimon: visit.visitorId.daimon || 0,
+        countryRegion: visit.visitorId.countryRegion || '',
         visitedAt: visit.visitedAt,
         visitCount: visit.visitCount || 1,
         isFollowing: followingSet.has(visit.visitorId._id?.toString())
@@ -3526,7 +3727,7 @@ app.get('/profile/:userId/followers', async (req, res) => {
     const rows = await Follow.find({ followingId: userId })
       .sort({ createdAt: -1 })
       .limit(limit)
-      .populate('followerId', 'name profilePic glixId daimon')
+      .populate('followerId', 'name profilePic glixId daimon countryRegion')
       .lean();
 
     const followerIds = rows.map(row => row.followerId?._id?.toString()).filter(Boolean);
@@ -3548,6 +3749,7 @@ app.get('/profile/:userId/followers', async (req, res) => {
         profilePic: row.followerId.profilePic || '',
         glixId: row.followerId.glixId || '',
         daimon: row.followerId.daimon || 0,
+        countryRegion: row.followerId.countryRegion || '',
         isFollowing: followingSet.has(row.followerId._id?.toString())
       }));
 
@@ -3570,7 +3772,7 @@ app.get('/profile/:userId/following', async (req, res) => {
     const rows = await Follow.find({ followerId: userId })
       .sort({ createdAt: -1 })
       .limit(limit)
-      .populate('followingId', 'name profilePic glixId daimon')
+      .populate('followingId', 'name profilePic glixId daimon countryRegion')
       .lean();
 
     const followingIds = rows.map(row => row.followingId?._id?.toString()).filter(Boolean);
@@ -3592,6 +3794,7 @@ app.get('/profile/:userId/following', async (req, res) => {
         profilePic: row.followingId.profilePic || '',
         glixId: row.followingId.glixId || '',
         daimon: row.followingId.daimon || 0,
+        countryRegion: row.followingId.countryRegion || '',
         isFollowing: followingSet.has(row.followingId._id?.toString())
       }));
 

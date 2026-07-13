@@ -16,6 +16,17 @@ const audioRoomSchema = new mongoose.Schema({
   // Track everyone currently listening
   audience: [{ type: mongoose.Schema.Types.ObjectId, ref: 'User' }],
 
+  micSeatCount: {
+    type: Number,
+    enum: [5, 10, 15, 24],
+    default: 15
+  },
+  micLayoutType: {
+    type: String,
+    enum: ['chatroom', 'dating', 'party', 'birthday'],
+    default: 'chatroom'
+  },
+
   isLive: { type: Boolean, default: true },
   createdAt: { type: Date, default: Date.now },
 });

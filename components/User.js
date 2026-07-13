@@ -23,6 +23,43 @@ const userSchema = new mongoose.Schema({
     type: String,
     default: '' // Points to a CDN URL or remains empty string until uploaded
   },
+  gender: {
+    type: String,
+    enum: ['Male', 'Female', 'Other', ''],
+    default: ''
+  },
+  age: {
+    type: Number,
+    min: 1,
+    max: 120,
+    default: null
+  },
+  birthday: {
+    type: String,
+    trim: true,
+    default: ''
+  },
+  countryRegion: {
+    type: String,
+    trim: true,
+    default: ''
+  },
+  voiceSignature: {
+    type: String,
+    trim: true,
+    maxlength: 120,
+    default: ''
+  },
+  signature: {
+    type: String,
+    trim: true,
+    maxlength: 160,
+    default: ''
+  },
+  albumPhotos: {
+    type: [String],
+    default: []
+  },
   glixId: {
     type: String,
     unique: true,
@@ -162,6 +199,10 @@ const userSchema = new mongoose.Schema({
     city: { type: String, trim: true, default: '' },
     expectedHosts: { type: Number, default: 0 },
     experience: { type: String, trim: true, default: '' },
+    profilePhotoUrl: { type: String, default: '' },
+    idFrontUrl: { type: String, default: '' },
+    idBackUrl: { type: String, default: '' },
+    selfiePhotoUrl: { type: String, default: '' },
     status: {
       type: String,
       enum: ['none', 'pending', 'approved', 'rejected'],
