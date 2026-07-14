@@ -337,6 +337,26 @@ const clearHostDisconnectClosure = (roomId, hostId) => {
 
 const AUDIO_MIC_SEAT_COUNTS = [5, 10, 15, 24];
 const AUDIO_LAYOUT_TYPES = ['chatroom', 'dating', 'party', 'birthday'];
+const AUDIO_BACKGROUND_THEMES = [
+  { id: 'bg-1', url: 'https://res.cloudinary.com/dh99ihggv/image/upload/v1784010162/6_glmptj.png' },
+  { id: 'bg-2', url: 'https://res.cloudinary.com/dh99ihggv/image/upload/v1784010156/10_uuhqqt.png' },
+  { id: 'bg-3', url: 'https://res.cloudinary.com/dh99ihggv/image/upload/v1784010153/9_uexecd.png' },
+  { id: 'bg-4', url: 'https://res.cloudinary.com/dh99ihggv/image/upload/v1784010153/8_xla01g.png' },
+  { id: 'bg-5', url: 'https://res.cloudinary.com/dh99ihggv/image/upload/v1784010152/1_fl6fdh.png' },
+  { id: 'bg-6', url: 'https://res.cloudinary.com/dh99ihggv/image/upload/v1784010152/4_feyzyg.png' },
+  { id: 'bg-7', url: 'https://res.cloudinary.com/dh99ihggv/image/upload/v1784010152/5_adnuuk.png' },
+  { id: 'bg-8', url: 'https://res.cloudinary.com/dh99ihggv/image/upload/v1784010152/7_ngjvsy.png' },
+  { id: 'bg-9', url: 'https://res.cloudinary.com/dh99ihggv/image/upload/v1784010151/2_mkye9g.png' },
+  { id: 'bg-10', url: 'https://res.cloudinary.com/dh99ihggv/image/upload/v1784010151/3_im6rv0.png' }
+];
+const normalizeAudioBackgroundThemeId = (theme) => {
+  if (!theme) return null;
+  const matchedTheme = AUDIO_BACKGROUND_THEMES.find(item => item.id === theme || item.url === theme);
+  return matchedTheme?.id || null;
+};
+const getAudioRoomBackgroundThemeId = (room) => (
+  normalizeAudioBackgroundThemeId(room?.backgroundThemeId || room?.backgroundThemeUrl)
+);
 const DEFAULT_AUDIO_MIC_SEAT_COUNT = 15;
 const DEFAULT_AUDIO_LAYOUT_TYPE = 'chatroom';
 const normalizeAudioMicSeatCount = (count) => {
@@ -415,6 +435,18 @@ const emitRoomSlotsSnapshot = async (roomId) => {
   const stringRoomId = roomId ? roomId.toString() : '';
   if (!stringRoomId) return;
   const slots = await buildRoomSlotsSnapshot(stringRoomId);
+  if (mongoose.Types.ObjectId.isValid(stringRoomId)) {
+    const roomMeta = await AudioRoom.findById(stringRoomId).select('micSeatCount micLayoutType backgroundThemeId backgroundThemeUrl').lean();
+    const backgroundThemeId = getAudioRoomBackgroundThemeId(roomMeta);
+    io.to(stringRoomId).emit('room_slots_updated', {
+      slots,
+      micSeatCount: normalizeAudioMicSeatCount(roomMeta?.micSeatCount),
+      micLayoutType: normalizeAudioLayoutType(roomMeta?.micLayoutType),
+      backgroundThemeId,
+      backgroundThemeUrl: backgroundThemeId
+    });
+    return;
+  }
   io.to(stringRoomId).emit('room_slots_updated', slots);
 };
 
@@ -830,8 +862,19 @@ io.on('connection', (socket) => {
       }
 
       const completeLayoutMatrix = await buildRoomSlotsSnapshot(stringRoomId);
-
-      socket.emit('initialize_room_slots', completeLayoutMatrix);
+      if (mongoose.Types.ObjectId.isValid(stringRoomId)) {
+        const roomMeta = await AudioRoom.findById(stringRoomId).select('micSeatCount micLayoutType backgroundThemeId backgroundThemeUrl').lean();
+        const backgroundThemeId = getAudioRoomBackgroundThemeId(roomMeta);
+        socket.emit('initialize_room_slots', {
+          slots: completeLayoutMatrix,
+          micSeatCount: normalizeAudioMicSeatCount(roomMeta?.micSeatCount),
+          micLayoutType: normalizeAudioLayoutType(roomMeta?.micLayoutType),
+          backgroundThemeId,
+          backgroundThemeUrl: backgroundThemeId
+        });
+      } else {
+        socket.emit('initialize_room_slots', completeLayoutMatrix);
+      }
       await emitRoomStats(stringRoomId);
 
     } catch (err) {
@@ -969,7 +1012,7 @@ io.on('connection', (socket) => {
     }
   });
 
-  socket.on('update_audio_room_layout', async ({ roomId, requesterId, micSeatCount, micLayoutType }) => {
+  socket.on('update_audio_room_layout', async ({ roomId, requesterId, micSeatCount, micLayoutType, backgroundThemeId, backgroundThemeUrl }) => {
     try {
       const stringRoomId = roomId ? roomId.toString() : '';
       const actingUserId = requesterId || socket.userId;
@@ -979,7 +1022,7 @@ io.on('connection', (socket) => {
         return;
       }
 
-      const room = await AudioRoom.findById(stringRoomId).select('hostId speakers micSeatCount micLayoutType');
+      const room = await AudioRoom.findById(stringRoomId).select('hostId speakers micSeatCount micLayoutType backgroundThemeId backgroundThemeUrl');
       if (!room) {
         socket.emit('error_notice', { message: 'Audio room not found.' });
         return;
@@ -1004,6 +1047,11 @@ io.on('connection', (socket) => {
         ? normalizeAudioLayoutType(room.micLayoutType)
         : normalizeAudioLayoutType(micLayoutType);
 
+      const incomingBackgroundTheme = backgroundThemeId !== undefined ? backgroundThemeId : backgroundThemeUrl;
+      const nextBackgroundThemeId = incomingBackgroundTheme === undefined
+        ? getAudioRoomBackgroundThemeId(room)
+        : normalizeAudioBackgroundThemeId(incomingBackgroundTheme);
+
       const occupiedOutsideLayout = (room.speakers || []).some(speaker => (
         speaker?.userId &&
         Number(speaker.slotIndex) >= nextSeatCount
@@ -1017,7 +1065,9 @@ io.on('connection', (socket) => {
       await AudioRoom.findByIdAndUpdate(stringRoomId, {
         $set: {
           micSeatCount: nextSeatCount,
-          micLayoutType: nextLayoutType
+          micLayoutType: nextLayoutType,
+          backgroundThemeId: nextBackgroundThemeId,
+          backgroundThemeUrl: nextBackgroundThemeId
         }
       });
 
@@ -1025,6 +1075,8 @@ io.on('connection', (socket) => {
       io.to(stringRoomId).emit('room_layout_changed', {
         micSeatCount: nextSeatCount,
         micLayoutType: nextLayoutType,
+        backgroundThemeId: nextBackgroundThemeId,
+        backgroundThemeUrl: nextBackgroundThemeId,
         slots
       });
     } catch (error) {
@@ -1969,7 +2021,7 @@ app.get('/gift-history/host/:hostId', async (req, res) => {
 
 app.post('/create', async (req, res) => {
   try {
-    const { title, hostId, numericUid, micSeatCount, micLayoutType } = req.body;
+    const { title, hostId, numericUid, micSeatCount, micLayoutType, backgroundThemeId, backgroundThemeUrl } = req.body;
     if (!hostId) return res.status(400).json({ success: false, error: 'Host identifier missing' });
     if (!(await canCreateLiveRoom(hostId))) {
       return res.status(403).json({ success: false, error: 'Login is required to create live rooms.' });
@@ -1982,6 +2034,8 @@ app.post('/create', async (req, res) => {
       isLive: true,
       micSeatCount: normalizeAudioMicSeatCount(micSeatCount),
       micLayoutType: normalizeAudioLayoutType(micLayoutType),
+      backgroundThemeId: normalizeAudioBackgroundThemeId(backgroundThemeId || backgroundThemeUrl),
+      backgroundThemeUrl: normalizeAudioBackgroundThemeId(backgroundThemeId || backgroundThemeUrl),
       speakers: [{ userId: hostId, isMuted: false, slotIndex: 0, numericUid: sanitizedUid }],
       audience: []
     });
@@ -2229,6 +2283,8 @@ app.get('/rooms', async (req, res) => {
       audienceCount: room.audience.length,
       micSeatCount: normalizeAudioMicSeatCount(room.micSeatCount),
       micLayoutType: normalizeAudioLayoutType(room.micLayoutType),
+      backgroundThemeId: getAudioRoomBackgroundThemeId(room),
+      backgroundThemeUrl: getAudioRoomBackgroundThemeId(room),
       createdAt: room.createdAt
     }));
     return res.status(200).json({ success: true, rooms: formattedRooms });

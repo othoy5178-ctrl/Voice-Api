@@ -26,6 +26,8 @@ const audioRoomSchema = new mongoose.Schema({
     enum: ['chatroom', 'dating', 'party', 'birthday'],
     default: 'chatroom'
   },
+  backgroundThemeId: { type: String, default: null },
+  backgroundThemeUrl: { type: String, default: null },
 
   isLive: { type: Boolean, default: true },
   createdAt: { type: Date, default: Date.now },
