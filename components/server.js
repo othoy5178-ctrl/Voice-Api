@@ -75,6 +75,21 @@ const hashAuthToken = (token) => crypto
   .update(String(token || ''))
   .digest('hex');
 
+const md5Signature = (value) => crypto
+  .createHash('md5')
+  .update(String(value || ''))
+  .digest('hex');
+
+const buildQuantumNexusSign = (...parts) => md5Signature(parts.join(''));
+
+const getQuantumNexusSharedKey = () => String(process.env.QUANTUM_NEXUS_SHARED_KEY || '').trim();
+
+const normalizeGameUser = (user) => ({
+  uid: user?._id?.toString() || '',
+  nickname: user?.name || user?.glixId || 'Glix User',
+  avatar: user?.profilePic || ''
+});
+
 const signAuthToken = async (user) => {
   const token = createAuthTokenValue();
   await AuthSession.create({
@@ -110,6 +125,38 @@ const verifyAuthToken = async (token) => {
   }
 
   return { sub: session.userId.toString() };
+};
+
+const notifyQuantumNexusMessage = async ({ sendUID, receiveUID, count = 1 }) => {
+  const providerNotifyUrl = String(process.env.QUANTUM_NEXUS_MESSAGE_NOTIFY_URL || '').trim();
+  const sharedKey = getQuantumNexusSharedKey();
+
+  if (!providerNotifyUrl || !sharedKey || !sendUID || !receiveUID) return null;
+
+  const messageCount = Number(count) || 1;
+  const payload = {
+    sendUID: sendUID.toString(),
+    receiveUID: receiveUID.toString(),
+    count: messageCount,
+    sign: buildQuantumNexusSign(sendUID, receiveUID, messageCount, sharedKey)
+  };
+
+  try {
+    const response = await fetch(providerNotifyUrl, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload)
+    });
+
+    const data = await response.json().catch(() => ({}));
+    if (!response.ok) {
+      console.log('Quantum Nexus message notify failed:', response.status, data);
+    }
+    return data;
+  } catch (error) {
+    console.log('Quantum Nexus message notify error:', error.message);
+    return null;
+  }
 };
 
 const requireAuthUser = async (req, res) => {
@@ -1478,6 +1525,12 @@ io.on('connection', (socket) => {
       // TARGET THE ROOM NAME
       io.to(receiverId.toString()).emit('receive_direct_message', serverPayload);
 
+      notifyQuantumNexusMessage({
+        sendUID: senderId,
+        receiveUID: receiverId,
+        count: 1
+      });
+
       // Echo back to sender
       socket.emit('message_sent_ack', { localId, _id: savedMessage._id.toString() });
 
@@ -1837,6 +1890,122 @@ app.get('/Friends/:userId', async (req, res) => {
 
   } catch (error) {
     res.status(500).json({ message: "Server error", error: error.message });
+  }
+});
+
+app.post('/api/friends/list', async (req, res) => {
+  try {
+    const uid = String(req.body?.uid || '').trim();
+    const token = String(req.body?.token || '').trim();
+    const sign = String(req.body?.sign || '').trim().toLowerCase();
+    const sharedKey = getQuantumNexusSharedKey();
+
+    if (!sharedKey) {
+      return res.status(500).json({
+        errorCode: 500,
+        errorMsg: 'Quantum Nexus shared key is not configured.',
+        data: []
+      });
+    }
+
+    if (!uid || !token || !sign) {
+      return res.status(400).json({
+        errorCode: 400,
+        errorMsg: 'uid, token and sign are required.',
+        data: []
+      });
+    }
+
+    if (!mongoose.Types.ObjectId.isValid(uid)) {
+      return res.status(400).json({
+        errorCode: 400,
+        errorMsg: 'Invalid uid.',
+        data: []
+      });
+    }
+
+    const expectedSign = buildQuantumNexusSign(uid, token, sharedKey);
+    if (sign !== expectedSign) {
+      return res.status(401).json({
+        errorCode: 401,
+        errorMsg: 'Invalid signature.',
+        data: []
+      });
+    }
+
+    const authPayload = await verifyAuthToken(token);
+    if (String(authPayload.sub) !== uid) {
+      return res.status(401).json({
+        errorCode: 401,
+        errorMsg: 'Token does not match uid.',
+        data: []
+      });
+    }
+
+    const user = await User.findById(uid).select('_id').lean();
+    if (!user) {
+      return res.status(404).json({
+        errorCode: 404,
+        errorMsg: 'User not found.',
+        data: []
+      });
+    }
+
+    const userObjectId = new mongoose.Types.ObjectId(uid);
+    const mutualRows = await Follow.aggregate([
+      { $match: { followerId: userObjectId } },
+      {
+        $lookup: {
+          from: 'follows',
+          let: { followingObjectId: '$followingId' },
+          pipeline: [
+            {
+              $match: {
+                $expr: {
+                  $and: [
+                    { $eq: ['$followerId', '$$followingObjectId'] },
+                    { $eq: ['$followingId', userObjectId] }
+                  ]
+                }
+              }
+            }
+          ],
+          as: 'isMutual'
+        }
+      },
+      { $match: { 'isMutual.0': { $exists: true } } },
+      {
+        $lookup: {
+          from: 'users',
+          localField: 'followingId',
+          foreignField: '_id',
+          as: 'friend'
+        }
+      },
+      { $unwind: '$friend' },
+      {
+        $project: {
+          _id: '$friend._id',
+          name: '$friend.name',
+          glixId: '$friend.glixId',
+          profilePic: '$friend.profilePic'
+        }
+      }
+    ]);
+
+    return res.status(200).json({
+      errorCode: 0,
+      errorMsg: 'Success',
+      data: mutualRows.map(normalizeGameUser)
+    });
+  } catch (error) {
+    console.log('Quantum Nexus friend list error:', error);
+    const statusCode = error?.statusCode || 500;
+    return res.status(statusCode).json({
+      errorCode: statusCode,
+      errorMsg: statusCode === 401 ? 'Invalid auth token.' : 'Internal server error.',
+      data: []
+    });
   }
 });
 
