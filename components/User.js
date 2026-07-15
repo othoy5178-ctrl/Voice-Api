@@ -145,7 +145,7 @@ const userSchema = new mongoose.Schema({
   chang: { type: Number, default: 0 },
   role: {
     type: String,
-    enum: ['user', 'host', 'agency', 'manager', 'admin'],
+    enum: ['user', 'host', 'agency', 'manager', 'admin', 'coin_seller'],
     default: 'user',
     index: true
   },
@@ -166,9 +166,60 @@ const userSchema = new mongoose.Schema({
     type: [String],
     default: []
   },
+  adminAccessRequest: {
+    requestedRole: {
+      type: String,
+      enum: ['manager', 'admin', ''],
+      default: ''
+    },
+    status: {
+      type: String,
+      enum: ['none', 'pending', 'approved', 'rejected'],
+      default: 'none',
+      index: true
+    },
+    note: { type: String, trim: true, default: '' },
+    rejectionReason: { type: String, trim: true, default: '' },
+    reviewedBy: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: 'User',
+      default: null
+    },
+    reviewedAt: { type: Date, default: null },
+    requestedAt: { type: Date, default: null }
+  },
   commissionBalance: { type: Number, default: 0 },
   revenueBalance: { type: Number, default: 0 },
   totalHostCoins: { type: Number, default: 0 },
+  sellerBalance: { type: Number, default: 0 },
+  sellerTotalSold: { type: Number, default: 0 },
+  coinSellerStatus: {
+    type: String,
+    enum: ['none', 'pending', 'approved', 'rejected', 'suspended'],
+    default: 'none',
+    index: true
+  },
+  coinSellerRejectionReason: { type: String, trim: true, default: '' },
+  coinSellerRegistration: {
+    fullName: { type: String, trim: true, default: '' },
+    phoneNumber: { type: String, trim: true, default: '' },
+    city: { type: String, trim: true, default: '' },
+    paymentMethod: { type: String, trim: true, default: '' },
+    note: { type: String, trim: true, default: '' },
+    status: {
+      type: String,
+      enum: ['none', 'pending', 'approved', 'rejected', 'suspended'],
+      default: 'none'
+    },
+    rejectionReason: { type: String, trim: true, default: '' },
+    reviewedBy: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: 'User',
+      default: null
+    },
+    reviewedAt: { type: Date, default: null },
+    registeredAt: { type: Date, default: null }
+  },
   hostStatus: {
     type: String,
     enum: ['none', 'pending', 'approved', 'rejected'],
@@ -256,3 +307,5 @@ const userSchema = new mongoose.Schema({
 const User = mongoose.model('User', userSchema);
 
 export default User;
+
+

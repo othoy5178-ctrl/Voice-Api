@@ -1,4 +1,4 @@
-﻿import mongoose from 'mongoose';
+import mongoose from 'mongoose';
 
 const storeItemSchema = new mongoose.Schema({
   itemKey: { type: String, required: true, unique: true, index: true },
@@ -13,6 +13,7 @@ const storeItemSchema = new mongoose.Schema({
   previewUrl: { type: String, default: '' },
   assetKey: { type: String, default: '' },
   equipValue: { type: String, default: '' },
+  isVipItem: { type: Boolean, default: false, index: true },
   isActive: { type: Boolean, default: true, index: true },
   sortOrder: { type: Number, default: 0 },
   createdAt: { type: Date, default: Date.now }

@@ -17,11 +17,13 @@ import DirectMessage from "./DirectMessage.js";
 import Follow from './Follow.js';
 import GiftTransaction from './GiftTransation.js';
 import GameCoinTransaction from './GameCoinTransaction.js';
+import CoinSellerTransaction from './CoinSellerTransaction.js';
 import RewardActivity from './RewardActivity.js';
 import RewardClaim from './RewardClaim.js';
 import StoreItem from './StoreItem.js';
 import UserStoreItem from './UserStoreItem.js';
 import Withdrawal from './Withdrawal.js';
+import MonthlyCommission from './MonthlyCommission.js';
 import AuthSession from './AuthSession.js';
 import ProfileVisit from './ProfileVisit.js';
 import cloudinary from './utils/cloudinary.js';
@@ -62,6 +64,7 @@ const HOST_RECONNECT_GRACE_MS = 30000;
 const HOST_REVIEWER_ROLES = ['manager', 'admin'];
 const WITHDRAW_METHODS = ['Easypaisa', 'JazzCash', 'Bank'];
 const MIN_WITHDRAW_AMOUNT = 1000;
+const MONTHLY_COMMISSION_ROLES = ['agency'];
 const TOKEN_TTL_SECONDS = 60 * 60 * 24 * 30;
 
 const TOKEN_TTL_MS = TOKEN_TTL_SECONDS * 1000;
@@ -238,17 +241,28 @@ const sendPasswordResetOtpEmail = async ({ email, name, otp }) => {
   });
 };
 const sendPushNotification = async ({ userId, title, body, data = {} }) => {
-  if (!userId || !mongoose.Types.ObjectId.isValid(userId)) return null;
+  const emptyResult = (reason) => ({
+    successCount: 0,
+    failureCount: 0,
+    tokenCount: 0,
+    skipped: true,
+    reason,
+  });
+
+  if (!userId || !mongoose.Types.ObjectId.isValid(userId)) return emptyResult('invalid_user');
 
   try {
     const messaging = getFirebaseMessaging();
-    if (!messaging) return null;
+    if (!messaging) return emptyResult('firebase_not_configured');
 
     const user = await User.findById(userId).select('fcmTokens settings').lean();
+    if (!user) return emptyResult('user_not_found');
+
     const notificationAllowed = user?.settings?.newMessageNotifications !== false;
     const tokens = [...new Set((user?.fcmTokens || []).map(item => item?.token).filter(Boolean))];
 
-    if (!notificationAllowed || !tokens.length) return null;
+    if (!notificationAllowed) return emptyResult('notifications_disabled');
+    if (!tokens.length) return emptyResult('no_fcm_token');
 
     const response = await messaging.sendEachForMulticast({
       tokens,
@@ -293,10 +307,21 @@ const sendPushNotification = async ({ userId, title, body, data = {} }) => {
       );
     }
 
-    return response;
+    return {
+      ...response,
+      tokenCount: tokens.length,
+      skipped: false,
+      invalidTokenCount: invalidTokens.length,
+    };
   } catch (error) {
     console.log('Push notification send error:', error.message);
-    return null;
+    return {
+      successCount: 0,
+      failureCount: 0,
+      tokenCount: 0,
+      skipped: true,
+      reason: error.message || 'send_error',
+    };
   }
 };
 
@@ -357,10 +382,58 @@ const buildWalletSnapshot = (user) => ({
   daimon: user?.daimon || 0,
   chang: user?.chang || 0,
   commissionBalance: user?.commissionBalance || 0,
-  revenueBalance: user?.revenueBalance || 0
+  revenueBalance: user?.revenueBalance || 0,
+  sellerBalance: user?.sellerBalance || 0
 });
 
 const sanitizeWithdrawalText = (value = '', max = 80) => String(value || '').trim().slice(0, max);
+
+const normalizeAccessEmail = (value = '') => String(value || '').trim().toLowerCase();
+
+const getAdminAccessAllowedEmails = () => String(
+  process.env.ADMIN_ACCESS_ALLOWED_EMAILS || process.env.ADMIN_ALLOWED_EMAILS || ''
+)
+  .split(',')
+  .map(normalizeAccessEmail)
+  .filter(Boolean);
+
+const isAdminAccessEmailAllowed = (email) => {
+  const allowedEmails = getAdminAccessAllowedEmails();
+  if (!allowedEmails.length) return false;
+  return allowedEmails.includes(normalizeAccessEmail(email));
+};
+
+const sanitizeAdminAccessRole = (role) => ['manager', 'admin'].includes(role) ? role : '';
+
+const normalizeGlixId = (value = '') => String(value || '').trim();
+
+const buildCoinSellerProfile = (user) => ({
+  id: user?._id,
+  name: user?.name || '',
+  email: user?.email || '',
+  glixId: user?.glixId || '',
+  role: user?.role || 'user',
+  coinSellerStatus: user?.coinSellerStatus || 'none',
+  sellerBalance: user?.sellerBalance || 0,
+  sellerTotalSold: user?.sellerTotalSold || 0,
+  coinSellerRegistration: user?.coinSellerRegistration || {}
+});
+
+const requireCoinSellerUser = async (req, res) => {
+  const authUser = await requireAuthUser(req, res);
+  if (!authUser) return null;
+
+  const seller = await User.findById(authUser._id)
+    .select('_id name email glixId role coinSellerStatus sellerBalance sellerTotalSold coinSellerRegistration accountStatus')
+    .lean();
+
+  if (!seller || seller.role !== 'coin_seller' || seller.coinSellerStatus !== 'approved' || seller.accountStatus !== 'active') {
+    res.status(403).json({ success: false, message: 'Approved coin seller access is required.' });
+    return null;
+  }
+
+  return seller;
+};
 
 const normalizeAgencyCode = (value = '') => String(value || '').trim().toUpperCase().replace(/[^A-Z0-9_-]/g, '').slice(0, 24);
 
@@ -374,19 +447,103 @@ const sanitizeStoreItemPayload = (payload = {}) => {
     if (payload[key] !== undefined) cleanItem[key] = Number(payload[key]) || 0;
   });
   if (payload.isActive !== undefined) cleanItem.isActive = !!payload.isActive;
+  if (payload.isVipItem !== undefined) cleanItem.isVipItem = !!payload.isVipItem;
   return cleanItem;
 };
 
+const getCommissionMonth = (date = new Date()) => {
+  const value = date instanceof Date ? date : new Date(date);
+  const year = value.getUTCFullYear();
+  const month = String(value.getUTCMonth() + 1).padStart(2, '0');
+  return `${year}-${month}`;
+};
+
+const getAgencyCommissionRate = (totalHostCoins = 0) => {
+  const coins = Number(totalHostCoins || 0);
+  if (coins >= 200000000) return 20;
+  if (coins >= 130000000) return 16;
+  if (coins >= 70000000) return 12;
+  if (coins >= 17000000) return 8;
+  return 4;
+};
+
+const settleCompletedMonthlyCommissions = async (session = null) => {
+  const currentMonth = getCommissionMonth();
+  let query = MonthlyCommission.find({ status: 'pending', month: { $lt: currentMonth } });
+  if (session) query = query.session(session);
+  const rows = await query;
+
+  for (const row of rows) {
+    if (!MONTHLY_COMMISSION_ROLES.includes(row.beneficiaryRole)) continue;
+
+    const updateOptions = session ? { session } : {};
+    await User.updateOne(
+      { _id: row.beneficiaryId, role: row.beneficiaryRole },
+      { $inc: { commissionBalance: Math.floor(Number(row.commissionAmount || 0)) } },
+      updateOptions
+    );
+    row.status = 'settled';
+    row.settledAt = new Date();
+    await row.save(updateOptions);
+  }
+
+  return rows.length;
+};
+
+const recordMonthlyAgencyCommission = async ({ receiverIds = [], perReceiverCost = 0, session = null }) => {
+  const cleanReceiverIds = receiverIds.filter(id => id && mongoose.Types.ObjectId.isValid(id));
+  const sourceCoins = Math.floor(Number(perReceiverCost || 0));
+  if (!cleanReceiverIds.length || sourceCoins <= 0) return;
+
+  const receivers = await User.find({ _id: { $in: cleanReceiverIds }, agencyId: { $ne: null } })
+    .select('_id agencyId hostStatus')
+    .session(session);
+
+  for (const receiver of receivers) {
+    if (!receiver.agencyId) continue;
+
+    const agency = await User.findOne({ _id: receiver.agencyId, role: 'agency' })
+      .select('_id totalHostCoins')
+      .session(session);
+    if (!agency) continue;
+
+    const ratePercent = getAgencyCommissionRate(agency.totalHostCoins || 0);
+    const commissionAmount = Math.floor((sourceCoins * ratePercent) / 100);
+    if (commissionAmount <= 0) continue;
+
+    const month = getCommissionMonth();
+    await MonthlyCommission.updateOne(
+      {
+        beneficiaryId: agency._id,
+        beneficiaryRole: 'agency',
+        hostId: receiver._id,
+        month
+      },
+      {
+        $setOnInsert: {
+          beneficiaryId: agency._id,
+          beneficiaryRole: 'agency',
+          hostId: receiver._id,
+          month,
+          status: 'pending',
+          settledAt: null
+        },
+        $set: { ratePercent },
+        $inc: { sourceCoins, commissionAmount }
+      },
+      { upsert: true, session }
+    );
+
+    await User.updateOne(
+      { _id: agency._id, role: 'agency' },
+      { $inc: { totalHostCoins: sourceCoins } },
+      { session }
+    );
+  }
+};
 const buildAgencySummary = async (agency) => {
   const hostCount = await User.countDocuments({ agencyId: agency._id });
-  const rate = (() => {
-    const coins = Number(agency.totalHostCoins || 0);
-    if (coins >= 200000000) return 20;
-    if (coins >= 130000000) return 16;
-    if (coins >= 70000000) return 12;
-    if (coins >= 17000000) return 8;
-    return 4;
-  })();
+  const rate = getAgencyCommissionRate(agency.totalHostCoins || 0);
 
   return {
     _id: agency._id,
@@ -694,16 +851,88 @@ const addAudioRoomController = (roomId, userId) => {
 };
 
 
+const VIP_BADGE_DURATION_DAYS = 30;
+const VIP_BADGE_PRICE = 799;
+const VIP_BADGE_PRIMARY_URL = 'https://res.cloudinary.com/dh99ihggv/image/upload/v1784108945/1_ioagdz.gif?_s=public-apps';
+const VIP_BADGE_ASSETS = [
+  { itemKey: 'vip_badge_2_tifvvq', name: 'VIP Badge 2', imageUrl: 'https://res.cloudinary.com/dh99ihggv/image/upload/v1784108948/2_tifvvq.gif?_s=public-apps' },
+  { itemKey: 'vip_badge_3_e2fggz', name: 'VIP Badge 3', imageUrl: 'https://res.cloudinary.com/dh99ihggv/image/upload/v1784108950/3_e2fggz.gif?_s=public-apps' },
+  { itemKey: 'vip_badge_4_etbwig', name: 'VIP Badge 4', imageUrl: 'https://res.cloudinary.com/dh99ihggv/image/upload/v1784108947/4_etbwig.gif?_s=public-apps' },
+  { itemKey: 'vip_badge_5_tu0gmi', name: 'VIP Badge 5', imageUrl: 'https://res.cloudinary.com/dh99ihggv/image/upload/v1784108945/5_tu0gmi.gif?_s=public-apps' },
+  { itemKey: 'vip_badge_6_ssrx8b', name: 'VIP Badge 6', imageUrl: 'https://res.cloudinary.com/dh99ihggv/image/upload/v1784108946/6_ssrx8b.gif?_s=public-apps' },
+  { itemKey: 'vip_badge_7_sy9jwx', name: 'VIP Badge 7', imageUrl: 'https://res.cloudinary.com/dh99ihggv/image/upload/v1784108949/7_sy9jwx.gif?_s=public-apps' },
+  { itemKey: 'vip_badge_8_jeamrm', name: 'VIP Badge 8', imageUrl: 'https://res.cloudinary.com/dh99ihggv/image/upload/v1784108947/8_jeamrm.gif?_s=public-apps' },
+  { itemKey: 'vip_badge_9_wy6zl2', name: 'VIP Badge 9', imageUrl: 'https://res.cloudinary.com/dh99ihggv/image/upload/v1784108948/9_wy6zl2.gif?_s=public-apps' },
+  { itemKey: 'vip_badge_10_mmjbai', name: 'VIP Badge 10', imageUrl: 'https://res.cloudinary.com/dh99ihggv/image/upload/v1784108950/10_mmjbai.gif?_s=public-apps' },
+  { itemKey: 'vip_badge_11_hrg1ht', name: 'VIP Badge 11', imageUrl: 'https://res.cloudinary.com/dh99ihggv/image/upload/v1784108942/11_hrg1ht.gif?_s=public-apps' },
+  { itemKey: 'vip_badge_12_gnuuau', name: 'VIP Badge 12', imageUrl: 'https://res.cloudinary.com/dh99ihggv/image/upload/v1784108943/12_gnuuau.gif?_s=public-apps' },
+  { itemKey: 'vip_badge_13_ci64oo', name: 'VIP Badge 13', imageUrl: 'https://res.cloudinary.com/dh99ihggv/image/upload/v1784108944/13_ci64oo.gif?_s=public-apps' },
+  { itemKey: 'vip_badge_14_hcrqhv', name: 'VIP Badge 14', imageUrl: 'https://res.cloudinary.com/dh99ihggv/image/upload/v1784108939/14_hcrqhv.gif?_s=public-apps' },
+  { itemKey: 'vip_badge_15_y4zdlr', name: 'VIP Badge 15', imageUrl: 'https://res.cloudinary.com/dh99ihggv/image/upload/v1784108935/15_y4zdlr.gif?_s=public-apps' },
+  { itemKey: 'vip_badge_16_cllcsq', name: 'VIP Badge 16', imageUrl: 'https://res.cloudinary.com/dh99ihggv/image/upload/v1784108941/16_cllcsq.gif?_s=public-apps' },
+  { itemKey: 'vip_badge_17_jkgagc', name: 'VIP Badge 17', imageUrl: 'https://res.cloudinary.com/dh99ihggv/image/upload/v1784108938/17_jkgagc.gif?_s=public-apps' },
+  { itemKey: 'vip_badge_18_cuyquh', name: 'VIP Badge 18', imageUrl: 'https://res.cloudinary.com/dh99ihggv/image/upload/v1784108936/18_cuyquh.gif?_s=public-apps' },
+  { itemKey: 'vip_badge_19_j2tr9w', name: 'VIP Badge 19', imageUrl: 'https://res.cloudinary.com/dh99ihggv/image/upload/v1784108937/19_j2tr9w.gif?_s=public-apps' },
+  { itemKey: 'vip_badge_20_i83r13', name: 'VIP Badge 20', imageUrl: 'https://res.cloudinary.com/dh99ihggv/image/upload/v1784108933/20_i83r13.gif?_s=public-apps' },
+  { itemKey: 'vip_badge_21_ulfv20', name: 'VIP Badge 21', imageUrl: 'https://res.cloudinary.com/dh99ihggv/image/upload/v1784108936/21_ulfv20.gif?_s=public-apps' },
+  { itemKey: 'vip_badge_22_jv8l10', name: 'VIP Badge 22', imageUrl: 'https://res.cloudinary.com/dh99ihggv/image/upload/v1784108940/22_jv8l10.gif?_s=public-apps' },
+  { itemKey: 'vip_badge_23_cwvilb', name: 'VIP Badge 23', imageUrl: 'https://res.cloudinary.com/dh99ihggv/image/upload/v1784108945/23_cwvilb.gif?_s=public-apps' },
+  { itemKey: 'vip_badge_24_fdfcfy', name: 'VIP Badge 24', imageUrl: 'https://res.cloudinary.com/dh99ihggv/image/upload/v1784108943/24_fdfcfy.gif?_s=public-apps' },
+  { itemKey: 'vip_badge_25_ym6c4g', name: 'VIP Badge 25', imageUrl: 'https://res.cloudinary.com/dh99ihggv/image/upload/v1784108940/25_ym6c4g.gif?_s=public-apps' },
+  { itemKey: 'vip_badge_26_sllsfx', name: 'VIP Badge 26', imageUrl: 'https://res.cloudinary.com/dh99ihggv/image/upload/v1784108935/26_sllsfx.gif?_s=public-apps' },
+  { itemKey: 'vip_badge_27_ijswom', name: 'VIP Badge 27', imageUrl: 'https://res.cloudinary.com/dh99ihggv/image/upload/v1784108938/27_ijswom.gif?_s=public-apps' },
+  { itemKey: 'vip_badge_28_tmosll', name: 'VIP Badge 28', imageUrl: 'https://res.cloudinary.com/dh99ihggv/image/upload/v1784108934/28_tmosll.gif?_s=public-apps' },
+  { itemKey: 'vip_badge_29_xfhzbc', name: 'VIP Badge 29', imageUrl: 'https://res.cloudinary.com/dh99ihggv/image/upload/v1784108939/29_xfhzbc.gif?_s=public-apps' },
+  { itemKey: 'vip_badge_30_qpwjku', name: 'VIP Badge 30', imageUrl: 'https://res.cloudinary.com/dh99ihggv/image/upload/v1784108942/30_qpwjku.gif?_s=public-apps' },
+  { itemKey: 'vip_badge_31_mpybnz', name: 'VIP Badge 31', imageUrl: 'https://res.cloudinary.com/dh99ihggv/image/upload/v1784108932/31_mpybnz.gif?_s=public-apps' },
+  { itemKey: 'vip_badge_32_aqy1oy', name: 'VIP Badge 32', imageUrl: 'https://res.cloudinary.com/dh99ihggv/image/upload/v1784108932/32_aqy1oy.gif?_s=public-apps' },
+  { itemKey: 'vip_badge_33_i5mjde', name: 'VIP Badge 33', imageUrl: 'https://res.cloudinary.com/dh99ihggv/image/upload/v1784108932/33_i5mjde.gif?_s=public-apps' },
+  { itemKey: 'vip_badge_35_utcpg1', name: 'VIP Badge 35', imageUrl: 'https://res.cloudinary.com/dh99ihggv/image/upload/v1784108929/35_utcpg1.gif?_s=public-apps' },
+  { itemKey: 'vip_badge_36_vfdyf2', name: 'VIP Badge 36', imageUrl: 'https://res.cloudinary.com/dh99ihggv/image/upload/v1784108930/36_vfdyf2.gif?_s=public-apps' },
+  { itemKey: 'vip_badge_37_pcfj8w', name: 'VIP Badge 37', imageUrl: 'https://res.cloudinary.com/dh99ihggv/image/upload/v1784108930/37_pcfj8w.gif?_s=public-apps' },
+  { itemKey: 'vip_badge_38_j3ujym', name: 'VIP Badge 38', imageUrl: 'https://res.cloudinary.com/dh99ihggv/image/upload/v1784108931/38_j3ujym.gif?_s=public-apps' },
+  { itemKey: 'vip_badge_39_chtadx', name: 'VIP Badge 39', imageUrl: 'https://res.cloudinary.com/dh99ihggv/image/upload/v1784108927/39_chtadx.gif?_s=public-apps' },
+  { itemKey: 'vip_badge_40_ovz5gx', name: 'VIP Badge 40', imageUrl: 'https://res.cloudinary.com/dh99ihggv/image/upload/v1784108928/40_ovz5gx.gif?_s=public-apps' },
+  { itemKey: 'vip_badge_41_ql13et', name: 'VIP Badge 41', imageUrl: 'https://res.cloudinary.com/dh99ihggv/image/upload/v1784108924/41_ql13et.gif?_s=public-apps' },
+  { itemKey: 'vip_badge_42_aorxmf', name: 'VIP Badge 42', imageUrl: 'https://res.cloudinary.com/dh99ihggv/image/upload/v1784108925/42_aorxmf.gif?_s=public-apps' },
+  { itemKey: 'vip_badge_43_wodtmf', name: 'VIP Badge 43', imageUrl: 'https://res.cloudinary.com/dh99ihggv/image/upload/v1784108923/43_wodtmf.gif?_s=public-apps' },
+  { itemKey: 'vip_badge_44_xbrrvf', name: 'VIP Badge 44', imageUrl: 'https://res.cloudinary.com/dh99ihggv/image/upload/v1784108925/44_xbrrvf.gif?_s=public-apps' },
+  { itemKey: 'vip_badge_45_e0nccv', name: 'VIP Badge 45', imageUrl: 'https://res.cloudinary.com/dh99ihggv/image/upload/v1784108926/45_e0nccv.gif?_s=public-apps' },
+  { itemKey: 'vip_badge_46_xq940e', name: 'VIP Badge 46', imageUrl: 'https://res.cloudinary.com/dh99ihggv/image/upload/v1784108923/46_xq940e.gif?_s=public-apps' },
+  { itemKey: 'vip_badge_47_d5mt3q', name: 'VIP Badge 47', imageUrl: 'https://res.cloudinary.com/dh99ihggv/image/upload/v1784108927/47_d5mt3q.gif?_s=public-apps' },
+  { itemKey: 'vip_badge_48_lsyh6v', name: 'VIP Badge 48', imageUrl: 'https://res.cloudinary.com/dh99ihggv/image/upload/v1784108922/48_lsyh6v.gif?_s=public-apps' },
+  { itemKey: 'vip_badge_49_ufjckq', name: 'VIP Badge 49', imageUrl: 'https://res.cloudinary.com/dh99ihggv/image/upload/v1784108926/49_ufjckq.gif?_s=public-apps' },
+  { itemKey: 'vip_badge_50_wmyblm', name: 'VIP Badge 50', imageUrl: 'https://res.cloudinary.com/dh99ihggv/image/upload/v1784108922/50_wmyblm.gif?_s=public-apps' },
+];
 const DEFAULT_STORE_ITEMS = [
-  { itemKey: 'toyota_ride', name: 'Toyota', category: 'Ride', section: 'New This Month', type: 'ride', price: 400, currency: 'chang', durationDays: 30, assetKey: 'Ride', sortOrder: 1 },
-  { itemKey: 'premium_badge', name: 'Premium', category: 'Honor', section: 'New This Month', type: 'badge', price: 30, currency: 'chang', durationDays: 1, assetKey: 'premium', sortOrder: 2 },
-  { itemKey: 'jupiter_rare_id', name: 'Jupiter', category: 'Rare ID', section: 'New This Month', type: 'rareId', price: 12, currency: 'chang', durationDays: 7, assetKey: 'RareId', sortOrder: 3 },
-  { itemKey: 'gilded_precious_frame', name: 'Gilded Precious', category: 'Profile', section: 'Avatar Frame', type: 'frame', price: 400, currency: 'chang', durationDays: 30, assetKey: 'profileBadge', equipValue: 'profileBadge', sortOrder: 4 },
-  { itemKey: 'panther_frame', name: 'Panther', category: 'Profile', section: 'Avatar Frame', type: 'frame', price: 400, currency: 'chang', durationDays: 30, assetKey: 'higher', equipValue: 'higher', sortOrder: 5 },
-  { itemKey: 'lion_king_frame', name: 'Lion King', category: 'Profile', section: 'Avatar Frame', type: 'frame', price: 400, currency: 'chang', durationDays: 30, assetKey: 'special', equipValue: 'special', sortOrder: 6 },
-  { itemKey: 'honor_star', name: 'Honor Star', category: 'Honor', section: 'Avatar Frame', type: 'badge', price: 250, currency: 'chang', durationDays: 15, assetKey: 'honor-star', sortOrder: 7 },
-  { itemKey: 'popular_flower', name: 'Flower Aura', category: 'Popular', section: 'Avatar Frame', type: 'frame', price: 180, currency: 'chang', durationDays: 30, assetKey: 'flower', equipValue: 'flower', sortOrder: 8 },
-  { itemKey: 'star_entry_effect', name: 'Star Entry', category: 'Popular', section: 'New This Month', type: 'entryVideo', price: 300, currency: 'chang', durationDays: 30, assetKey: 'star', previewUrl: 'https://www.w3schools.com/html/mov_bbb.mp4', equipValue: 'https://www.w3schools.com/html/mov_bbb.mp4', sortOrder: 9 }
+  { itemKey: 'vip_1_day', name: 'VIP 1 Day', category: 'VIP', section: 'VIP Plans', type: 'vip', price: 30, currency: 'chang', durationDays: VIP_BADGE_DURATION_DAYS, assetKey: 'premium', isVipItem: true, isActive: false, sortOrder: 101 },
+  { itemKey: 'vip_7_days', name: 'VIP 7 Days', category: 'VIP', section: 'VIP Plans', type: 'vip', price: 199, currency: 'chang', durationDays: VIP_BADGE_DURATION_DAYS, assetKey: 'premium', isVipItem: true, isActive: false, sortOrder: 102 },
+  { itemKey: 'vip_30_days', name: 'VIP Badge 30 Days', category: 'VIP', section: 'VIP Badges', type: 'vip', price: VIP_BADGE_PRICE, currency: 'chang', durationDays: VIP_BADGE_DURATION_DAYS, imageUrl: VIP_BADGE_PRIMARY_URL, previewUrl: VIP_BADGE_PRIMARY_URL, equipValue: VIP_BADGE_PRIMARY_URL, assetKey: 'premium', isVipItem: true, sortOrder: 1 },
+  ...VIP_BADGE_ASSETS.map((badge, index) => ({
+    itemKey: badge.itemKey,
+    name: badge.name,
+    category: 'VIP',
+    section: 'VIP Badges',
+    type: 'vip',
+    price: VIP_BADGE_PRICE,
+    currency: 'chang',
+    durationDays: VIP_BADGE_DURATION_DAYS,
+    imageUrl: badge.imageUrl,
+    previewUrl: badge.imageUrl,
+    equipValue: badge.imageUrl,
+    assetKey: 'premium',
+    isVipItem: true,
+    sortOrder: index + 2
+  })),
+  { itemKey: 'premium_badge', name: 'Premium', category: 'VIP', section: 'VIP Plans', type: 'vip', price: 30, currency: 'chang', durationDays: VIP_BADGE_DURATION_DAYS, assetKey: 'premium', isVipItem: true, isActive: false, sortOrder: 103 },
+  { itemKey: 'toyota_ride', name: 'Toyota', category: 'Ride', section: 'New This Month', type: 'ride', price: 400, currency: 'chang', durationDays: 30, assetKey: 'Ride', isVipItem: false, sortOrder: 10 },
+  { itemKey: 'jupiter_rare_id', name: 'Jupiter', category: 'Rare ID', section: 'New This Month', type: 'rareId', price: 12, currency: 'chang', durationDays: 7, assetKey: 'RareId', isVipItem: false, sortOrder: 11 },
+  { itemKey: 'gilded_precious_frame', name: 'Gilded Precious', category: 'Profile', section: 'Avatar Frame', type: 'frame', price: 400, currency: 'chang', durationDays: 30, assetKey: 'profileBadge', equipValue: 'profileBadge', isVipItem: false, sortOrder: 12 },
+  { itemKey: 'panther_frame', name: 'Panther', category: 'Profile', section: 'Avatar Frame', type: 'frame', price: 400, currency: 'chang', durationDays: 30, assetKey: 'higher', equipValue: 'higher', isVipItem: false, sortOrder: 13 },
+  { itemKey: 'lion_king_frame', name: 'Lion King', category: 'Profile', section: 'Avatar Frame', type: 'frame', price: 400, currency: 'chang', durationDays: 30, assetKey: 'special', equipValue: 'special', isVipItem: false, sortOrder: 14 },
+  { itemKey: 'honor_star', name: 'Honor Star', category: 'Honor', section: 'Avatar Frame', type: 'badge', price: 250, currency: 'chang', durationDays: 15, assetKey: 'honor-star', isVipItem: false, sortOrder: 15 },
+  { itemKey: 'popular_flower', name: 'Flower Aura', category: 'Popular', section: 'Avatar Frame', type: 'frame', price: 180, currency: 'chang', durationDays: 30, assetKey: 'flower', equipValue: 'flower', isVipItem: false, sortOrder: 16 },
+  { itemKey: 'star_entry_effect', name: 'Star Entry', category: 'Popular', section: 'New This Month', type: 'entryVideo', price: 300, currency: 'chang', durationDays: 30, assetKey: 'star', previewUrl: 'https://www.w3schools.com/html/mov_bbb.mp4', equipValue: 'https://www.w3schools.com/html/mov_bbb.mp4', isVipItem: false, sortOrder: 17 }
 ];
 
 const ensureDefaultStoreItems = async () => {
@@ -753,15 +982,44 @@ const clearExpiredStoreItems = async (userId, session = null) => {
   }
 };
 
+const getUserVipStatus = async (userId) => {
+  if (!mongoose.Types.ObjectId.isValid(userId)) {
+    return { isVip: false, vipExpiresAt: null, vipItemKey: '', vipBadgeUrl: '' };
+  }
+
+  const now = new Date();
+  const vipItem = await UserStoreItem.findOne({
+    userId,
+    $and: [
+      { $or: [{ type: 'vip' }, { itemKey: 'premium_badge' }] },
+      { $or: [{ expiresAt: null }, { expiresAt: { $gt: now } }] }
+    ]
+  })
+    .populate('itemId', 'imageUrl previewUrl equipValue assetKey name')
+    .sort({ expiresAt: -1, createdAt: -1 })
+    .lean();
+
+  const vipStoreItem = vipItem?.itemId && typeof vipItem.itemId === 'object' ? vipItem.itemId : {};
+  const vipBadgeUrl = vipStoreItem.equipValue || vipStoreItem.imageUrl || vipStoreItem.previewUrl || '';
+
+  return {
+    isVip: !!vipItem,
+    vipExpiresAt: vipItem?.expiresAt || null,
+    vipItemKey: vipItem?.itemKey || '',
+    vipBadgeUrl
+  };
+};
 const getStoreWallet = async (userId) => {
   await clearExpiredStoreItems(userId);
   const user = await User.findById(userId).select('daimon chang frameUrl entryVideoUrl');
   if (!user) return null;
+  const vip = await getUserVipStatus(userId);
   return {
     daimon: user.daimon || 0,
     chang: user.chang || 0,
     frameUrl: user.frameUrl || '',
-    entryVideoUrl: user.entryVideoUrl || ''
+    entryVideoUrl: user.entryVideoUrl || '',
+    ...vip
   };
 };
 
@@ -1529,6 +1787,11 @@ io.on('connection', (socket) => {
       })), { session });
 
 
+            await recordMonthlyAgencyCommission({
+        receiverIds: targetIds,
+        perReceiverCost,
+        session
+      });
       await session.commitTransaction();
       await recordRewardActivity(userId, 'send_gift', { roomId: roomId?.toString(), totalCost });
 
@@ -2050,9 +2313,11 @@ app.get('/Friends/:userId', async (req, res) => {
     const friendCount = result.length > 0 ? result[0].friendCount : 0;
 
     // 3. Return the combined data
+    const vip = await getUserVipStatus(userId);
     res.status(200).json({
       ...user._doc,
-      friends: friendCount // This matches your profile UI needs
+      friends: friendCount, // This matches your profile UI needs
+      ...vip
     });
 
   } catch (error) {
@@ -3034,6 +3299,523 @@ app.get('/rooms', async (req, res) => {
   }
 });
 
+app.post('/coin-seller/register', async (req, res) => {
+  try {
+    const name = sanitizeWithdrawalText(req.body?.name, 80);
+    const normalizedEmail = normalizeAccessEmail(req.body?.email);
+    const password = String(req.body?.password || '');
+    const phoneNumber = sanitizeWithdrawalText(req.body?.phoneNumber || req.body?.phone, 40);
+    const city = sanitizeWithdrawalText(req.body?.city, 80);
+    const paymentMethod = sanitizeWithdrawalText(req.body?.paymentMethod, 80);
+    const note = sanitizeWithdrawalText(req.body?.note, 300);
+
+    if (!name) return res.status(400).json({ success: false, message: 'Name is required.' });
+    if (!normalizedEmail) return res.status(400).json({ success: false, message: 'Email is required.' });
+    if (!password || password.length < 6) return res.status(400).json({ success: false, message: 'Password must be at least 6 characters.' });
+    if (!phoneNumber) return res.status(400).json({ success: false, message: 'Phone number is required.' });
+    if (!paymentMethod) return res.status(400).json({ success: false, message: 'Payment method is required.' });
+
+    let user = await User.findOne({ email: normalizedEmail }).select('name email password role glixId coinSellerStatus coinSellerRegistration');
+    if (user) {
+      if (user.role === 'coin_seller' && user.coinSellerStatus === 'approved') {
+        return res.status(400).json({ success: false, message: 'This email is already approved as a coin seller.' });
+      }
+      if (user.password) {
+        const passwordMatches = await bcrypt.compare(password, user.password);
+        if (!passwordMatches) return res.status(401).json({ success: false, message: 'This email already exists. Enter the correct password.' });
+      } else {
+        const salt = await bcrypt.genSalt(10);
+        user.password = await bcrypt.hash(password, salt);
+      }
+      if (!user.glixId) user = await ensureUserPublicId(user);
+      user.name = user.name || name;
+    } else {
+      const salt = await bcrypt.genSalt(10);
+      user = new User({
+        name,
+        email: normalizedEmail,
+        password: await bcrypt.hash(password, salt),
+        glixId: await createUniqueUserPublicId()
+      });
+    }
+
+    user.coinSellerStatus = 'pending';
+    user.coinSellerRejectionReason = '';
+    user.coinSellerRegistration = {
+      fullName: name,
+      phoneNumber,
+      city,
+      paymentMethod,
+      note,
+      status: 'pending',
+      rejectionReason: '',
+      reviewedBy: null,
+      reviewedAt: null,
+      registeredAt: new Date()
+    };
+    await user.save();
+
+    return res.status(200).json({ success: true, message: 'Coin seller request submitted. Wait for admin approval.' });
+  } catch (error) {
+    if (error?.code === 11000) return res.status(409).json({ success: false, message: 'This email is already registered.' });
+    return res.status(500).json({ success: false, message: error.message });
+  }
+});
+
+app.post('/coin-seller/login', async (req, res) => {
+  try {
+    const normalizedEmail = normalizeAccessEmail(req.body?.email);
+    const password = String(req.body?.password || '');
+    if (!normalizedEmail) return res.status(400).json({ success: false, message: 'Email is required.' });
+    if (!password) return res.status(400).json({ success: false, message: 'Password is required.' });
+
+    const user = await User.findOne({ email: normalizedEmail }).select('name email password glixId role coinSellerStatus sellerBalance sellerTotalSold coinSellerRegistration accountStatus');
+    if (!user || !user.password) return res.status(401).json({ success: false, message: 'Invalid email or password.' });
+
+    const passwordMatches = await bcrypt.compare(password, user.password);
+    if (!passwordMatches) return res.status(401).json({ success: false, message: 'Invalid email or password.' });
+
+    if (user.role !== 'coin_seller' || user.coinSellerStatus !== 'approved') {
+      return res.status(403).json({
+        success: false,
+        message: user.coinSellerStatus === 'pending'
+          ? 'Your coin seller request is pending admin approval.'
+          : user.coinSellerStatus === 'rejected'
+            ? 'Your coin seller request was rejected.'
+            : 'This account is not approved as a coin seller.',
+        coinSellerStatus: user.coinSellerStatus || 'none'
+      });
+    }
+    if (user.accountStatus !== 'active') return res.status(403).json({ success: false, message: 'This seller account is not active.' });
+
+    user.lastLogin = new Date();
+    await user.save();
+
+    const token = await signAuthToken(user);
+    return res.status(200).json({ success: true, token, seller: buildCoinSellerProfile(user) });
+  } catch (error) {
+    return res.status(500).json({ success: false, message: error.message });
+  }
+});
+
+app.get('/coin-seller/me', async (req, res) => {
+  try {
+    const seller = await requireCoinSellerUser(req, res);
+    if (!seller) return;
+    return res.status(200).json({ success: true, seller: buildCoinSellerProfile(seller) });
+  } catch (error) {
+    return res.status(500).json({ success: false, message: error.message });
+  }
+});
+
+app.get('/coin-seller/transactions', async (req, res) => {
+  try {
+    const seller = await requireCoinSellerUser(req, res);
+    if (!seller) return;
+    const transactions = await CoinSellerTransaction.find({ sellerId: seller._id })
+      .populate('buyerId', 'name email glixId profilePic chang')
+      .sort({ createdAt: -1 })
+      .limit(200)
+      .lean();
+    return res.status(200).json({ success: true, transactions });
+  } catch (error) {
+    return res.status(500).json({ success: false, message: error.message });
+  }
+});
+
+app.post('/coin-seller/sell', async (req, res) => {
+  const session = await mongoose.startSession();
+  session.startTransaction();
+
+  try {
+    const sellerAuth = await requireCoinSellerUser(req, res);
+    if (!sellerAuth) {
+      await session.abortTransaction();
+      return;
+    }
+
+    const glixId = normalizeGlixId(req.body?.glixId);
+    const coins = Math.floor(Number(req.body?.coins));
+    const paymentMethod = sanitizeWithdrawalText(req.body?.paymentMethod, 80);
+    const note = sanitizeWithdrawalText(req.body?.note, 300);
+
+    if (!glixId) throw new Error('Buyer Glix ID is required.');
+    if (!Number.isFinite(coins) || coins <= 0) throw new Error('Enter a valid coin amount.');
+
+    const buyer = await User.findOne({ glixId: { $regex: `^${glixId.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}$`, $options: 'i' } })
+      .select('_id name email glixId chang')
+      .session(session);
+    if (!buyer) throw new Error('No user found with this Glix ID.');
+    if (String(buyer._id) === String(sellerAuth._id)) throw new Error('You cannot sell coins to yourself.');
+
+    const seller = await User.findOneAndUpdate(
+      {
+        _id: sellerAuth._id,
+        role: 'coin_seller',
+        coinSellerStatus: 'approved',
+        accountStatus: 'active',
+        sellerBalance: { $gte: coins }
+      },
+      { $inc: { sellerBalance: -coins, sellerTotalSold: coins } },
+      { new: true, session }
+    ).select('_id sellerBalance sellerTotalSold name email glixId role coinSellerStatus coinSellerRegistration');
+
+    if (!seller) throw new Error('Insufficient seller balance. Ask admin to add more balance.');
+
+    buyer.chang = (buyer.chang || 0) + coins;
+    await buyer.save({ session });
+
+    const [transaction] = await CoinSellerTransaction.create([{
+      sellerId: seller._id,
+      buyerId: buyer._id,
+      buyerGlixId: buyer.glixId,
+      coins,
+      paymentMethod,
+      note,
+      status: 'completed',
+      sellerBalanceAfter: seller.sellerBalance || 0,
+      buyerCoinsAfter: buyer.chang || 0
+    }], { session });
+
+    await session.commitTransaction();
+
+    return res.status(200).json({
+      success: true,
+      message: 'Coins added successfully.',
+      seller: buildCoinSellerProfile(seller),
+      buyer: { id: buyer._id, name: buyer.name, glixId: buyer.glixId, chang: buyer.chang },
+      transaction
+    });
+  } catch (error) {
+    await session.abortTransaction();
+    return res.status(400).json({ success: false, message: error.message });
+  } finally {
+    session.endSession();
+  }
+});
+
+app.get('/admin/coin-seller/requests', async (req, res) => {
+  try {
+    const adminUser = await requireAuthUser(req, res);
+    if (!adminUser) return;
+    if (!(await canUseAdminPanel(adminUser._id))) {
+      return res.status(403).json({ success: false, message: 'Only admin can review coin seller requests.' });
+    }
+
+    const sellerStatuses = ['pending', 'approved', 'rejected', 'suspended'];
+    const status = [...sellerStatuses, 'all'].includes(req.query.status) ? req.query.status : 'pending';
+    const filter = status === 'all'
+      ? {
+        $or: [
+          { coinSellerStatus: { $in: sellerStatuses } },
+          { 'coinSellerRegistration.status': { $in: sellerStatuses } }
+        ]
+      }
+      : {
+        $or: [
+          { coinSellerStatus: status },
+          { 'coinSellerRegistration.status': status }
+        ]
+      };
+    const requests = await User.find(filter)
+      .select('name email profilePic glixId role coinSellerStatus coinSellerRejectionReason coinSellerRegistration sellerBalance sellerTotalSold createdAt')
+      .populate('coinSellerRegistration.reviewedBy', 'name email glixId')
+      .sort({ 'coinSellerRegistration.registeredAt': -1, createdAt: -1 })
+      .limit(500)
+      .lean();
+
+    const normalizedRequests = requests.map((requestItem) => {
+      const registrationStatus = requestItem.coinSellerRegistration?.status;
+      const normalizedStatus = requestItem.coinSellerStatus && requestItem.coinSellerStatus !== 'none'
+        ? requestItem.coinSellerStatus
+        : registrationStatus || 'none';
+      return { ...requestItem, coinSellerStatus: normalizedStatus };
+    });
+
+    return res.status(200).json({ success: true, requests: normalizedRequests });
+  } catch (error) {
+    return res.status(500).json({ success: false, message: error.message });
+  }
+});
+
+app.patch('/admin/coin-seller/requests/:userId', async (req, res) => {
+  try {
+    const adminUser = await requireAuthUser(req, res);
+    if (!adminUser) return;
+    if (!(await canUseAdminPanel(adminUser._id))) {
+      return res.status(403).json({ success: false, message: 'Only admin can review coin seller requests.' });
+    }
+
+    const { userId } = req.params;
+    if (!mongoose.Types.ObjectId.isValid(userId)) return res.status(400).json({ success: false, message: 'Invalid user id.' });
+    const status = req.body?.status;
+    if (!['approved', 'rejected', 'suspended'].includes(status)) return res.status(400).json({ success: false, message: 'Select approved, rejected, or suspended.' });
+
+    const seller = await User.findById(userId).select('role coinSellerStatus coinSellerRegistration coinSellerRejectionReason sellerBalance');
+    if (!seller) return res.status(404).json({ success: false, message: 'Coin seller request not found.' });
+
+    if (status === 'approved') {
+      seller.role = 'coin_seller';
+      seller.coinSellerStatus = 'approved';
+      seller.coinSellerRejectionReason = '';
+      seller.coinSellerRegistration.status = 'approved';
+      seller.coinSellerRegistration.rejectionReason = '';
+      if (!Number.isFinite(Number(seller.sellerBalance))) seller.sellerBalance = 0;
+    } else if (status === 'suspended') {
+      seller.coinSellerStatus = 'suspended';
+      seller.coinSellerRegistration.status = 'suspended';
+    } else {
+      const reason = sanitizeWithdrawalText(req.body?.reason, 300);
+      seller.coinSellerStatus = 'rejected';
+      seller.coinSellerRejectionReason = reason;
+      seller.coinSellerRegistration.status = 'rejected';
+      seller.coinSellerRegistration.rejectionReason = reason;
+      if (seller.role === 'coin_seller') seller.role = 'user';
+    }
+
+    seller.coinSellerRegistration.reviewedBy = adminUser._id;
+    seller.coinSellerRegistration.reviewedAt = new Date();
+    await seller.save();
+
+    return res.status(200).json({ success: true, message: `Coin seller request ${status}.`, seller });
+  } catch (error) {
+    return res.status(500).json({ success: false, message: error.message });
+  }
+});
+
+app.get('/admin/coin-sellers', async (req, res) => {
+  try {
+    const adminUser = await requireAuthUser(req, res);
+    if (!adminUser) return;
+    if (!(await canUseAdminPanel(adminUser._id))) {
+      return res.status(403).json({ success: false, message: 'Only admin can view coin sellers.' });
+    }
+
+    const sellers = await User.find({ coinSellerStatus: { $in: ['approved', 'suspended'] } })
+      .select('name email profilePic glixId role coinSellerStatus sellerBalance sellerTotalSold coinSellerRegistration createdAt')
+      .sort({ sellerTotalSold: -1, createdAt: -1 })
+      .limit(500)
+      .lean();
+
+    return res.status(200).json({ success: true, sellers });
+  } catch (error) {
+    return res.status(500).json({ success: false, message: error.message });
+  }
+});
+
+app.patch('/admin/coin-sellers/:sellerId/balance', async (req, res) => {
+  try {
+    const adminUser = await requireAuthUser(req, res);
+    if (!adminUser) return;
+    if (!(await canUseAdminPanel(adminUser._id))) {
+      return res.status(403).json({ success: false, message: 'Only admin can update seller balance.' });
+    }
+
+    const { sellerId } = req.params;
+    if (!mongoose.Types.ObjectId.isValid(sellerId)) return res.status(400).json({ success: false, message: 'Invalid seller id.' });
+    const amount = Math.floor(Number(req.body?.amount));
+    const type = req.body?.type === 'deduct' ? 'deduct' : 'add';
+    if (!Number.isFinite(amount) || amount <= 0) return res.status(400).json({ success: false, message: 'Enter a valid amount.' });
+
+    const inc = type === 'deduct' ? -amount : amount;
+    const filter = type === 'deduct'
+      ? { _id: sellerId, coinSellerStatus: { $in: ['approved', 'suspended'] }, sellerBalance: { $gte: amount } }
+      : { _id: sellerId, coinSellerStatus: { $in: ['approved', 'suspended'] } };
+    const seller = await User.findOneAndUpdate(filter, { $inc: { sellerBalance: inc } }, { new: true })
+      .select('name email glixId role coinSellerStatus sellerBalance sellerTotalSold coinSellerRegistration');
+
+    if (!seller) return res.status(400).json({ success: false, message: 'Seller not found or insufficient balance.' });
+    return res.status(200).json({ success: true, seller, message: 'Seller balance updated.' });
+  } catch (error) {
+    return res.status(500).json({ success: false, message: error.message });
+  }
+});
+
+app.get('/admin/coin-seller/transactions', async (req, res) => {
+  try {
+    const adminUser = await requireAuthUser(req, res);
+    if (!adminUser) return;
+    if (!(await canUseAdminPanel(adminUser._id))) {
+      return res.status(403).json({ success: false, message: 'Only admin can view seller transactions.' });
+    }
+
+    const transactions = await CoinSellerTransaction.find({})
+      .populate('sellerId', 'name email glixId')
+      .populate('buyerId', 'name email glixId chang')
+      .sort({ createdAt: -1 })
+      .limit(500)
+      .lean();
+
+    return res.status(200).json({ success: true, transactions });
+  } catch (error) {
+    return res.status(500).json({ success: false, message: error.message });
+  }
+});
+app.post('/admin/access/request', async (req, res) => {
+  try {
+    const authUser = await requireAuthUser(req, res);
+    if (!authUser) return;
+
+    const requestedRole = sanitizeAdminAccessRole(req.body?.requestedRole);
+    const note = sanitizeWithdrawalText(req.body?.note, 300);
+    if (!requestedRole) return res.status(400).json({ success: false, message: 'Select manager or admin access.' });
+
+    const user = await User.findById(authUser._id).select('name email role adminAccessRequest');
+    if (!user) return res.status(404).json({ success: false, message: 'User not found' });
+    if (['admin', 'manager'].includes(user.role || 'user')) {
+      return res.status(400).json({ success: false, message: 'This account already has admin portal access.' });
+    }
+    if (!isAdminAccessEmailAllowed(user.email)) {
+      return res.status(403).json({ success: false, message: 'This email is not allowed to request admin portal access.' });
+    }
+
+    user.adminAccessRequest = {
+      requestedRole,
+      status: 'pending',
+      note,
+      rejectionReason: '',
+      reviewedBy: null,
+      reviewedAt: null,
+      requestedAt: new Date()
+    };
+    await user.save();
+
+    return res.status(200).json({ success: true, message: 'Access request submitted for admin approval.', request: user.adminAccessRequest });
+  } catch (error) {
+    return res.status(500).json({ success: false, message: error.message });
+  }
+});
+
+app.post('/admin/access/register', async (req, res) => {
+  try {
+    const name = sanitizeWithdrawalText(req.body?.name, 80);
+    const normalizedEmail = normalizeAccessEmail(req.body?.email);
+    const password = String(req.body?.password || '');
+    const requestedRole = sanitizeAdminAccessRole(req.body?.requestedRole);
+    const note = sanitizeWithdrawalText(req.body?.note, 300);
+
+    if (!name) return res.status(400).json({ success: false, message: 'Name is required.' });
+    if (!normalizedEmail) return res.status(400).json({ success: false, message: 'Email is required.' });
+    if (!password || password.length < 6) return res.status(400).json({ success: false, message: 'Password must be at least 6 characters.' });
+    if (!requestedRole) return res.status(400).json({ success: false, message: 'Select manager or admin access.' });
+    if (!isAdminAccessEmailAllowed(normalizedEmail)) {
+      return res.status(403).json({ success: false, message: 'This email is not allowed to request admin portal access.' });
+    }
+
+    let user = await User.findOne({ email: normalizedEmail }).select('name email password role adminAccessRequest glixId');
+    if (user) {
+      if (['admin', 'manager'].includes(user.role || 'user')) {
+        return res.status(400).json({ success: false, message: 'This account already has admin portal access. Please sign in.' });
+      }
+      if (user.password) {
+        const passwordMatches = await bcrypt.compare(password, user.password);
+        if (!passwordMatches) return res.status(401).json({ success: false, message: 'This email already exists. Enter the correct password or request from the app profile.' });
+      } else {
+        const salt = await bcrypt.genSalt(10);
+        user.password = await bcrypt.hash(password, salt);
+      }
+      if (!user.glixId) user = await ensureUserPublicId(user);
+      user.name = user.name || name;
+    } else {
+      const salt = await bcrypt.genSalt(10);
+      user = new User({
+        name,
+        email: normalizedEmail,
+        password: await bcrypt.hash(password, salt),
+        glixId: await createUniqueUserPublicId()
+      });
+    }
+
+    user.adminAccessRequest = {
+      requestedRole,
+      status: 'pending',
+      note,
+      rejectionReason: '',
+      reviewedBy: null,
+      reviewedAt: null,
+      requestedAt: new Date()
+    };
+    await user.save();
+
+    return res.status(200).json({ success: true, message: 'Access request submitted. An existing admin must approve it before you can sign in.' });
+  } catch (error) {
+    if (error?.code === 11000) return res.status(409).json({ success: false, message: 'This email is already registered.' });
+    return res.status(500).json({ success: false, message: error.message });
+  }
+});
+
+app.get('/admin/access/requests', async (req, res) => {
+  try {
+    const adminUser = await requireAuthUser(req, res);
+    if (!adminUser) return;
+    if (!(await canUseAdminPanel(adminUser._id))) {
+      return res.status(403).json({ success: false, message: 'Only admin can review access requests.' });
+    }
+
+    const status = ['pending', 'approved', 'rejected', 'all'].includes(req.query.status) ? req.query.status : 'pending';
+    const filter = status === 'all'
+      ? { 'adminAccessRequest.status': { $in: ['pending', 'approved', 'rejected'] } }
+      : { 'adminAccessRequest.status': status };
+    const requests = await User.find(filter)
+      .select('name email profilePic glixId role adminAccessRequest createdAt')
+      .populate('adminAccessRequest.reviewedBy', 'name email glixId')
+      .sort({ 'adminAccessRequest.requestedAt': -1 })
+      .limit(500)
+      .lean();
+
+    return res.status(200).json({ success: true, requests });
+  } catch (error) {
+    return res.status(500).json({ success: false, message: error.message });
+  }
+});
+
+app.patch('/admin/access/requests/:userId', async (req, res) => {
+  try {
+    const adminUser = await requireAuthUser(req, res);
+    if (!adminUser) return;
+    if (!(await canUseAdminPanel(adminUser._id))) {
+      return res.status(403).json({ success: false, message: 'Only admin can review access requests.' });
+    }
+
+    const { userId } = req.params;
+    if (!mongoose.Types.ObjectId.isValid(userId)) return res.status(400).json({ success: false, message: 'Invalid user id.' });
+
+    const status = req.body?.status;
+    if (!['approved', 'rejected'].includes(status)) return res.status(400).json({ success: false, message: 'Select approved or rejected.' });
+
+    const target = await User.findById(userId).select('name email role adminAccessRequest managerPermissions');
+    if (!target) return res.status(404).json({ success: false, message: 'Request user not found.' });
+    if (target.adminAccessRequest?.status !== 'pending') {
+      return res.status(400).json({ success: false, message: 'This access request is not pending.' });
+    }
+
+    const requestedRole = sanitizeAdminAccessRole(req.body?.role) || sanitizeAdminAccessRole(target.adminAccessRequest?.requestedRole);
+    if (!requestedRole) return res.status(400).json({ success: false, message: 'Request role is invalid.' });
+
+    if (status === 'approved') {
+      if (!isAdminAccessEmailAllowed(target.email)) {
+        return res.status(403).json({ success: false, message: 'This email is not in the allowed admin access list.' });
+      }
+      target.role = requestedRole;
+      if (requestedRole === 'manager' && (!target.managerPermissions || !target.managerPermissions.length)) {
+        target.managerPermissions = ['host_review', 'withdrawals'];
+      }
+      target.adminAccessRequest.status = 'approved';
+      target.adminAccessRequest.rejectionReason = '';
+    } else {
+      target.adminAccessRequest.status = 'rejected';
+      target.adminAccessRequest.rejectionReason = sanitizeWithdrawalText(req.body?.reason, 300);
+    }
+
+    target.adminAccessRequest.reviewedBy = adminUser._id;
+    target.adminAccessRequest.reviewedAt = new Date();
+    await target.save();
+
+    return res.status(200).json({ success: true, message: `Access request ${status}.`, user: target });
+  } catch (error) {
+    return res.status(500).json({ success: false, message: error.message });
+  }
+});
 app.post('/host/register', async (req, res) => {
   try {
     const {
@@ -3357,6 +4139,8 @@ app.get('/admin/agencies', async (req, res) => {
       return res.status(403).json({ success: false, message: 'Only admin can access agencies' });
     }
 
+    await settleCompletedMonthlyCommissions();
+
     const agencies = await User.find({ role: 'agency' })
       .select('name email profilePic glixId agencyCode commissionBalance totalHostCoins createdAt')
       .sort({ createdAt: -1 })
@@ -3456,6 +4240,40 @@ app.get('/admin/agencies/:agencyId/hosts', async (req, res) => {
   }
 });
 
+app.get('/admin/monthly-commissions', async (req, res) => {
+  try {
+    const adminUser = await requireAuthUser(req, res);
+    if (!adminUser) return;
+    if (!(await canUseAdminPanel(adminUser._id))) {
+      return res.status(403).json({ success: false, message: 'Only admin can view monthly commissions' });
+    }
+
+    await settleCompletedMonthlyCommissions();
+
+    const status = ['pending', 'settled', 'all'].includes(req.query.status) ? req.query.status : 'all';
+    const month = String(req.query.month || '').trim();
+    const filter = {};
+    if (status !== 'all') filter.status = status;
+    if (/^\d{4}-\d{2}$/.test(month)) filter.month = month;
+
+    const commissions = await MonthlyCommission.find(filter)
+      .populate('beneficiaryId', 'name email glixId agencyCode role commissionBalance')
+      .populate('hostId', 'name email glixId profilePic')
+      .sort({ month: -1, updatedAt: -1 })
+      .limit(1000)
+      .lean();
+
+    const totals = commissions.reduce((acc, row) => {
+      acc.sourceCoins += Number(row.sourceCoins || 0);
+      acc.commissionAmount += Number(row.commissionAmount || 0);
+      return acc;
+    }, { sourceCoins: 0, commissionAmount: 0 });
+
+    return res.status(200).json({ success: true, commissions, totals });
+  } catch (error) {
+    return res.status(500).json({ success: false, message: error.message });
+  }
+});
 app.get('/admin/dashboard', async (req, res) => {
   try {
     const reviewer = await requireAuthUser(req, res);
@@ -3577,7 +4395,7 @@ app.patch('/admin/users/:userId', async (req, res) => {
       return res.status(400).json({ success: false, message: 'Invalid user id' });
     }
 
-    const allowedRoles = ['user', 'host', 'agency', 'manager', 'admin'];
+    const allowedRoles = ['user', 'host', 'agency', 'manager', 'admin', 'coin_seller'];
     const allowedHostStatuses = ['none', 'pending', 'approved', 'rejected'];
     const allowedAgencyStatuses = ['none', 'pending', 'approved', 'rejected'];
     const allowedAccountStatuses = ['active', 'suspended', 'banned'];
@@ -3697,14 +4515,40 @@ app.post('/admin/notifications/send', async (req, res) => {
         : {};
 
     const users = await User.find(filter).select('_id').limit(2000).lean();
-    await Promise.all(users.map(user => sendPushNotification({
+    const results = await Promise.all(users.map(user => sendPushNotification({
       userId: user._id,
       title,
       body,
       data: { type: 'admin_broadcast' }
     })));
 
-    return res.status(200).json({ success: true, sentTo: users.length });
+    const summary = results.reduce((acc, result) => {
+      const item = result || {};
+      acc.successCount += Number(item.successCount || 0);
+      acc.failureCount += Number(item.failureCount || 0);
+      acc.tokenCount += Number(item.tokenCount || 0);
+      acc.invalidTokenCount += Number(item.invalidTokenCount || 0);
+      if (item.skipped) {
+        acc.skippedUsers += 1;
+        const reason = item.reason || 'unknown';
+        acc.skippedReasons[reason] = (acc.skippedReasons[reason] || 0) + 1;
+      }
+      return acc;
+    }, {
+      successCount: 0,
+      failureCount: 0,
+      tokenCount: 0,
+      invalidTokenCount: 0,
+      skippedUsers: 0,
+      skippedReasons: {},
+    });
+
+    return res.status(200).json({
+      success: true,
+      matchedUsers: users.length,
+      sentTo: summary.successCount,
+      ...summary,
+    });
   } catch (error) {
     return res.status(500).json({ success: false, message: error.message });
   }
@@ -3721,6 +4565,7 @@ app.post('/withdrawals', async (req, res) => {
       return;
     }
     const userId = authUser._id;
+    await settleCompletedMonthlyCommissions(session);
     const { amount, method, accountTitle, accountNumber, note = '' } = req.body;
     const numericAmount = Math.floor(Number(amount));
 
@@ -4291,7 +5136,7 @@ app.post('/store/purchase', async (req, res) => {
     }
 
     const existing = await UserStoreItem.findOne({ userId, itemKey: item.itemKey }).session(session);
-    if (existing && (!existing.expiresAt || existing.expiresAt > new Date())) {
+    if (existing && item.type !== 'vip' && (!existing.expiresAt || existing.expiresAt > new Date())) {
       await session.abortTransaction();
       return res.status(400).json({ success: false, message: 'Item already owned' });
     }
@@ -4304,7 +5149,14 @@ app.post('/store/purchase', async (req, res) => {
 
     if (!user) throw new Error('Insufficient coins');
 
-    const expiresAt = getStoreExpiry(item);
+    let expiresAt = getStoreExpiry(item);
+    if (item.type === 'vip' && existing?.expiresAt && existing.expiresAt > new Date()) {
+      const durationDays = getStoreDurationDays(item);
+      if (durationDays && durationDays > 0) {
+        expiresAt = new Date(existing.expiresAt);
+        expiresAt.setDate(expiresAt.getDate() + durationDays);
+      }
+    }
     await UserStoreItem.findOneAndUpdate(
       { userId, itemKey: item.itemKey },
       {
@@ -4512,7 +5364,7 @@ app.post('/rewards/claim', async (req, res) => {
   }
 });
 
-const PUBLIC_USER_FIELDS = 'name email profilePic gender age birthday countryRegion voiceSignature signature albumPhotos glixId googleId createdAt lastLogin followersCount followingCount daimon chang frameUrl entryVideoUrl settings blacklistedUsers role agencyId agencyCode managerPermissions commissionBalance revenueBalance totalHostCoins hostStatus hostRejectionReason hostRegistration agencyStatus agencyRejectionReason agencyRegistration';
+const PUBLIC_USER_FIELDS = 'name email profilePic gender age birthday countryRegion voiceSignature signature albumPhotos glixId googleId createdAt lastLogin followersCount followingCount daimon chang frameUrl entryVideoUrl settings blacklistedUsers role agencyId agencyCode managerPermissions commissionBalance revenueBalance totalHostCoins hostStatus hostRejectionReason hostRegistration agencyStatus agencyRejectionReason agencyRegistration adminAccessRequest sellerBalance sellerTotalSold coinSellerStatus coinSellerRejectionReason coinSellerRegistration';
 
 const sanitizeUserSettings = (settings = {}) => {
   const allowedMessagesFrom = ['everyone', 'following', 'none'];
@@ -4555,6 +5407,12 @@ app.get('/settings/:userId', async (req, res) => {
 
     const hasPassword = Boolean(user.password);
     delete user.password;
+
+    const vip = await getUserVipStatus(userId);
+    user.isVip = vip.isVip;
+    user.vipExpiresAt = vip.vipExpiresAt;
+    user.vipItemKey = vip.vipItemKey;
+    user.vipBadgeUrl = vip.vipBadgeUrl;
 
     return res.status(200).json({
       success: true,
@@ -4709,7 +5567,7 @@ app.post('/settings/:userId/album-photo', async (req, res) => {
 
     const userRecord = await User.findById(userId).select('albumPhotos');
     if (!userRecord) return res.status(404).json({ success: false, message: 'User not found' });
-    if ((userRecord.albumPhotos || []).length >= 12) return res.status(400).json({ success: false, message: 'Album can contain up to 12 photos' });
+    if ((userRecord.albumPhotos || []).length >= 10) return res.status(400).json({ success: false, message: 'Album can contain up to 10 photos' });
 
     const photoUrl = await uploadHostVerificationImage({
       userId,
@@ -4893,6 +5751,47 @@ app.delete('/settings/:userId/account', async (req, res) => {
   }
 });
 
+app.get('/users/search', async (req, res) => {
+  try {
+    const query = String(req.query.q || req.query.query || '').trim();
+    const limit = Math.min(Math.max(parseInt(req.query.limit, 10) || 20, 1), 30);
+
+    if (query.length < 2) {
+      return res.status(200).json({ success: true, users: [] });
+    }
+
+    const escapedQuery = query.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    const regex = new RegExp(escapedQuery, 'i');
+    const filter = {
+      $or: [
+        { name: regex },
+        { glixId: regex },
+        ...(mongoose.Types.ObjectId.isValid(query) ? [{ _id: query }] : [])
+      ]
+    };
+
+    const users = await User.find(filter)
+      .select('name profilePic glixId daimon role countryRegion')
+      .sort({ followersCount: -1, createdAt: -1 })
+      .limit(limit)
+      .lean();
+
+    return res.status(200).json({
+      success: true,
+      users: users.map(user => ({
+        id: user._id,
+        name: user.name || 'User',
+        profilePic: user.profilePic || '',
+        glixId: user.glixId || '',
+        daimon: user.daimon || 0,
+        role: user.role || 'user',
+        countryRegion: user.countryRegion || ''
+      }))
+    });
+  } catch (error) {
+    return res.status(500).json({ success: false, message: error.message });
+  }
+});
 app.get('/profile/:id', async (req, res) => {
   try {
     const { id } = req.params;
@@ -4901,7 +5800,9 @@ app.get('/profile/:id', async (req, res) => {
     let user = await User.findById(id).select('-password');
     if (!user) return res.status(404).json({ message: "User not found" });
     user = await ensureUserPublicId(user);
-    return res.status(200).json(user);
+    const vip = await getUserVipStatus(id);
+    const profile = user.toObject ? user.toObject() : user;
+    return res.status(200).json({ ...profile, ...vip });
   } catch (error) {
     return res.status(500).json({ message: error.message });
   }
@@ -5120,6 +6021,30 @@ app.post('/check-follow', async (req, res) => {
 server.listen(PORT, () => {
   console.log(`Server listening on port ${PORT}`);
 });
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 
 
