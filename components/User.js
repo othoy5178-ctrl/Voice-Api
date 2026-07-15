@@ -74,6 +74,11 @@ const userSchema = new mongoose.Schema({
     type: String,
     default: ''
   },
+  fcmTokens: [{
+    token: { type: String, required: true },
+    platform: { type: String, enum: ['android', 'ios', 'web', 'unknown'], default: 'unknown' },
+    updatedAt: { type: Date, default: Date.now }
+  }],
   settings: {
     floatingPlayer: { type: Boolean, default: true },
     newMessageNotifications: { type: Boolean, default: true },
@@ -106,6 +111,33 @@ const userSchema = new mongoose.Schema({
   lastLogin: {
     type: Date,
     default: Date.now
+  },
+  accountStatus: {
+    type: String,
+    enum: ['active', 'suspended', 'banned'],
+    default: 'active',
+    index: true
+  },
+  adminNote: {
+    type: String,
+    trim: true,
+    default: ''
+  },
+  passwordResetOtpHash: {
+    type: String,
+    default: ''
+  },
+  passwordResetOtpExpiresAt: {
+    type: Date,
+    default: null
+  },
+  passwordResetOtpRequestedAt: {
+    type: Date,
+    default: null
+  },
+  passwordResetOtpAttempts: {
+    type: Number,
+    default: 0
   },
   followersCount: { type: Number, default: 0 },
   followingCount: { type: Number, default: 0 },

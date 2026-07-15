@@ -60,6 +60,184 @@ Provider message notify receiveUID
 
 Do not mix `_id` and `glixId`.
 
+## Query User Information API
+
+Give this URL to the game provider after deploying this backend:
+
+```text
+POST https://voice-api-production-703d.up.railway.app/api/user/info
+```
+
+Local testing URL:
+
+```text
+POST http://192.168.2.6:5000/api/user/info
+```
+
+Alias, if the provider prefers a game-scoped path:
+
+```text
+POST https://voice-api-production-703d.up.railway.app/api/game/user-info
+```
+
+### Request
+
+```json
+{
+  "gameId": "101",
+  "uid": "MongoDB_USER_ID",
+  "token": "AUTH_SESSION_TOKEN",
+  "roomId": "ROOM_ID_OR_EMPTY_STRING",
+  "sign": "MD5(gameId + uid + token + roomId + sharedKey)"
+}
+```
+
+`roomId` is optional. If it is not sent, generate the signature with an empty roomId value.
+
+### Success Response
+
+```json
+{
+  "errorCode": 0,
+  "errorMsg": "Success",
+  "data": {
+    "uid": "MongoDB_USER_ID",
+    "nickname": "User Name",
+    "avatar": "https://cdn.example.com/avatar.png",
+    "coin": 10000
+  }
+}
+```
+
+Coin field mapping:
+
+```text
+coin = User.chang
+```
+
+## Update Game Coin API
+
+Give this URL to the game provider after deploying this backend:
+
+```text
+POST https://voice-api-production-703d.up.railway.app/api/game/coin/update
+```
+
+Alias:
+
+```text
+POST https://voice-api-production-703d.up.railway.app/api/game/update-coin
+```
+
+Local testing URL:
+
+```text
+POST http://192.168.2.6:5000/api/game/coin/update
+```
+
+### Request
+
+```json
+{
+  "orderId": "abcefg12345",
+  "gameId": "101",
+  "roundId": "abcdeee123",
+  "uid": "MongoDB_USER_ID",
+  "coin": 100,
+  "type": 1,
+  "rewardType": 2,
+  "token": "AUTH_SESSION_TOKEN",
+  "winId": "",
+  "roomid": "",
+  "sign": "MD5(orderId + gameId + roundId + uid + coin + type + rewardType + token + winId + sharedKey)"
+}
+```
+
+`type` values:
+
+```text
+1 = consume coins
+2 = obtain coins
+```
+
+`orderId` is unique and deduplicated. If the provider sends the same `orderId` again, the backend returns success with the stored balance and does not update coins again.
+
+### Success Response
+
+```json
+{
+  "errorCode": 0,
+  "errorMsg": "Success",
+  "data": {
+    "coin": 9999
+  }
+}
+```
+
+Coin field mapping:
+
+```text
+coin = User.chang
+```
+
+## Supplementary Coin Polling API
+
+Give this URL to the game provider after deploying this backend:
+
+```text
+POST https://voice-api-production-703d.up.railway.app/api/game/coin/supplement
+```
+
+Alias:
+
+```text
+POST https://voice-api-production-703d.up.railway.app/api/game/supplement-coin
+```
+
+Local testing URL:
+
+```text
+POST http://192.168.2.6:5000/api/game/coin/supplement
+```
+
+### Request
+
+```json
+{
+  "orderId": "abcefg12345",
+  "gameId": "101",
+  "roundId": "abcdeee123",
+  "uid": "MongoDB_USER_ID",
+  "coin": 100,
+  "rewardType": 2,
+  "winId": "",
+  "roomid": "",
+  "sign": "MD5(orderId + gameId + roundId + uid + coin + rewardType + winId + sharedKey)"
+}
+```
+
+This endpoint always adds coins to `User.chang`. It does not require `token` and does not accept a consume type.
+
+`orderId` is unique and deduplicated. If the provider sends the same `orderId` again during polling, the backend returns success with the stored balance and does not add coins again.
+
+### Success Response
+
+```json
+{
+  "errorCode": 0,
+  "errorMsg": "Success",
+  "data": {
+    "coin": 9999
+  }
+}
+```
+
+Coin field mapping:
+
+```text
+coin = User.chang
+```
+
 ## Environment Variables
 
 Add these to Railway/backend environment:

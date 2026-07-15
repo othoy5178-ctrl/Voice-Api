@@ -18,10 +18,12 @@
     "cors": "^2.8.5",
     "dotenv": "^17.4.2",
     "express": "^4.19.2",
+    "firebase-admin": "^14.1.0",
     "gh": "^2.8.9",
     "gridfs-stream": "^1.1.1",
     "method-override": "^3.0.0",
     "mongoose": "^8.7.0",
+    "nodemailer": "^9.0.3",
     "socket.io": "^4.8.3"
   }
 }

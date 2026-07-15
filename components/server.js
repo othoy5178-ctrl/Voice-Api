@@ -7,6 +7,8 @@ import cors from "cors";
 import mongoose from "mongoose";
 import pkg from "agora-token";
 import crypto from "crypto";
+import admin from "firebase-admin";
+import nodemailer from "nodemailer";
 
 import User from "./User.js";
 import AudioRoom from "./AudioRoom.js";
@@ -14,6 +16,7 @@ import Room from "./RoomSchema.js";
 import DirectMessage from "./DirectMessage.js";
 import Follow from './Follow.js';
 import GiftTransaction from './GiftTransation.js';
+import GameCoinTransaction from './GameCoinTransaction.js';
 import RewardActivity from './RewardActivity.js';
 import RewardClaim from './RewardClaim.js';
 import StoreItem from './StoreItem.js';
@@ -62,6 +65,8 @@ const MIN_WITHDRAW_AMOUNT = 1000;
 const TOKEN_TTL_SECONDS = 60 * 60 * 24 * 30;
 
 const TOKEN_TTL_MS = TOKEN_TTL_SECONDS * 1000;
+const PASSWORD_RESET_OTP_TTL_MS = 10 * 60 * 1000;
+const PASSWORD_RESET_MAX_ATTEMPTS = 5;
 
 const createAuthTokenValue = () => crypto
   .randomBytes(48)
@@ -89,6 +94,39 @@ const normalizeGameUser = (user) => ({
   nickname: user?.name || user?.glixId || 'Glix User',
   avatar: user?.profilePic || ''
 });
+
+const parseFirebaseServiceAccount = () => {
+  const rawValue = String(process.env.FIREBASE_SERVICE_ACCOUNT_JSON || '').trim();
+  if (!rawValue) return null;
+
+  try {
+    const jsonValue = rawValue.startsWith('{')
+      ? rawValue
+      : Buffer.from(rawValue, 'base64').toString('utf8');
+    return JSON.parse(jsonValue);
+  } catch (error) {
+    console.log('Firebase service account parse error:', error.message);
+    return null;
+  }
+};
+
+const getFirebaseMessaging = () => {
+  try {
+    if (!admin.apps.length) {
+      const serviceAccount = parseFirebaseServiceAccount();
+      if (!serviceAccount) return null;
+
+      admin.initializeApp({
+        credential: admin.credential.cert(serviceAccount),
+      });
+    }
+
+    return admin.messaging();
+  } catch (error) {
+    console.log('Firebase Admin initialization error:', error.message);
+    return null;
+  }
+};
 
 const signAuthToken = async (user) => {
   const token = createAuthTokenValue();
@@ -159,6 +197,109 @@ const notifyQuantumNexusMessage = async ({ sendUID, receiveUID, count = 1 }) => 
   }
 };
 
+const hashPasswordResetOtp = (email, otp) => crypto
+  .createHash('sha256')
+  .update(`${String(email || '').toLowerCase().trim()}:${String(otp || '').trim()}:${String(process.env.PASSWORD_RESET_SECRET || process.env.JWT_SECRET || 'glix-reset-secret')}`)
+  .digest('hex');
+
+const createPasswordResetOtp = () => String(Math.floor(100000 + Math.random() * 900000));
+
+const getMailTransporter = () => {
+  const host = String(process.env.SMTP_HOST || '').trim();
+  const port = Number(process.env.SMTP_PORT || 587);
+  const user = String(process.env.SMTP_USER || '').trim();
+  const pass = String(process.env.SMTP_PASS || '').trim();
+
+  if (!host || !user || !pass) return null;
+
+  return nodemailer.createTransport({
+    host,
+    port,
+    secure: String(process.env.SMTP_SECURE || '').toLowerCase() === 'true' || port === 465,
+    auth: { user, pass }
+  });
+};
+
+const sendPasswordResetOtpEmail = async ({ email, name, otp }) => {
+  const transporter = getMailTransporter();
+  if (!transporter) {
+    const error = new Error('Email service is not configured. Set SMTP_HOST, SMTP_USER, SMTP_PASS, and SMTP_FROM.');
+    error.statusCode = 503;
+    throw error;
+  }
+
+  const from = String(process.env.SMTP_FROM || process.env.SMTP_USER || '').trim();
+  await transporter.sendMail({
+    from,
+    to: email,
+    subject: 'Glix Admin password reset OTP',
+    text: `Hi ${name || 'Admin'},\n\nYour Glix Admin password reset OTP is ${otp}. It expires in 10 minutes.\n\nIf you did not request this, ignore this email.`,
+    html: `<p>Hi ${name || 'Admin'},</p><p>Your Glix Admin password reset OTP is <strong>${otp}</strong>.</p><p>It expires in 10 minutes.</p><p>If you did not request this, ignore this email.</p>`
+  });
+};
+const sendPushNotification = async ({ userId, title, body, data = {} }) => {
+  if (!userId || !mongoose.Types.ObjectId.isValid(userId)) return null;
+
+  try {
+    const messaging = getFirebaseMessaging();
+    if (!messaging) return null;
+
+    const user = await User.findById(userId).select('fcmTokens settings').lean();
+    const notificationAllowed = user?.settings?.newMessageNotifications !== false;
+    const tokens = [...new Set((user?.fcmTokens || []).map(item => item?.token).filter(Boolean))];
+
+    if (!notificationAllowed || !tokens.length) return null;
+
+    const response = await messaging.sendEachForMulticast({
+      tokens,
+      notification: {
+        title: String(title || 'Glix Live'),
+        body: String(body || 'You have a new notification.'),
+      },
+      data: Object.fromEntries(
+        Object.entries(data)
+          .filter(([, value]) => value !== null && value !== undefined)
+          .map(([key, value]) => [key, String(value)])
+      ),
+      android: {
+        priority: 'high',
+        notification: {
+          channelId: 'default',
+          sound: 'default',
+        },
+      },
+      apns: {
+        payload: {
+          aps: {
+            sound: 'default',
+          },
+        },
+      },
+    });
+
+    const invalidTokens = response.responses
+      .map((item, index) => {
+        const code = item?.error?.code || '';
+        return ['messaging/registration-token-not-registered', 'messaging/invalid-registration-token'].includes(code)
+          ? tokens[index]
+          : null;
+      })
+      .filter(Boolean);
+
+    if (invalidTokens.length) {
+      await User.updateMany(
+        { 'fcmTokens.token': { $in: invalidTokens } },
+        { $pull: { fcmTokens: { token: { $in: invalidTokens } } } }
+      );
+    }
+
+    return response;
+  } catch (error) {
+    console.log('Push notification send error:', error.message);
+    return null;
+  }
+};
+
 const requireAuthUser = async (req, res) => {
   const authorization = req.headers.authorization || '';
   const token = authorization.startsWith('Bearer ') ? authorization.slice(7).trim() : '';
@@ -222,6 +363,19 @@ const buildWalletSnapshot = (user) => ({
 const sanitizeWithdrawalText = (value = '', max = 80) => String(value || '').trim().slice(0, max);
 
 const normalizeAgencyCode = (value = '') => String(value || '').trim().toUpperCase().replace(/[^A-Z0-9_-]/g, '').slice(0, 24);
+
+const sanitizeStoreItemPayload = (payload = {}) => {
+  const cleanItem = {};
+  const stringFields = ['itemKey', 'name', 'category', 'section', 'type', 'currency', 'imageUrl', 'previewUrl', 'assetKey', 'equipValue'];
+  stringFields.forEach((key) => {
+    if (payload[key] !== undefined) cleanItem[key] = String(payload[key] || '').trim();
+  });
+  ['price', 'durationDays', 'sortOrder'].forEach((key) => {
+    if (payload[key] !== undefined) cleanItem[key] = Number(payload[key]) || 0;
+  });
+  if (payload.isActive !== undefined) cleanItem.isActive = !!payload.isActive;
+  return cleanItem;
+};
 
 const buildAgencySummary = async (agency) => {
   const hostCount = await User.countDocuments({ agencyId: agency._id });
@@ -1525,6 +1679,19 @@ io.on('connection', (socket) => {
       // TARGET THE ROOM NAME
       io.to(receiverId.toString()).emit('receive_direct_message', serverPayload);
 
+      sendPushNotification({
+        userId: receiverId,
+        title: senderName || 'New message',
+        body: text?.length > 120 ? `${text.slice(0, 117)}...` : text,
+        data: {
+          type: 'direct_message',
+          senderId,
+          receiverId,
+          senderName,
+          messageId: savedMessage._id.toString()
+        }
+      });
+
       notifyQuantumNexusMessage({
         sendUID: senderId,
         receiveUID: receiverId,
@@ -1893,6 +2060,373 @@ app.get('/Friends/:userId', async (req, res) => {
   }
 });
 
+const handleQuantumNexusUserInfo = async (req, res) => {
+  try {
+    const gameId = String(req.body?.gameId || '').trim();
+    const uid = String(req.body?.uid || '').trim();
+    const token = String(req.body?.token || '').trim();
+    const roomId = String(req.body?.roomId || '').trim();
+    const sign = String(req.body?.sign || '').trim().toLowerCase();
+    const sharedKey = getQuantumNexusSharedKey();
+
+    if (!sharedKey) {
+      return res.status(500).json({
+        errorCode: 500,
+        errorMsg: 'Quantum Nexus shared key is not configured.',
+        data: null
+      });
+    }
+
+    if (!gameId || !uid || !token || !sign) {
+      return res.status(400).json({
+        errorCode: 400,
+        errorMsg: 'gameId, uid, token and sign are required.',
+        data: null
+      });
+    }
+
+    if (!mongoose.Types.ObjectId.isValid(uid)) {
+      return res.status(400).json({
+        errorCode: 400,
+        errorMsg: 'Invalid uid.',
+        data: null
+      });
+    }
+
+    const expectedSign = buildQuantumNexusSign(gameId, uid, token, roomId, sharedKey);
+    if (sign !== expectedSign) {
+      return res.status(401).json({
+        errorCode: 401,
+        errorMsg: 'Invalid signature.',
+        data: null
+      });
+    }
+
+    const authPayload = await verifyAuthToken(token);
+    if (String(authPayload.sub) !== uid) {
+      return res.status(401).json({
+        errorCode: 401,
+        errorMsg: 'Token does not match uid.',
+        data: null
+      });
+    }
+
+    const user = await User.findById(uid).select('name glixId profilePic chang').lean();
+    if (!user) {
+      return res.status(404).json({
+        errorCode: 404,
+        errorMsg: 'User not found.',
+        data: null
+      });
+    }
+
+    return res.status(200).json({
+      errorCode: 0,
+      errorMsg: 'Success',
+      data: {
+        uid: user._id.toString(),
+        nickname: user.name || user.glixId || 'Glix User',
+        avatar: user.profilePic || '',
+        coin: Math.max(0, Math.floor(Number(user.chang || 0)))
+      }
+    });
+  } catch (error) {
+    console.log('Quantum Nexus user info error:', error);
+    const statusCode = error?.statusCode || 500;
+    return res.status(statusCode).json({
+      errorCode: statusCode,
+      errorMsg: statusCode === 401 ? 'Invalid auth token.' : 'Internal server error.',
+      data: null
+    });
+  }
+};
+
+app.post('/api/user/info', handleQuantumNexusUserInfo);
+app.post('/api/game/user-info', handleQuantumNexusUserInfo);
+const handleQuantumNexusCoinUpdate = async (req, res) => {
+  const session = await mongoose.startSession();
+
+  try {
+    const orderId = String(req.body?.orderId || '').trim();
+    const gameId = String(req.body?.gameId || '').trim();
+    const roundId = String(req.body?.roundId || '').trim();
+    const uid = String(req.body?.uid || '').trim();
+    const coinRaw = String(req.body?.coin ?? '').trim();
+    const typeRaw = String(req.body?.type ?? '').trim();
+    const rewardTypeRaw = String(req.body?.rewardType ?? '').trim();
+    const token = String(req.body?.token || '').trim();
+    const winId = String(req.body?.winId ?? '').trim();
+    const roomId = String(req.body?.roomid ?? req.body?.roomId ?? '').trim();
+    const sign = String(req.body?.sign || '').trim().toLowerCase();
+    const sharedKey = getQuantumNexusSharedKey();
+
+    if (!sharedKey) {
+      return res.status(500).json({
+        errorCode: 500,
+        errorMsg: 'Quantum Nexus shared key is not configured.',
+        data: null
+      });
+    }
+
+    if (!orderId || !gameId || !roundId || !uid || coinRaw === '' || typeRaw === '' || rewardTypeRaw === '' || !token || !sign) {
+      return res.status(400).json({
+        errorCode: 400,
+        errorMsg: 'orderId, gameId, roundId, uid, coin, type, rewardType, token and sign are required.',
+        data: null
+      });
+    }
+
+    if (!mongoose.Types.ObjectId.isValid(uid)) {
+      return res.status(400).json({
+        errorCode: 400,
+        errorMsg: 'Invalid uid.',
+        data: null
+      });
+    }
+
+    const coin = Number(coinRaw);
+    const type = Number(typeRaw);
+    const rewardType = Number(rewardTypeRaw);
+
+    if (!Number.isSafeInteger(coin) || coin < 0) {
+      return res.status(400).json({ errorCode: 400, errorMsg: 'coin must be an unsigned integer.', data: null });
+    }
+
+    if (![1, 2].includes(type)) {
+      return res.status(400).json({ errorCode: 400, errorMsg: 'type must be 1 consume or 2 obtain.', data: null });
+    }
+
+    if (!Number.isSafeInteger(rewardType) || rewardType < 0) {
+      return res.status(400).json({ errorCode: 400, errorMsg: 'rewardType must be an integer.', data: null });
+    }
+
+    const expectedSign = buildQuantumNexusSign(orderId, gameId, roundId, uid, coinRaw, typeRaw, rewardTypeRaw, token, winId, sharedKey);
+    if (sign !== expectedSign) {
+      return res.status(401).json({
+        errorCode: 401,
+        errorMsg: 'Invalid signature.',
+        data: null
+      });
+    }
+
+    const authPayload = await verifyAuthToken(token);
+    if (String(authPayload.sub) !== uid) {
+      return res.status(401).json({
+        errorCode: 401,
+        errorMsg: 'Token does not match uid.',
+        data: null
+      });
+    }
+
+    const existingTransaction = await GameCoinTransaction.findOne({ orderId }).select('balanceAfter').lean();
+    if (existingTransaction) {
+      return res.status(200).json({
+        errorCode: 0,
+        errorMsg: 'Success',
+        data: { coin: Math.max(0, Math.floor(Number(existingTransaction.balanceAfter || 0))) }
+      });
+    }
+
+    let updatedUser = null;
+    await session.withTransaction(async () => {
+      await GameCoinTransaction.create([{
+        orderId,
+        gameId,
+        roundId,
+        userId: uid,
+        coin,
+        type,
+        rewardType,
+        winId,
+        roomId,
+        balanceAfter: 0
+      }], { session });
+
+      const increment = type === 1 ? -coin : coin;
+      const userFilter = type === 1
+        ? { _id: uid, chang: { $gte: coin } }
+        : { _id: uid };
+
+      updatedUser = await User.findOneAndUpdate(
+        userFilter,
+        { $inc: { chang: increment } },
+        { new: true, session, select: 'chang' }
+      );
+
+      if (!updatedUser) {
+        const error = new Error(type === 1 ? 'Insufficient coins.' : 'User not found.');
+        error.statusCode = type === 1 ? 402 : 404;
+        throw error;
+      }
+
+      await GameCoinTransaction.updateOne(
+        { orderId },
+        { $set: { balanceAfter: Math.max(0, Math.floor(Number(updatedUser.chang || 0))) } },
+        { session }
+      );
+    });
+
+    return res.status(200).json({
+      errorCode: 0,
+      errorMsg: 'Success',
+      data: { coin: Math.max(0, Math.floor(Number(updatedUser?.chang || 0))) }
+    });
+  } catch (error) {
+    console.log('Quantum Nexus coin update error:', error);
+
+    if (error?.code === 11000) {
+      const existingTransaction = await GameCoinTransaction.findOne({ orderId: String(req.body?.orderId || '').trim() }).select('balanceAfter').lean();
+      return res.status(200).json({
+        errorCode: 0,
+        errorMsg: 'Success',
+        data: { coin: Math.max(0, Math.floor(Number(existingTransaction?.balanceAfter || 0))) }
+      });
+    }
+
+    const statusCode = error?.statusCode || 500;
+    return res.status(statusCode).json({
+      errorCode: statusCode,
+      errorMsg: error?.message || 'Internal server error.',
+      data: null
+    });
+  } finally {
+    session.endSession();
+  }
+};
+
+const handleQuantumNexusCoinSupplement = async (req, res) => {
+  const session = await mongoose.startSession();
+
+  try {
+    const orderId = String(req.body?.orderId || '').trim();
+    const gameId = String(req.body?.gameId || '').trim();
+    const roundId = String(req.body?.roundId || '').trim();
+    const uid = String(req.body?.uid || '').trim();
+    const coinRaw = String(req.body?.coin ?? '').trim();
+    const rewardTypeRaw = String(req.body?.rewardType ?? '').trim();
+    const winId = String(req.body?.winId ?? '').trim();
+    const roomId = String(req.body?.roomid ?? req.body?.roomId ?? '').trim();
+    const sign = String(req.body?.sign || '').trim().toLowerCase();
+    const sharedKey = getQuantumNexusSharedKey();
+
+    if (!sharedKey) {
+      return res.status(500).json({
+        errorCode: 500,
+        errorMsg: 'Quantum Nexus shared key is not configured.',
+        data: null
+      });
+    }
+
+    if (!orderId || !gameId || !roundId || !uid || coinRaw === '' || rewardTypeRaw === '' || !sign) {
+      return res.status(400).json({
+        errorCode: 400,
+        errorMsg: 'orderId, gameId, roundId, uid, coin, rewardType and sign are required.',
+        data: null
+      });
+    }
+
+    if (!mongoose.Types.ObjectId.isValid(uid)) {
+      return res.status(400).json({
+        errorCode: 400,
+        errorMsg: 'Invalid uid.',
+        data: null
+      });
+    }
+
+    const coin = Number(coinRaw);
+    const rewardType = Number(rewardTypeRaw);
+
+    if (!Number.isSafeInteger(coin) || coin < 0) {
+      return res.status(400).json({ errorCode: 400, errorMsg: 'coin must be an unsigned integer.', data: null });
+    }
+
+    if (!Number.isSafeInteger(rewardType) || rewardType < 0) {
+      return res.status(400).json({ errorCode: 400, errorMsg: 'rewardType must be an integer.', data: null });
+    }
+
+    const expectedSign = buildQuantumNexusSign(orderId, gameId, roundId, uid, coinRaw, rewardTypeRaw, winId, sharedKey);
+    if (sign !== expectedSign) {
+      return res.status(401).json({
+        errorCode: 401,
+        errorMsg: 'Invalid signature.',
+        data: null
+      });
+    }
+
+    const existingTransaction = await GameCoinTransaction.findOne({ orderId }).select('balanceAfter').lean();
+    if (existingTransaction) {
+      return res.status(200).json({
+        errorCode: 0,
+        errorMsg: 'Success',
+        data: { coin: Math.max(0, Math.floor(Number(existingTransaction.balanceAfter || 0))) }
+      });
+    }
+
+    let updatedUser = null;
+    await session.withTransaction(async () => {
+      await GameCoinTransaction.create([{
+        orderId,
+        gameId,
+        roundId,
+        userId: uid,
+        coin,
+        type: 2,
+        rewardType,
+        winId,
+        roomId,
+        balanceAfter: 0
+      }], { session });
+
+      updatedUser = await User.findOneAndUpdate(
+        { _id: uid },
+        { $inc: { chang: coin } },
+        { new: true, session, select: 'chang' }
+      );
+
+      if (!updatedUser) {
+        const error = new Error('User not found.');
+        error.statusCode = 404;
+        throw error;
+      }
+
+      await GameCoinTransaction.updateOne(
+        { orderId },
+        { $set: { balanceAfter: Math.max(0, Math.floor(Number(updatedUser.chang || 0))) } },
+        { session }
+      );
+    });
+
+    return res.status(200).json({
+      errorCode: 0,
+      errorMsg: 'Success',
+      data: { coin: Math.max(0, Math.floor(Number(updatedUser?.chang || 0))) }
+    });
+  } catch (error) {
+    console.log('Quantum Nexus coin supplement error:', error);
+
+    if (error?.code === 11000) {
+      const existingTransaction = await GameCoinTransaction.findOne({ orderId: String(req.body?.orderId || '').trim() }).select('balanceAfter').lean();
+      return res.status(200).json({
+        errorCode: 0,
+        errorMsg: 'Success',
+        data: { coin: Math.max(0, Math.floor(Number(existingTransaction?.balanceAfter || 0))) }
+      });
+    }
+
+    const statusCode = error?.statusCode || 500;
+    return res.status(statusCode).json({
+      errorCode: statusCode,
+      errorMsg: error?.message || 'Internal server error.',
+      data: null
+    });
+  } finally {
+    session.endSession();
+  }
+};
+app.post('/api/game/coin/update', handleQuantumNexusCoinUpdate);
+app.post('/api/game/update-coin', handleQuantumNexusCoinUpdate);
+app.post('/api/game/coin/supplement', handleQuantumNexusCoinSupplement);
+app.post('/api/game/supplement-coin', handleQuantumNexusCoinSupplement);
 app.post('/api/friends/list', async (req, res) => {
   try {
     const uid = String(req.body?.uid || '').trim();
@@ -2006,6 +2540,44 @@ app.post('/api/friends/list', async (req, res) => {
       errorMsg: statusCode === 401 ? 'Invalid auth token.' : 'Internal server error.',
       data: []
     });
+  }
+});
+
+app.post('/users/fcm-token', async (req, res) => {
+  try {
+    const authUser = await requireAuthUser(req, res);
+    if (!authUser) return;
+
+    const requestedUserId = req.body?.userId ? String(req.body.userId) : authUser._id.toString();
+    const fcmToken = String(req.body?.fcmToken || '').trim();
+    const platform = ['android', 'ios', 'web'].includes(req.body?.platform) ? req.body.platform : 'unknown';
+
+    if (requestedUserId !== authUser._id.toString()) {
+      return res.status(403).json({ success: false, message: 'Cannot update another user notification token.' });
+    }
+
+    if (!fcmToken) {
+      return res.status(400).json({ success: false, message: 'FCM token is required.' });
+    }
+
+    await User.updateMany(
+      { 'fcmTokens.token': fcmToken },
+      { $pull: { fcmTokens: { token: fcmToken } } }
+    );
+
+    await User.findByIdAndUpdate(authUser._id, {
+      $push: {
+        fcmTokens: {
+          token: fcmToken,
+          platform,
+          updatedAt: new Date()
+        }
+      }
+    });
+
+    return res.status(200).json({ success: true });
+  } catch (error) {
+    return res.status(500).json({ success: false, message: error.message });
   }
 });
 
@@ -2884,6 +3456,260 @@ app.get('/admin/agencies/:agencyId/hosts', async (req, res) => {
   }
 });
 
+app.get('/admin/dashboard', async (req, res) => {
+  try {
+    const reviewer = await requireAuthUser(req, res);
+    if (!reviewer) return;
+    if (!(await canReviewHostRequests(reviewer._id))) {
+      return res.status(403).json({ success: false, message: 'Admin access required' });
+    }
+
+    const since = new Date();
+    since.setDate(since.getDate() - 7);
+
+    const [
+      totalUsers,
+      activeUsersCount,
+      suspendedUsers,
+      pendingHosts,
+      pendingAgencies,
+      pendingWithdrawals,
+      liveAudioRooms,
+      liveVideoRooms,
+      giftSummary
+    ] = await Promise.all([
+      User.countDocuments(),
+      User.countDocuments({ accountStatus: { $ne: 'banned' } }),
+      User.countDocuments({ accountStatus: { $in: ['suspended', 'banned'] } }),
+      User.countDocuments({ hostStatus: 'pending' }),
+      User.countDocuments({ agencyStatus: 'pending' }),
+      Withdrawal.countDocuments({ status: 'pending' }),
+      AudioRoom.countDocuments({ isLive: true }),
+      Room.countDocuments({ isLive: true }),
+      GiftTransaction.aggregate([
+        { $match: { createdAt: { $gte: since } } },
+        {
+          $group: {
+            _id: null,
+            totalCoins: { $sum: '$totalCost' },
+            totalGifts: { $sum: '$quantity' },
+            totalTransactions: { $sum: 1 }
+          }
+        }
+      ])
+    ]);
+
+    return res.status(200).json({
+      success: true,
+      stats: {
+        totalUsers,
+        activeUsers: activeUsersCount,
+        suspendedUsers,
+        pendingHosts,
+        pendingAgencies,
+        pendingWithdrawals,
+        liveRooms: liveAudioRooms + liveVideoRooms,
+        liveAudioRooms,
+        liveVideoRooms,
+        weeklyGiftCoins: giftSummary[0]?.totalCoins || 0,
+        weeklyGiftCount: giftSummary[0]?.totalGifts || 0,
+        weeklyGiftTransactions: giftSummary[0]?.totalTransactions || 0
+      }
+    });
+  } catch (error) {
+    return res.status(500).json({ success: false, message: error.message });
+  }
+});
+
+app.get('/admin/users', async (req, res) => {
+  try {
+    const admin = await requireAuthUser(req, res);
+    if (!admin) return;
+    if (!(await canUseAdminPanel(admin._id))) {
+      return res.status(403).json({ success: false, message: 'Only admin can view users' });
+    }
+
+    const page = Math.max(parseInt(req.query.page, 10) || 1, 1);
+    const limit = Math.min(Math.max(parseInt(req.query.limit, 10) || 25, 1), 100);
+    const search = String(req.query.search || '').trim();
+    const role = String(req.query.role || '').trim();
+    const accountStatus = String(req.query.accountStatus || '').trim();
+
+    const filter = {};
+    if (role && role !== 'all') filter.role = role;
+    if (accountStatus && accountStatus !== 'all') filter.accountStatus = accountStatus;
+    if (search) {
+      const regex = new RegExp(search.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'i');
+      filter.$or = [
+        { name: regex },
+        { email: regex },
+        { glixId: regex },
+        ...(mongoose.Types.ObjectId.isValid(search) ? [{ _id: search }] : [])
+      ];
+    }
+
+    const [users, total] = await Promise.all([
+      User.find(filter)
+        .select('name email profilePic glixId role hostStatus agencyStatus accountStatus adminNote chang daimon followersCount followingCount createdAt lastLogin')
+        .sort({ createdAt: -1 })
+        .skip((page - 1) * limit)
+        .limit(limit)
+        .lean(),
+      User.countDocuments(filter)
+    ]);
+
+    return res.status(200).json({ success: true, users, page, limit, total, pages: Math.ceil(total / limit) });
+  } catch (error) {
+    return res.status(500).json({ success: false, message: error.message });
+  }
+});
+
+app.patch('/admin/users/:userId', async (req, res) => {
+  try {
+    const admin = await requireAuthUser(req, res);
+    if (!admin) return;
+    if (!(await canUseAdminPanel(admin._id))) {
+      return res.status(403).json({ success: false, message: 'Only admin can update users' });
+    }
+
+    const { userId } = req.params;
+    if (!mongoose.Types.ObjectId.isValid(userId)) {
+      return res.status(400).json({ success: false, message: 'Invalid user id' });
+    }
+
+    const allowedRoles = ['user', 'host', 'agency', 'manager', 'admin'];
+    const allowedHostStatuses = ['none', 'pending', 'approved', 'rejected'];
+    const allowedAgencyStatuses = ['none', 'pending', 'approved', 'rejected'];
+    const allowedAccountStatuses = ['active', 'suspended', 'banned'];
+    const update = {};
+
+    if (req.body.role !== undefined && allowedRoles.includes(req.body.role)) update.role = req.body.role;
+    if (req.body.hostStatus !== undefined && allowedHostStatuses.includes(req.body.hostStatus)) update.hostStatus = req.body.hostStatus;
+    if (req.body.agencyStatus !== undefined && allowedAgencyStatuses.includes(req.body.agencyStatus)) update.agencyStatus = req.body.agencyStatus;
+    if (req.body.accountStatus !== undefined && allowedAccountStatuses.includes(req.body.accountStatus)) update.accountStatus = req.body.accountStatus;
+    if (req.body.adminNote !== undefined) update.adminNote = sanitizeWithdrawalText(req.body.adminNote, 300);
+    if (req.body.chang !== undefined) update.chang = Math.max(0, Number(req.body.chang) || 0);
+    if (req.body.daimon !== undefined) update.daimon = Math.max(0, Number(req.body.daimon) || 0);
+
+    const user = await User.findByIdAndUpdate(userId, { $set: update }, { new: true })
+      .select('name email profilePic glixId role hostStatus agencyStatus accountStatus adminNote chang daimon followersCount followingCount createdAt lastLogin')
+      .lean();
+
+    if (!user) return res.status(404).json({ success: false, message: 'User not found' });
+    return res.status(200).json({ success: true, user });
+  } catch (error) {
+    return res.status(500).json({ success: false, message: error.message });
+  }
+});
+
+app.get('/admin/store/items', async (req, res) => {
+  try {
+    const admin = await requireAuthUser(req, res);
+    if (!admin) return;
+    if (!(await canUseAdminPanel(admin._id))) {
+      return res.status(403).json({ success: false, message: 'Only admin can manage store items' });
+    }
+
+    await ensureDefaultStoreItems();
+    const items = await StoreItem.find({}).sort({ category: 1, section: 1, sortOrder: 1, createdAt: -1 }).lean();
+    return res.status(200).json({ success: true, items });
+  } catch (error) {
+    return res.status(500).json({ success: false, message: error.message });
+  }
+});
+
+app.post('/admin/store/items', async (req, res) => {
+  try {
+    const admin = await requireAuthUser(req, res);
+    if (!admin) return;
+    if (!(await canUseAdminPanel(admin._id))) {
+      return res.status(403).json({ success: false, message: 'Only admin can manage store items' });
+    }
+
+    const item = await StoreItem.create(sanitizeStoreItemPayload(req.body));
+    return res.status(201).json({ success: true, item });
+  } catch (error) {
+    return res.status(500).json({ success: false, message: error.message });
+  }
+});
+
+app.patch('/admin/store/items/:itemId', async (req, res) => {
+  try {
+    const admin = await requireAuthUser(req, res);
+    if (!admin) return;
+    if (!(await canUseAdminPanel(admin._id))) {
+      return res.status(403).json({ success: false, message: 'Only admin can manage store items' });
+    }
+
+    const { itemId } = req.params;
+    if (!mongoose.Types.ObjectId.isValid(itemId)) {
+      return res.status(400).json({ success: false, message: 'Invalid store item id' });
+    }
+
+    const item = await StoreItem.findByIdAndUpdate(itemId, { $set: sanitizeStoreItemPayload(req.body) }, { new: true }).lean();
+    if (!item) return res.status(404).json({ success: false, message: 'Store item not found' });
+    return res.status(200).json({ success: true, item });
+  } catch (error) {
+    return res.status(500).json({ success: false, message: error.message });
+  }
+});
+
+app.delete('/admin/store/items/:itemId', async (req, res) => {
+  try {
+    const admin = await requireAuthUser(req, res);
+    if (!admin) return;
+    if (!(await canUseAdminPanel(admin._id))) {
+      return res.status(403).json({ success: false, message: 'Only admin can manage store items' });
+    }
+
+    const { itemId } = req.params;
+    if (!mongoose.Types.ObjectId.isValid(itemId)) {
+      return res.status(400).json({ success: false, message: 'Invalid store item id' });
+    }
+
+    const item = await StoreItem.findByIdAndUpdate(itemId, { $set: { isActive: false } }, { new: true }).lean();
+    if (!item) return res.status(404).json({ success: false, message: 'Store item not found' });
+    return res.status(200).json({ success: true, item });
+  } catch (error) {
+    return res.status(500).json({ success: false, message: error.message });
+  }
+});
+
+app.post('/admin/notifications/send', async (req, res) => {
+  try {
+    const admin = await requireAuthUser(req, res);
+    if (!admin) return;
+    if (!(await canUseAdminPanel(admin._id))) {
+      return res.status(403).json({ success: false, message: 'Only admin can send notifications' });
+    }
+
+    const title = sanitizeWithdrawalText(req.body.title, 80) || 'Glix Live';
+    const body = sanitizeWithdrawalText(req.body.body, 180);
+    const target = req.body.target || 'all';
+    const userIds = Array.isArray(req.body.userIds) ? req.body.userIds.filter(mongoose.Types.ObjectId.isValid) : [];
+
+    if (!body) return res.status(400).json({ success: false, message: 'Notification body is required' });
+
+    const filter = target === 'selected' && userIds.length
+      ? { _id: { $in: userIds } }
+      : target === 'hosts'
+        ? { role: 'host', hostStatus: 'approved' }
+        : {};
+
+    const users = await User.find(filter).select('_id').limit(2000).lean();
+    await Promise.all(users.map(user => sendPushNotification({
+      userId: user._id,
+      title,
+      body,
+      data: { type: 'admin_broadcast' }
+    })));
+
+    return res.status(200).json({ success: true, sentTo: users.length });
+  } catch (error) {
+    return res.status(500).json({ success: false, message: error.message });
+  }
+});
+
 app.post('/withdrawals', async (req, res) => {
   const session = await mongoose.startSession();
   session.startTransaction();
@@ -3156,6 +3982,139 @@ app.post('/login', async (req, res) => {
     });
   } catch (error) {
     return res.status(500).json({ message: error.message });
+  }
+});
+app.post('/auth/forgot-password', async (req, res) => {
+  try {
+    const normalizedEmail = req.body?.email?.toLowerCase().trim();
+    if (!normalizedEmail) return res.status(400).json({ success: false, message: 'Email is required' });
+
+    const user = await User.findOne({ email: normalizedEmail }).select('name email role');
+
+    if (user) {
+      const otp = createPasswordResetOtp();
+      user.passwordResetOtpHash = hashPasswordResetOtp(normalizedEmail, otp);
+      user.passwordResetOtpExpiresAt = new Date(Date.now() + PASSWORD_RESET_OTP_TTL_MS);
+      user.passwordResetOtpRequestedAt = new Date();
+      user.passwordResetOtpAttempts = 0;
+      await user.save();
+
+      await sendPasswordResetOtpEmail({ email: normalizedEmail, name: user.name, otp });
+
+      if (String(process.env.ALLOW_DEV_OTP_RESPONSE || '').toLowerCase() === 'true') {
+        return res.status(200).json({ success: true, message: 'OTP sent to your email.', devOtp: otp });
+      }
+    }
+
+    return res.status(200).json({ success: true, message: 'If this account exists, an OTP has been sent.' });
+  } catch (error) {
+    return res.status(error.statusCode || 500).json({ success: false, message: error.message });
+  }
+});
+
+app.post('/auth/reset-password', async (req, res) => {
+  try {
+    const normalizedEmail = req.body?.email?.toLowerCase().trim();
+    const otp = String(req.body?.otp || '').trim();
+    const newPassword = String(req.body?.newPassword || '');
+
+    if (!normalizedEmail) return res.status(400).json({ success: false, message: 'Email is required' });
+    if (!/^\d{6}$/.test(otp)) return res.status(400).json({ success: false, message: 'Enter the 6 digit OTP' });
+    if (newPassword.length < 6) return res.status(400).json({ success: false, message: 'New password must be at least 6 characters' });
+
+    const user = await User.findOne({ email: normalizedEmail }).select('email passwordResetOtpHash passwordResetOtpExpiresAt passwordResetOtpAttempts password');
+    if (!user) {
+      return res.status(400).json({ success: false, message: 'Invalid or expired OTP' });
+    }
+
+    const isExpired = !user.passwordResetOtpExpiresAt || user.passwordResetOtpExpiresAt.getTime() < Date.now();
+    const tooManyAttempts = Number(user.passwordResetOtpAttempts || 0) >= PASSWORD_RESET_MAX_ATTEMPTS;
+    const incomingHash = hashPasswordResetOtp(normalizedEmail, otp);
+
+    if (isExpired || tooManyAttempts || !user.passwordResetOtpHash || user.passwordResetOtpHash !== incomingHash) {
+      user.passwordResetOtpAttempts = Number(user.passwordResetOtpAttempts || 0) + 1;
+      await user.save();
+      return res.status(400).json({ success: false, message: 'Invalid or expired OTP' });
+    }
+
+    const salt = await bcrypt.genSalt(10);
+    user.password = await bcrypt.hash(newPassword, salt);
+    user.passwordResetOtpHash = '';
+    user.passwordResetOtpExpiresAt = null;
+    user.passwordResetOtpRequestedAt = null;
+    user.passwordResetOtpAttempts = 0;
+    await user.save();
+
+    return res.status(200).json({ success: true, message: 'Password reset successful. You can sign in now.' });
+  } catch (error) {
+    return res.status(500).json({ success: false, message: error.message });
+  }
+});
+app.post('/admin/auth/forgot-password', async (req, res) => {
+  try {
+    const normalizedEmail = req.body?.email?.toLowerCase().trim();
+    if (!normalizedEmail) return res.status(400).json({ success: false, message: 'Email is required' });
+
+    const user = await User.findOne({ email: normalizedEmail }).select('name email role');
+    const canResetAdminPassword = user && ['admin', 'manager'].includes(user.role || 'user');
+
+    if (canResetAdminPassword) {
+      const otp = createPasswordResetOtp();
+      user.passwordResetOtpHash = hashPasswordResetOtp(normalizedEmail, otp);
+      user.passwordResetOtpExpiresAt = new Date(Date.now() + PASSWORD_RESET_OTP_TTL_MS);
+      user.passwordResetOtpRequestedAt = new Date();
+      user.passwordResetOtpAttempts = 0;
+      await user.save();
+
+      await sendPasswordResetOtpEmail({ email: normalizedEmail, name: user.name, otp });
+
+      if (String(process.env.ALLOW_DEV_OTP_RESPONSE || '').toLowerCase() === 'true') {
+        return res.status(200).json({ success: true, message: 'OTP sent to your email.', devOtp: otp });
+      }
+    }
+
+    return res.status(200).json({ success: true, message: 'If this admin account exists, an OTP has been sent.' });
+  } catch (error) {
+    return res.status(error.statusCode || 500).json({ success: false, message: error.message });
+  }
+});
+
+app.post('/admin/auth/reset-password', async (req, res) => {
+  try {
+    const normalizedEmail = req.body?.email?.toLowerCase().trim();
+    const otp = String(req.body?.otp || '').trim();
+    const newPassword = String(req.body?.newPassword || '');
+
+    if (!normalizedEmail) return res.status(400).json({ success: false, message: 'Email is required' });
+    if (!/^\d{6}$/.test(otp)) return res.status(400).json({ success: false, message: 'Enter the 6 digit OTP' });
+    if (newPassword.length < 6) return res.status(400).json({ success: false, message: 'New password must be at least 6 characters' });
+
+    const user = await User.findOne({ email: normalizedEmail }).select('email role passwordResetOtpHash passwordResetOtpExpiresAt passwordResetOtpAttempts password');
+    if (!user || !['admin', 'manager'].includes(user.role || 'user')) {
+      return res.status(400).json({ success: false, message: 'Invalid or expired OTP' });
+    }
+
+    const isExpired = !user.passwordResetOtpExpiresAt || user.passwordResetOtpExpiresAt.getTime() < Date.now();
+    const tooManyAttempts = Number(user.passwordResetOtpAttempts || 0) >= PASSWORD_RESET_MAX_ATTEMPTS;
+    const incomingHash = hashPasswordResetOtp(normalizedEmail, otp);
+
+    if (isExpired || tooManyAttempts || !user.passwordResetOtpHash || user.passwordResetOtpHash !== incomingHash) {
+      user.passwordResetOtpAttempts = Number(user.passwordResetOtpAttempts || 0) + 1;
+      await user.save();
+      return res.status(400).json({ success: false, message: 'Invalid or expired OTP' });
+    }
+
+    const salt = await bcrypt.genSalt(10);
+    user.password = await bcrypt.hash(newPassword, salt);
+    user.passwordResetOtpHash = '';
+    user.passwordResetOtpExpiresAt = null;
+    user.passwordResetOtpRequestedAt = null;
+    user.passwordResetOtpAttempts = 0;
+    await user.save();
+
+    return res.status(200).json({ success: true, message: 'Password reset successful. You can sign in now.' });
+  } catch (error) {
+    return res.status(500).json({ success: false, message: error.message });
   }
 });
 
