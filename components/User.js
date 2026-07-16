@@ -145,7 +145,7 @@ const userSchema = new mongoose.Schema({
   chang: { type: Number, default: 0 },
   role: {
     type: String,
-    enum: ['user', 'host', 'agency', 'manager', 'admin', 'coin_seller'],
+    enum: ['user', 'host', 'agency', 'manager', 'admin', 'coin_seller', 'super_admin'],
     default: 'user',
     index: true
   },
@@ -169,7 +169,7 @@ const userSchema = new mongoose.Schema({
   adminAccessRequest: {
     requestedRole: {
       type: String,
-      enum: ['manager', 'admin', ''],
+      enum: ['manager', 'admin', 'super_admin', ''],
       default: ''
     },
     status: {

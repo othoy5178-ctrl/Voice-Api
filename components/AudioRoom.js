@@ -30,6 +30,8 @@ const audioRoomSchema = new mongoose.Schema({
   backgroundThemeUrl: { type: String, default: null },
 
   isLive: { type: Boolean, default: true },
+  lastHeartbeatAt: { type: Date, default: Date.now },
+  endedAt: { type: Date, default: null },
   createdAt: { type: Date, default: Date.now },
 });
 

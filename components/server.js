@@ -6,9 +6,6 @@ import express from "express";
 import cors from "cors";
 import mongoose from "mongoose";
 import pkg from "agora-token";
-import crypto from "crypto";
-import admin from "firebase-admin";
-import nodemailer from "nodemailer";
 
 import User from "./User.js";
 import AudioRoom from "./AudioRoom.js";
@@ -16,18 +13,18 @@ import Room from "./RoomSchema.js";
 import DirectMessage from "./DirectMessage.js";
 import Follow from './Follow.js';
 import GiftTransaction from './GiftTransation.js';
-import GameCoinTransaction from './GameCoinTransaction.js';
-import CoinSellerTransaction from './CoinSellerTransaction.js';
 import RewardActivity from './RewardActivity.js';
 import RewardClaim from './RewardClaim.js';
 import StoreItem from './StoreItem.js';
 import UserStoreItem from './UserStoreItem.js';
-import Withdrawal from './Withdrawal.js';
-import MonthlyCommission from './MonthlyCommission.js';
-import AuthSession from './AuthSession.js';
-import ProfileVisit from './ProfileVisit.js';
-import cloudinary from './utils/cloudinary.js';
 import bcrypt from "bcryptjs";
+import crypto from "crypto";
+import { getApps, initializeApp } from "firebase-admin/app";
+import { getMessaging } from "firebase-admin/messaging";
+import AuthSession from "./AuthSession.js";
+import Withdrawal from "./Withdrawal.js";
+import MonthlyCommission from "./MonthlyCommission.js";
+import CoinSellerTransaction from "./CoinSellerTransaction.js";
 
 const { RtcTokenBuilder, RtcRole } = pkg;
 const app = express();
@@ -57,882 +54,63 @@ const io = new Server(server, {
 
 // Real-time globally synchronized active tracking matrix map (userId -> socket.id)
 const activeUsers = {};
-const roomMembers = new Map();
-const pendingHostDisconnects = new Map();
-const audioRoomControllers = new Map();
-const HOST_RECONNECT_GRACE_MS = 30000;
-const HOST_REVIEWER_ROLES = ['manager', 'admin'];
-const WITHDRAW_METHODS = ['Easypaisa', 'JazzCash', 'Bank'];
-const MIN_WITHDRAW_AMOUNT = 1000;
-const MONTHLY_COMMISSION_ROLES = ['agency'];
-const TOKEN_TTL_SECONDS = 60 * 60 * 24 * 30;
 
-const TOKEN_TTL_MS = TOKEN_TTL_SECONDS * 1000;
-const PASSWORD_RESET_OTP_TTL_MS = 10 * 60 * 1000;
-const PASSWORD_RESET_MAX_ATTEMPTS = 5;
+const LIVE_ROOM_STALE_MS = 90 * 1000;
 
-const createAuthTokenValue = () => crypto
-  .randomBytes(48)
-  .toString('base64')
-  .replace(/=/g, '')
-  .replace(/\+/g, '-')
-  .replace(/\//g, '_');
+const getLiveRoomFreshCutoff = () => new Date(Date.now() - LIVE_ROOM_STALE_MS);
 
-const hashAuthToken = (token) => crypto
-  .createHash('sha256')
-  .update(String(token || ''))
-  .digest('hex');
-
-const md5Signature = (value) => crypto
-  .createHash('md5')
-  .update(String(value || ''))
-  .digest('hex');
-
-const buildQuantumNexusSign = (...parts) => md5Signature(parts.join(''));
-
-const getQuantumNexusSharedKey = () => String(process.env.QUANTUM_NEXUS_SHARED_KEY || '').trim();
-
-const normalizeGameUser = (user) => ({
-  uid: user?._id?.toString() || '',
-  nickname: user?.name || user?.glixId || 'Glix User',
-  avatar: user?.profilePic || ''
-});
-
-const parseFirebaseServiceAccount = () => {
-  const rawValue = String(process.env.FIREBASE_SERVICE_ACCOUNT_JSON || '').trim();
-  if (!rawValue) return null;
-
-  try {
-    const jsonValue = rawValue.startsWith('{')
-      ? rawValue
-      : Buffer.from(rawValue, 'base64').toString('utf8');
-    return JSON.parse(jsonValue);
-  } catch (error) {
-    console.log('Firebase service account parse error:', error.message);
-    return null;
-  }
-};
-
-const getFirebaseMessaging = () => {
-  try {
-    if (!admin.apps.length) {
-      const serviceAccount = parseFirebaseServiceAccount();
-      if (!serviceAccount) return null;
-
-      admin.initializeApp({
-        credential: admin.credential.cert(serviceAccount),
-      });
-    }
-
-    return admin.messaging();
-  } catch (error) {
-    console.log('Firebase Admin initialization error:', error.message);
-    return null;
-  }
-};
-
-const signAuthToken = async (user) => {
-  const token = createAuthTokenValue();
-  await AuthSession.create({
-    userId: user._id,
-    tokenHash: hashAuthToken(token),
-    expiresAt: new Date(Date.now() + TOKEN_TTL_MS)
-  });
-
-  return token;
-};
-
-const verifyAuthToken = async (token) => {
-  const tokenValue = String(token || '').trim();
-  if (!tokenValue) {
-    const error = new Error('Invalid auth token');
-    error.statusCode = 401;
-    throw error;
-  }
-
-  const session = await AuthSession.findOneAndUpdate(
-    {
-      tokenHash: hashAuthToken(tokenValue),
-      expiresAt: { $gt: new Date() }
-    },
-    { $set: { lastUsedAt: new Date() } },
-    { new: true }
-  ).select('userId').lean();
-
-  if (!session?.userId || !mongoose.Types.ObjectId.isValid(session.userId)) {
-    const error = new Error('Invalid auth token');
-    error.statusCode = 401;
-    throw error;
-  }
-
-  return { sub: session.userId.toString() };
-};
-
-const notifyQuantumNexusMessage = async ({ sendUID, receiveUID, count = 1 }) => {
-  const providerNotifyUrl = String(process.env.QUANTUM_NEXUS_MESSAGE_NOTIFY_URL || '').trim();
-  const sharedKey = getQuantumNexusSharedKey();
-
-  if (!providerNotifyUrl || !sharedKey || !sendUID || !receiveUID) return null;
-
-  const messageCount = Number(count) || 1;
-  const payload = {
-    sendUID: sendUID.toString(),
-    receiveUID: receiveUID.toString(),
-    count: messageCount,
-    sign: buildQuantumNexusSign(sendUID, receiveUID, messageCount, sharedKey)
-  };
-
-  try {
-    const response = await fetch(providerNotifyUrl, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(payload)
-    });
-
-    const data = await response.json().catch(() => ({}));
-    if (!response.ok) {
-      console.log('Quantum Nexus message notify failed:', response.status, data);
-    }
-    return data;
-  } catch (error) {
-    console.log('Quantum Nexus message notify error:', error.message);
-    return null;
-  }
-};
-
-const hashPasswordResetOtp = (email, otp) => crypto
-  .createHash('sha256')
-  .update(`${String(email || '').toLowerCase().trim()}:${String(otp || '').trim()}:${String(process.env.PASSWORD_RESET_SECRET || process.env.JWT_SECRET || 'glix-reset-secret')}`)
-  .digest('hex');
-
-const createPasswordResetOtp = () => String(Math.floor(100000 + Math.random() * 900000));
-
-const getMailTransporter = () => {
-  const host = String(process.env.SMTP_HOST || '').trim();
-  const port = Number(process.env.SMTP_PORT || 587);
-  const user = String(process.env.SMTP_USER || '').trim();
-  const pass = String(process.env.SMTP_PASS || '').trim();
-
-  if (!host || !user || !pass) return null;
-
-  return nodemailer.createTransport({
-    host,
-    port,
-    secure: String(process.env.SMTP_SECURE || '').toLowerCase() === 'true' || port === 465,
-    auth: { user, pass }
-  });
-};
-
-const sendPasswordResetOtpEmail = async ({ email, name, otp }) => {
-  const transporter = getMailTransporter();
-  if (!transporter) {
-    const error = new Error('Email service is not configured. Set SMTP_HOST, SMTP_USER, SMTP_PASS, and SMTP_FROM.');
-    error.statusCode = 503;
-    throw error;
-  }
-
-  const from = String(process.env.SMTP_FROM || process.env.SMTP_USER || '').trim();
-  await transporter.sendMail({
-    from,
-    to: email,
-    subject: 'Glix Admin password reset OTP',
-    text: `Hi ${name || 'Admin'},\n\nYour Glix Admin password reset OTP is ${otp}. It expires in 10 minutes.\n\nIf you did not request this, ignore this email.`,
-    html: `<p>Hi ${name || 'Admin'},</p><p>Your Glix Admin password reset OTP is <strong>${otp}</strong>.</p><p>It expires in 10 minutes.</p><p>If you did not request this, ignore this email.</p>`
-  });
-};
-const sendPushNotification = async ({ userId, title, body, data = {} }) => {
-  const emptyResult = (reason) => ({
-    successCount: 0,
-    failureCount: 0,
-    tokenCount: 0,
-    skipped: true,
-    reason,
-  });
-
-  if (!userId || !mongoose.Types.ObjectId.isValid(userId)) return emptyResult('invalid_user');
-
-  try {
-    const messaging = getFirebaseMessaging();
-    if (!messaging) return emptyResult('firebase_not_configured');
-
-    const user = await User.findById(userId).select('fcmTokens settings').lean();
-    if (!user) return emptyResult('user_not_found');
-
-    const notificationAllowed = user?.settings?.newMessageNotifications !== false;
-    const tokens = [...new Set((user?.fcmTokens || []).map(item => item?.token).filter(Boolean))];
-
-    if (!notificationAllowed) return emptyResult('notifications_disabled');
-    if (!tokens.length) return emptyResult('no_fcm_token');
-
-    const response = await messaging.sendEachForMulticast({
-      tokens,
-      notification: {
-        title: String(title || 'Glix Live'),
-        body: String(body || 'You have a new notification.'),
-      },
-      data: Object.fromEntries(
-        Object.entries(data)
-          .filter(([, value]) => value !== null && value !== undefined)
-          .map(([key, value]) => [key, String(value)])
-      ),
-      android: {
-        priority: 'high',
-        notification: {
-          channelId: 'default',
-          sound: 'default',
-        },
-      },
-      apns: {
-        payload: {
-          aps: {
-            sound: 'default',
-          },
-        },
-      },
-    });
-
-    const invalidTokens = response.responses
-      .map((item, index) => {
-        const code = item?.error?.code || '';
-        return ['messaging/registration-token-not-registered', 'messaging/invalid-registration-token'].includes(code)
-          ? tokens[index]
-          : null;
-      })
-      .filter(Boolean);
-
-    if (invalidTokens.length) {
-      await User.updateMany(
-        { 'fcmTokens.token': { $in: invalidTokens } },
-        { $pull: { fcmTokens: { token: { $in: invalidTokens } } } }
-      );
-    }
-
-    return {
-      ...response,
-      tokenCount: tokens.length,
-      skipped: false,
-      invalidTokenCount: invalidTokens.length,
-    };
-  } catch (error) {
-    console.log('Push notification send error:', error.message);
-    return {
-      successCount: 0,
-      failureCount: 0,
-      tokenCount: 0,
-      skipped: true,
-      reason: error.message || 'send_error',
-    };
-  }
-};
-
-const requireAuthUser = async (req, res) => {
-  const authorization = req.headers.authorization || '';
-  const token = authorization.startsWith('Bearer ') ? authorization.slice(7).trim() : '';
-  if (!token) {
-    res.status(401).json({ success: false, message: 'Authentication required' });
-    return null;
-  }
-
-  try {
-    const payload = await verifyAuthToken(token);
-    const user = await User.findById(payload.sub).select('_id role hostStatus').lean();
-    if (!user) {
-      res.status(401).json({ success: false, message: 'Authentication user not found' });
-      return null;
-    }
-    return user;
-  } catch (error) {
-    res.status(error.statusCode || 401).json({ success: false, message: error.message || 'Authentication failed' });
-    return null;
-  }
-};
-
-const canCreateLiveRoom = async (userId) => {
-  if (!mongoose.Types.ObjectId.isValid(userId)) return false;
-  const user = await User.findById(userId).select('_id').lean();
-  return !!user;
-};
-
-const canClaimRewards = async (userId) => {
-  if (!mongoose.Types.ObjectId.isValid(userId)) return false;
-  const user = await User.findById(userId).select('role hostStatus').lean();
-  return user?.role === 'host' && user.hostStatus === 'approved';
-};
-
-const canReviewHostRequests = async (userId) => {
-  if (!mongoose.Types.ObjectId.isValid(userId)) return false;
-  const user = await User.findById(userId).select('role').lean();
-  return !!user && HOST_REVIEWER_ROLES.includes(user.role);
-};
-
-const canUseAdminPanel = async (userId) => {
-  if (!mongoose.Types.ObjectId.isValid(userId)) return false;
-  const user = await User.findById(userId).select('role').lean();
-  return user?.role === 'admin';
-};
-
-const getWithdrawSourceForRole = (role) => {
-  if (role === 'host') return 'daimon';
-  if (['agency', 'manager'].includes(role)) return 'commissionBalance';
-  if (role === 'admin') return 'revenueBalance';
+const getVideoRoomFilter = (roomId) => {
+  const stringRoomId = roomId ? roomId.toString() : '';
+  if (!stringRoomId) return null;
+  if (stringRoomId.startsWith('glix_')) return { channelName: stringRoomId };
+  if (mongoose.Types.ObjectId.isValid(stringRoomId)) return { _id: stringRoomId };
   return null;
 };
 
-const buildWalletSnapshot = (user) => ({
-  daimon: user?.daimon || 0,
-  chang: user?.chang || 0,
-  commissionBalance: user?.commissionBalance || 0,
-  revenueBalance: user?.revenueBalance || 0,
-  sellerBalance: user?.sellerBalance || 0
-});
+const closeStaleLiveRooms = async () => {
+  const cutoff = getLiveRoomFreshCutoff();
+  const now = new Date();
 
-const sanitizeWithdrawalText = (value = '', max = 80) => String(value || '').trim().slice(0, max);
+  await AudioRoom.updateMany(
+    {
+      isLive: true,
+      $or: [
+        { lastHeartbeatAt: { $lt: cutoff } },
+        { lastHeartbeatAt: { $exists: false }, createdAt: { $lt: cutoff } }
+      ]
+    },
+    { $set: { isLive: false, speakers: [], audience: [], endedAt: now } }
+  );
 
-const normalizeAccessEmail = (value = '') => String(value || '').trim().toLowerCase();
-
-const getAdminAccessAllowedEmails = () => String(
-  process.env.ADMIN_ACCESS_ALLOWED_EMAILS || process.env.ADMIN_ALLOWED_EMAILS || ''
-)
-  .split(',')
-  .map(normalizeAccessEmail)
-  .filter(Boolean);
-
-const isAdminAccessEmailAllowed = (email) => {
-  const allowedEmails = getAdminAccessAllowedEmails();
-  if (!allowedEmails.length) return false;
-  return allowedEmails.includes(normalizeAccessEmail(email));
-};
-
-const sanitizeAdminAccessRole = (role) => ['manager', 'admin'].includes(role) ? role : '';
-
-const normalizeGlixId = (value = '') => String(value || '').trim();
-
-const buildCoinSellerProfile = (user) => ({
-  id: user?._id,
-  name: user?.name || '',
-  email: user?.email || '',
-  glixId: user?.glixId || '',
-  role: user?.role || 'user',
-  coinSellerStatus: user?.coinSellerStatus || 'none',
-  sellerBalance: user?.sellerBalance || 0,
-  sellerTotalSold: user?.sellerTotalSold || 0,
-  coinSellerRegistration: user?.coinSellerRegistration || {}
-});
-
-const requireCoinSellerUser = async (req, res) => {
-  const authUser = await requireAuthUser(req, res);
-  if (!authUser) return null;
-
-  const seller = await User.findById(authUser._id)
-    .select('_id name email glixId role coinSellerStatus sellerBalance sellerTotalSold coinSellerRegistration accountStatus')
-    .lean();
-
-  if (!seller || seller.role !== 'coin_seller' || seller.coinSellerStatus !== 'approved' || seller.accountStatus !== 'active') {
-    res.status(403).json({ success: false, message: 'Approved coin seller access is required.' });
-    return null;
-  }
-
-  return seller;
-};
-
-const normalizeAgencyCode = (value = '') => String(value || '').trim().toUpperCase().replace(/[^A-Z0-9_-]/g, '').slice(0, 24);
-
-const sanitizeStoreItemPayload = (payload = {}) => {
-  const cleanItem = {};
-  const stringFields = ['itemKey', 'name', 'category', 'section', 'type', 'currency', 'imageUrl', 'previewUrl', 'assetKey', 'equipValue'];
-  stringFields.forEach((key) => {
-    if (payload[key] !== undefined) cleanItem[key] = String(payload[key] || '').trim();
-  });
-  ['price', 'durationDays', 'sortOrder'].forEach((key) => {
-    if (payload[key] !== undefined) cleanItem[key] = Number(payload[key]) || 0;
-  });
-  if (payload.isActive !== undefined) cleanItem.isActive = !!payload.isActive;
-  if (payload.isVipItem !== undefined) cleanItem.isVipItem = !!payload.isVipItem;
-  return cleanItem;
-};
-
-const getCommissionMonth = (date = new Date()) => {
-  const value = date instanceof Date ? date : new Date(date);
-  const year = value.getUTCFullYear();
-  const month = String(value.getUTCMonth() + 1).padStart(2, '0');
-  return `${year}-${month}`;
-};
-
-const getAgencyCommissionRate = (totalHostCoins = 0) => {
-  const coins = Number(totalHostCoins || 0);
-  if (coins >= 200000000) return 20;
-  if (coins >= 130000000) return 16;
-  if (coins >= 70000000) return 12;
-  if (coins >= 17000000) return 8;
-  return 4;
-};
-
-const settleCompletedMonthlyCommissions = async (session = null) => {
-  const currentMonth = getCommissionMonth();
-  let query = MonthlyCommission.find({ status: 'pending', month: { $lt: currentMonth } });
-  if (session) query = query.session(session);
-  const rows = await query;
-
-  for (const row of rows) {
-    if (!MONTHLY_COMMISSION_ROLES.includes(row.beneficiaryRole)) continue;
-
-    const updateOptions = session ? { session } : {};
-    await User.updateOne(
-      { _id: row.beneficiaryId, role: row.beneficiaryRole },
-      { $inc: { commissionBalance: Math.floor(Number(row.commissionAmount || 0)) } },
-      updateOptions
-    );
-    row.status = 'settled';
-    row.settledAt = new Date();
-    await row.save(updateOptions);
-  }
-
-  return rows.length;
-};
-
-const recordMonthlyAgencyCommission = async ({ receiverIds = [], perReceiverCost = 0, session = null }) => {
-  const cleanReceiverIds = receiverIds.filter(id => id && mongoose.Types.ObjectId.isValid(id));
-  const sourceCoins = Math.floor(Number(perReceiverCost || 0));
-  if (!cleanReceiverIds.length || sourceCoins <= 0) return;
-
-  const receivers = await User.find({ _id: { $in: cleanReceiverIds }, agencyId: { $ne: null } })
-    .select('_id agencyId hostStatus')
-    .session(session);
-
-  for (const receiver of receivers) {
-    if (!receiver.agencyId) continue;
-
-    const agency = await User.findOne({ _id: receiver.agencyId, role: 'agency' })
-      .select('_id totalHostCoins')
-      .session(session);
-    if (!agency) continue;
-
-    const ratePercent = getAgencyCommissionRate(agency.totalHostCoins || 0);
-    const commissionAmount = Math.floor((sourceCoins * ratePercent) / 100);
-    if (commissionAmount <= 0) continue;
-
-    const month = getCommissionMonth();
-    await MonthlyCommission.updateOne(
-      {
-        beneficiaryId: agency._id,
-        beneficiaryRole: 'agency',
-        hostId: receiver._id,
-        month
-      },
-      {
-        $setOnInsert: {
-          beneficiaryId: agency._id,
-          beneficiaryRole: 'agency',
-          hostId: receiver._id,
-          month,
-          status: 'pending',
-          settledAt: null
-        },
-        $set: { ratePercent },
-        $inc: { sourceCoins, commissionAmount }
-      },
-      { upsert: true, session }
-    );
-
-    await User.updateOne(
-      { _id: agency._id, role: 'agency' },
-      { $inc: { totalHostCoins: sourceCoins } },
-      { session }
-    );
-  }
-};
-const buildAgencySummary = async (agency) => {
-  const hostCount = await User.countDocuments({ agencyId: agency._id });
-  const rate = getAgencyCommissionRate(agency.totalHostCoins || 0);
-
-  return {
-    _id: agency._id,
-    name: agency.name,
-    email: agency.email,
-    profilePic: agency.profilePic,
-    glixId: agency.glixId,
-    agencyCode: agency.agencyCode,
-    commissionBalance: agency.commissionBalance || 0,
-    totalHostCoins: agency.totalHostCoins || 0,
-    hostsCount: hostCount,
-    rate,
-    createdAt: agency.createdAt
-  };
-};
-
-const uploadHostVerificationImage = async ({ userId, key, image }) => {
-  const base64 = image?.base64;
-  if (!base64) throw new Error(`${key} image is required`);
-
-  const mimeType = image?.type || 'image/jpeg';
-  if (!mimeType.startsWith('image/')) throw new Error(`${key} must be an image`);
-  const missingCloudinaryVars = ['CLOUDINARY_CLOUD_NAME', 'CLOUDINARY_API_KEY', 'CLOUDINARY_API_SECRET']
-    .filter(envKey => !process.env[envKey]);
-  if (missingCloudinaryVars.length) {
-    throw new Error(`Cloudinary is not configured. Missing: ${missingCloudinaryVars.join(', ')}`);
-  }
-
-  const folder = `${process.env.CLOUDINARY_FOLDER || 'host-verification'}/${userId}`;
-  const result = await cloudinary.uploader.upload(`data:${mimeType};base64,${base64}`, {
-    folder,
-    resource_type: 'image',
-    public_id: `${key}-${Date.now()}`
-  });
-
-  return result.secure_url;
-};
-
-const getRoomMemberList = (roomId) => {
-  const members = roomMembers.get(roomId);
-  return members
-    ? Array.from(members.values()).map(({ userId, name, profilePic }) => ({ userId, name, profilePic }))
-    : [];
-};
-
-const emitRoomMembers = (roomId) => {
-  if (!roomId) return;
-  io.to(roomId).emit('room_members_updated', getRoomMemberList(roomId));
-};
-
-const upsertRoomMember = (roomId, member) => {
-  if (!roomId || !member?.userId) return;
-  const members = roomMembers.get(roomId) || new Map();
-  members.set(member.userId.toString(), {
-    userId: member.userId.toString(),
-    name: member.name || 'User',
-    profilePic: member.profilePic || '',
-    socketId: member.socketId || ''
-  });
-  roomMembers.set(roomId, members);
-  emitRoomMembers(roomId);
-};
-
-const removeRoomMember = (roomId, userId, socketId = null) => {
-  if (!roomId || !userId) return;
-  const members = roomMembers.get(roomId);
-  if (!members) return;
-  const existing = members.get(userId.toString());
-  if (socketId && existing?.socketId && existing.socketId !== socketId) return;
-  members.delete(userId.toString());
-  if (members.size === 0) {
-    roomMembers.delete(roomId);
-    return;
-  }
-  emitRoomMembers(roomId);
-};
-
-const closeRoomAfterHostTimeout = async (roomId, hostId) => {
-  if (roomId.startsWith('glix_')) {
-    const videoRoomDoc = await Room.findOne({ channelName: roomId });
-    if (!videoRoomDoc || String(videoRoomDoc.hostId) !== String(hostId)) return;
-
-    io.to(roomId).emit('room_closing', {
-      message: 'Host disconnected. Room closed.'
-    });
-    videoRoomDoc.isLive = false;
-    await videoRoomDoc.save();
-    roomMembers.delete(roomId);
-    console.log(`Video room closed after reconnect grace timeout: ${roomId}`);
-    return;
-  }
-
-  if (!mongoose.Types.ObjectId.isValid(roomId)) return;
-  const audioRoomDoc = await AudioRoom.findById(roomId);
-  if (!audioRoomDoc || String(audioRoomDoc.hostId) !== String(hostId)) return;
-
-  audioRoomDoc.isLive = false;
-  audioRoomDoc.speakers = [];
-  audioRoomDoc.audience = [];
-  await audioRoomDoc.save();
-  roomMembers.delete(roomId);
-  audioRoomControllers.delete(roomId);
-
-  io.to(roomId).emit('audio_room_ended', {
-    message: 'Host disconnected. Room closed.'
-  });
-  console.log(`Audio room closed after reconnect grace timeout: ${roomId}`);
-};
-
-const scheduleHostDisconnectClosure = (roomId, hostId) => {
-  if (!roomId || !hostId || pendingHostDisconnects.has(roomId)) return;
-
-  io.to(roomId).emit('host_reconnecting', {
-    roomId,
-    graceMs: HOST_RECONNECT_GRACE_MS,
-    message: 'Host connection lost. Waiting for reconnect...'
-  });
-
-  const timer = setTimeout(async () => {
-    const pending = pendingHostDisconnects.get(roomId);
-    if (!pending || String(pending.hostId) !== String(hostId)) return;
-
-    pendingHostDisconnects.delete(roomId);
-    try {
-      await closeRoomAfterHostTimeout(roomId, hostId);
-    } catch (error) {
-      console.log('Host reconnect grace timeout close failed:', error);
-    }
-  }, HOST_RECONNECT_GRACE_MS);
-
-  pendingHostDisconnects.set(roomId, {
-    hostId: hostId.toString(),
-    timer
+  await Room.deleteMany({
+    $or: [
+      { isLive: false },
+      { lastHeartbeatAt: { $lt: cutoff } },
+      { lastHeartbeatAt: { $exists: false }, createdAt: { $lt: cutoff } }
+    ]
   });
 };
 
-const clearHostDisconnectClosure = (roomId, hostId) => {
-  const pending = pendingHostDisconnects.get(roomId);
-  if (!pending || String(pending.hostId) !== String(hostId)) return false;
-
-  clearTimeout(pending.timer);
-  pendingHostDisconnects.delete(roomId);
-  io.to(roomId).emit('host_reconnected', {
-    roomId,
-    message: 'Host reconnected.'
-  });
-  return true;
-};
-
-const AUDIO_MIC_SEAT_COUNTS = [5, 10, 15, 24];
-const AUDIO_LAYOUT_TYPES = ['chatroom', 'dating', 'party', 'birthday'];
-const AUDIO_BACKGROUND_THEMES = [
-  { id: 'bg-1', url: 'https://res.cloudinary.com/dh99ihggv/image/upload/v1784010162/6_glmptj.png' },
-  { id: 'bg-2', url: 'https://res.cloudinary.com/dh99ihggv/image/upload/v1784010156/10_uuhqqt.png' },
-  { id: 'bg-3', url: 'https://res.cloudinary.com/dh99ihggv/image/upload/v1784010153/9_uexecd.png' },
-  { id: 'bg-4', url: 'https://res.cloudinary.com/dh99ihggv/image/upload/v1784010153/8_xla01g.png' },
-  { id: 'bg-5', url: 'https://res.cloudinary.com/dh99ihggv/image/upload/v1784010152/1_fl6fdh.png' },
-  { id: 'bg-6', url: 'https://res.cloudinary.com/dh99ihggv/image/upload/v1784010152/4_feyzyg.png' },
-  { id: 'bg-7', url: 'https://res.cloudinary.com/dh99ihggv/image/upload/v1784010152/5_adnuuk.png' },
-  { id: 'bg-8', url: 'https://res.cloudinary.com/dh99ihggv/image/upload/v1784010152/7_ngjvsy.png' },
-  { id: 'bg-9', url: 'https://res.cloudinary.com/dh99ihggv/image/upload/v1784010151/2_mkye9g.png' },
-  { id: 'bg-10', url: 'https://res.cloudinary.com/dh99ihggv/image/upload/v1784010151/3_im6rv0.png' }
-];
-const normalizeAudioBackgroundThemeId = (theme) => {
-  if (!theme) return null;
-  const matchedTheme = AUDIO_BACKGROUND_THEMES.find(item => item.id === theme || item.url === theme);
-  return matchedTheme?.id || null;
-};
-const getAudioRoomBackgroundThemeId = (room) => (
-  normalizeAudioBackgroundThemeId(room?.backgroundThemeId || room?.backgroundThemeUrl)
-);
-const DEFAULT_AUDIO_MIC_SEAT_COUNT = 15;
-const DEFAULT_AUDIO_LAYOUT_TYPE = 'chatroom';
-const normalizeAudioMicSeatCount = (count) => {
-  const parsed = Number(count);
-  return AUDIO_MIC_SEAT_COUNTS.includes(parsed) ? parsed : DEFAULT_AUDIO_MIC_SEAT_COUNT;
-};
-const normalizeAudioLayoutType = (type) => (
-  AUDIO_LAYOUT_TYPES.includes(type) ? type : DEFAULT_AUDIO_LAYOUT_TYPE
-);
-
-const createCleanSlotsBlueprint = (count = DEFAULT_AUDIO_MIC_SEAT_COUNT) => Array.from({ length: count }, (_, i) => ({
+const createCleanSlotsBlueprint = () => Array.from({ length: 25 }, (_, i) => ({
   id: i + 1,
   locked: i === 3 || i === 12 || i === 19,
-  userId: null,
   uid: null,
   username: `${i + 1}`,
   avatar: null,
-  frameUrl: null,
   isMuted: false
 }));
 
-const buildRoomSlotsSnapshot = async (roomId) => {
-  const stringRoomId = roomId ? roomId.toString() : '';
 
-  if (stringRoomId.startsWith('glix_')) {
-    const slots = createCleanSlotsBlueprint(25);
-    const videoRoomDoc = await Room.findOne({ channelName: stringRoomId }).lean();
-    if (videoRoomDoc?.slots) {
-      videoRoomDoc.slots.slice(0, 25).forEach((slot, index) => {
-        slots[index] = {
-          ...slots[index],
-          ...slot,
-          userId: slot.userId || null,
-          uid: slot.uid ?? slot.numericUid ?? null,
-          username: slot.username || slot.name || slots[index].username,
-          avatar: slot.avatar || slot.profilePic || null,
-          frameUrl: slot.frameUrl || null,
-          isMuted: !!slot.isMuted,
-          cameraOn: !!slot.cameraOn
-        };
-      });
-    }
-    return slots;
-  }
-
-  if (!mongoose.Types.ObjectId.isValid(stringRoomId)) return createCleanSlotsBlueprint();
-
-  const audioRoomDoc = await AudioRoom.findById(stringRoomId)
-    .populate('speakers.userId', 'name profilePic')
-    .lean();
-
-  const seatCount = normalizeAudioMicSeatCount(audioRoomDoc?.micSeatCount);
-  const slots = createCleanSlotsBlueprint(seatCount);
-
-  if (!audioRoomDoc?.speakers) return slots;
-
-  audioRoomDoc.speakers.filter(speaker => speaker && speaker.userId).forEach(speaker => {
-    const index = speaker.slotIndex;
-    if (index < 0 || index >= seatCount) return;
-    const speakerUserId = speaker.userId?._id || speaker.userId;
-    slots[index] = {
-      ...slots[index],
-      userId: speakerUserId ? speakerUserId.toString() : null,
-      uid: speaker.numericUid || null,
-      username: speaker.userId?.name || 'Broadcaster',
-      avatar: speaker.userId?.profilePic || null,
-      frameUrl: speaker.frameUrl || null,
-      isMuted: !!speaker.isMuted
-    };
-  });
-
-  return slots;
-};
-
-const emitRoomSlotsSnapshot = async (roomId) => {
-  const stringRoomId = roomId ? roomId.toString() : '';
-  if (!stringRoomId) return;
-  const slots = await buildRoomSlotsSnapshot(stringRoomId);
-  if (mongoose.Types.ObjectId.isValid(stringRoomId)) {
-    const roomMeta = await AudioRoom.findById(stringRoomId).select('micSeatCount micLayoutType backgroundThemeId backgroundThemeUrl').lean();
-    const backgroundThemeId = getAudioRoomBackgroundThemeId(roomMeta);
-    io.to(stringRoomId).emit('room_slots_updated', {
-      slots,
-      micSeatCount: normalizeAudioMicSeatCount(roomMeta?.micSeatCount),
-      micLayoutType: normalizeAudioLayoutType(roomMeta?.micLayoutType),
-      backgroundThemeId,
-      backgroundThemeUrl: backgroundThemeId
-    });
-    return;
-  }
-  io.to(stringRoomId).emit('room_slots_updated', slots);
-};
-
-const getSpeakerMatch = (speakers = [], { targetUserId, targetUid, targetSlotIndex }) => {
-  const hasTargetSlot = targetSlotIndex !== null && targetSlotIndex !== undefined;
-  const normalizedSlotIndex = hasTargetSlot ? Number(targetSlotIndex) : null;
-
-  if (targetUserId) {
-    const speaker = speakers.find(item => {
-      const speakerUserId = item?.userId?._id || item?.userId;
-      return speakerUserId && String(speakerUserId) === String(targetUserId);
-    });
-    if (speaker) return speaker;
-  }
-
-  if (targetUid !== null && targetUid !== undefined) {
-    const speaker = speakers.find(item => (
-      item?.numericUid !== null &&
-      item?.numericUid !== undefined &&
-      String(item.numericUid) === String(targetUid)
-    ));
-    if (speaker) return speaker;
-  }
-
-  if (Number.isInteger(normalizedSlotIndex)) {
-    return speakers.find(item => Number(item?.slotIndex) === normalizedSlotIndex) || null;
-  }
-
-  return null;
-};
-
-const isAudioRoomController = (roomId, userId) => {
-  if (!roomId || !userId) return false;
-  const controllers = audioRoomControllers.get(roomId.toString());
-  return !!controllers?.has(userId.toString());
-};
-
-const addAudioRoomController = (roomId, userId) => {
-  if (!roomId || !userId) return;
-  const stringRoomId = roomId.toString();
-  const controllers = audioRoomControllers.get(stringRoomId) || new Set();
-  controllers.add(userId.toString());
-  audioRoomControllers.set(stringRoomId, controllers);
-};
-
-
-const VIP_BADGE_DURATION_DAYS = 30;
-const VIP_BADGE_PRICE = 799;
-const VIP_BADGE_PRIMARY_URL = 'https://res.cloudinary.com/dh99ihggv/image/upload/v1784108945/1_ioagdz.gif?_s=public-apps';
-const VIP_BADGE_ASSETS = [
-  { itemKey: 'vip_badge_2_tifvvq', name: 'VIP Badge 2', imageUrl: 'https://res.cloudinary.com/dh99ihggv/image/upload/v1784108948/2_tifvvq.gif?_s=public-apps' },
-  { itemKey: 'vip_badge_3_e2fggz', name: 'VIP Badge 3', imageUrl: 'https://res.cloudinary.com/dh99ihggv/image/upload/v1784108950/3_e2fggz.gif?_s=public-apps' },
-  { itemKey: 'vip_badge_4_etbwig', name: 'VIP Badge 4', imageUrl: 'https://res.cloudinary.com/dh99ihggv/image/upload/v1784108947/4_etbwig.gif?_s=public-apps' },
-  { itemKey: 'vip_badge_5_tu0gmi', name: 'VIP Badge 5', imageUrl: 'https://res.cloudinary.com/dh99ihggv/image/upload/v1784108945/5_tu0gmi.gif?_s=public-apps' },
-  { itemKey: 'vip_badge_6_ssrx8b', name: 'VIP Badge 6', imageUrl: 'https://res.cloudinary.com/dh99ihggv/image/upload/v1784108946/6_ssrx8b.gif?_s=public-apps' },
-  { itemKey: 'vip_badge_7_sy9jwx', name: 'VIP Badge 7', imageUrl: 'https://res.cloudinary.com/dh99ihggv/image/upload/v1784108949/7_sy9jwx.gif?_s=public-apps' },
-  { itemKey: 'vip_badge_8_jeamrm', name: 'VIP Badge 8', imageUrl: 'https://res.cloudinary.com/dh99ihggv/image/upload/v1784108947/8_jeamrm.gif?_s=public-apps' },
-  { itemKey: 'vip_badge_9_wy6zl2', name: 'VIP Badge 9', imageUrl: 'https://res.cloudinary.com/dh99ihggv/image/upload/v1784108948/9_wy6zl2.gif?_s=public-apps' },
-  { itemKey: 'vip_badge_10_mmjbai', name: 'VIP Badge 10', imageUrl: 'https://res.cloudinary.com/dh99ihggv/image/upload/v1784108950/10_mmjbai.gif?_s=public-apps' },
-  { itemKey: 'vip_badge_11_hrg1ht', name: 'VIP Badge 11', imageUrl: 'https://res.cloudinary.com/dh99ihggv/image/upload/v1784108942/11_hrg1ht.gif?_s=public-apps' },
-  { itemKey: 'vip_badge_12_gnuuau', name: 'VIP Badge 12', imageUrl: 'https://res.cloudinary.com/dh99ihggv/image/upload/v1784108943/12_gnuuau.gif?_s=public-apps' },
-  { itemKey: 'vip_badge_13_ci64oo', name: 'VIP Badge 13', imageUrl: 'https://res.cloudinary.com/dh99ihggv/image/upload/v1784108944/13_ci64oo.gif?_s=public-apps' },
-  { itemKey: 'vip_badge_14_hcrqhv', name: 'VIP Badge 14', imageUrl: 'https://res.cloudinary.com/dh99ihggv/image/upload/v1784108939/14_hcrqhv.gif?_s=public-apps' },
-  { itemKey: 'vip_badge_15_y4zdlr', name: 'VIP Badge 15', imageUrl: 'https://res.cloudinary.com/dh99ihggv/image/upload/v1784108935/15_y4zdlr.gif?_s=public-apps' },
-  { itemKey: 'vip_badge_16_cllcsq', name: 'VIP Badge 16', imageUrl: 'https://res.cloudinary.com/dh99ihggv/image/upload/v1784108941/16_cllcsq.gif?_s=public-apps' },
-  { itemKey: 'vip_badge_17_jkgagc', name: 'VIP Badge 17', imageUrl: 'https://res.cloudinary.com/dh99ihggv/image/upload/v1784108938/17_jkgagc.gif?_s=public-apps' },
-  { itemKey: 'vip_badge_18_cuyquh', name: 'VIP Badge 18', imageUrl: 'https://res.cloudinary.com/dh99ihggv/image/upload/v1784108936/18_cuyquh.gif?_s=public-apps' },
-  { itemKey: 'vip_badge_19_j2tr9w', name: 'VIP Badge 19', imageUrl: 'https://res.cloudinary.com/dh99ihggv/image/upload/v1784108937/19_j2tr9w.gif?_s=public-apps' },
-  { itemKey: 'vip_badge_20_i83r13', name: 'VIP Badge 20', imageUrl: 'https://res.cloudinary.com/dh99ihggv/image/upload/v1784108933/20_i83r13.gif?_s=public-apps' },
-  { itemKey: 'vip_badge_21_ulfv20', name: 'VIP Badge 21', imageUrl: 'https://res.cloudinary.com/dh99ihggv/image/upload/v1784108936/21_ulfv20.gif?_s=public-apps' },
-  { itemKey: 'vip_badge_22_jv8l10', name: 'VIP Badge 22', imageUrl: 'https://res.cloudinary.com/dh99ihggv/image/upload/v1784108940/22_jv8l10.gif?_s=public-apps' },
-  { itemKey: 'vip_badge_23_cwvilb', name: 'VIP Badge 23', imageUrl: 'https://res.cloudinary.com/dh99ihggv/image/upload/v1784108945/23_cwvilb.gif?_s=public-apps' },
-  { itemKey: 'vip_badge_24_fdfcfy', name: 'VIP Badge 24', imageUrl: 'https://res.cloudinary.com/dh99ihggv/image/upload/v1784108943/24_fdfcfy.gif?_s=public-apps' },
-  { itemKey: 'vip_badge_25_ym6c4g', name: 'VIP Badge 25', imageUrl: 'https://res.cloudinary.com/dh99ihggv/image/upload/v1784108940/25_ym6c4g.gif?_s=public-apps' },
-  { itemKey: 'vip_badge_26_sllsfx', name: 'VIP Badge 26', imageUrl: 'https://res.cloudinary.com/dh99ihggv/image/upload/v1784108935/26_sllsfx.gif?_s=public-apps' },
-  { itemKey: 'vip_badge_27_ijswom', name: 'VIP Badge 27', imageUrl: 'https://res.cloudinary.com/dh99ihggv/image/upload/v1784108938/27_ijswom.gif?_s=public-apps' },
-  { itemKey: 'vip_badge_28_tmosll', name: 'VIP Badge 28', imageUrl: 'https://res.cloudinary.com/dh99ihggv/image/upload/v1784108934/28_tmosll.gif?_s=public-apps' },
-  { itemKey: 'vip_badge_29_xfhzbc', name: 'VIP Badge 29', imageUrl: 'https://res.cloudinary.com/dh99ihggv/image/upload/v1784108939/29_xfhzbc.gif?_s=public-apps' },
-  { itemKey: 'vip_badge_30_qpwjku', name: 'VIP Badge 30', imageUrl: 'https://res.cloudinary.com/dh99ihggv/image/upload/v1784108942/30_qpwjku.gif?_s=public-apps' },
-  { itemKey: 'vip_badge_31_mpybnz', name: 'VIP Badge 31', imageUrl: 'https://res.cloudinary.com/dh99ihggv/image/upload/v1784108932/31_mpybnz.gif?_s=public-apps' },
-  { itemKey: 'vip_badge_32_aqy1oy', name: 'VIP Badge 32', imageUrl: 'https://res.cloudinary.com/dh99ihggv/image/upload/v1784108932/32_aqy1oy.gif?_s=public-apps' },
-  { itemKey: 'vip_badge_33_i5mjde', name: 'VIP Badge 33', imageUrl: 'https://res.cloudinary.com/dh99ihggv/image/upload/v1784108932/33_i5mjde.gif?_s=public-apps' },
-  { itemKey: 'vip_badge_35_utcpg1', name: 'VIP Badge 35', imageUrl: 'https://res.cloudinary.com/dh99ihggv/image/upload/v1784108929/35_utcpg1.gif?_s=public-apps' },
-  { itemKey: 'vip_badge_36_vfdyf2', name: 'VIP Badge 36', imageUrl: 'https://res.cloudinary.com/dh99ihggv/image/upload/v1784108930/36_vfdyf2.gif?_s=public-apps' },
-  { itemKey: 'vip_badge_37_pcfj8w', name: 'VIP Badge 37', imageUrl: 'https://res.cloudinary.com/dh99ihggv/image/upload/v1784108930/37_pcfj8w.gif?_s=public-apps' },
-  { itemKey: 'vip_badge_38_j3ujym', name: 'VIP Badge 38', imageUrl: 'https://res.cloudinary.com/dh99ihggv/image/upload/v1784108931/38_j3ujym.gif?_s=public-apps' },
-  { itemKey: 'vip_badge_39_chtadx', name: 'VIP Badge 39', imageUrl: 'https://res.cloudinary.com/dh99ihggv/image/upload/v1784108927/39_chtadx.gif?_s=public-apps' },
-  { itemKey: 'vip_badge_40_ovz5gx', name: 'VIP Badge 40', imageUrl: 'https://res.cloudinary.com/dh99ihggv/image/upload/v1784108928/40_ovz5gx.gif?_s=public-apps' },
-  { itemKey: 'vip_badge_41_ql13et', name: 'VIP Badge 41', imageUrl: 'https://res.cloudinary.com/dh99ihggv/image/upload/v1784108924/41_ql13et.gif?_s=public-apps' },
-  { itemKey: 'vip_badge_42_aorxmf', name: 'VIP Badge 42', imageUrl: 'https://res.cloudinary.com/dh99ihggv/image/upload/v1784108925/42_aorxmf.gif?_s=public-apps' },
-  { itemKey: 'vip_badge_43_wodtmf', name: 'VIP Badge 43', imageUrl: 'https://res.cloudinary.com/dh99ihggv/image/upload/v1784108923/43_wodtmf.gif?_s=public-apps' },
-  { itemKey: 'vip_badge_44_xbrrvf', name: 'VIP Badge 44', imageUrl: 'https://res.cloudinary.com/dh99ihggv/image/upload/v1784108925/44_xbrrvf.gif?_s=public-apps' },
-  { itemKey: 'vip_badge_45_e0nccv', name: 'VIP Badge 45', imageUrl: 'https://res.cloudinary.com/dh99ihggv/image/upload/v1784108926/45_e0nccv.gif?_s=public-apps' },
-  { itemKey: 'vip_badge_46_xq940e', name: 'VIP Badge 46', imageUrl: 'https://res.cloudinary.com/dh99ihggv/image/upload/v1784108923/46_xq940e.gif?_s=public-apps' },
-  { itemKey: 'vip_badge_47_d5mt3q', name: 'VIP Badge 47', imageUrl: 'https://res.cloudinary.com/dh99ihggv/image/upload/v1784108927/47_d5mt3q.gif?_s=public-apps' },
-  { itemKey: 'vip_badge_48_lsyh6v', name: 'VIP Badge 48', imageUrl: 'https://res.cloudinary.com/dh99ihggv/image/upload/v1784108922/48_lsyh6v.gif?_s=public-apps' },
-  { itemKey: 'vip_badge_49_ufjckq', name: 'VIP Badge 49', imageUrl: 'https://res.cloudinary.com/dh99ihggv/image/upload/v1784108926/49_ufjckq.gif?_s=public-apps' },
-  { itemKey: 'vip_badge_50_wmyblm', name: 'VIP Badge 50', imageUrl: 'https://res.cloudinary.com/dh99ihggv/image/upload/v1784108922/50_wmyblm.gif?_s=public-apps' },
-];
 const DEFAULT_STORE_ITEMS = [
-  { itemKey: 'vip_1_day', name: 'VIP 1 Day', category: 'VIP', section: 'VIP Plans', type: 'vip', price: 30, currency: 'chang', durationDays: VIP_BADGE_DURATION_DAYS, assetKey: 'premium', isVipItem: true, isActive: false, sortOrder: 101 },
-  { itemKey: 'vip_7_days', name: 'VIP 7 Days', category: 'VIP', section: 'VIP Plans', type: 'vip', price: 199, currency: 'chang', durationDays: VIP_BADGE_DURATION_DAYS, assetKey: 'premium', isVipItem: true, isActive: false, sortOrder: 102 },
-  { itemKey: 'vip_30_days', name: 'VIP Badge 30 Days', category: 'VIP', section: 'VIP Badges', type: 'vip', price: VIP_BADGE_PRICE, currency: 'chang', durationDays: VIP_BADGE_DURATION_DAYS, imageUrl: VIP_BADGE_PRIMARY_URL, previewUrl: VIP_BADGE_PRIMARY_URL, equipValue: VIP_BADGE_PRIMARY_URL, assetKey: 'premium', isVipItem: true, sortOrder: 1 },
-  ...VIP_BADGE_ASSETS.map((badge, index) => ({
-    itemKey: badge.itemKey,
-    name: badge.name,
-    category: 'VIP',
-    section: 'VIP Badges',
-    type: 'vip',
-    price: VIP_BADGE_PRICE,
-    currency: 'chang',
-    durationDays: VIP_BADGE_DURATION_DAYS,
-    imageUrl: badge.imageUrl,
-    previewUrl: badge.imageUrl,
-    equipValue: badge.imageUrl,
-    assetKey: 'premium',
-    isVipItem: true,
-    sortOrder: index + 2
-  })),
-  { itemKey: 'premium_badge', name: 'Premium', category: 'VIP', section: 'VIP Plans', type: 'vip', price: 30, currency: 'chang', durationDays: VIP_BADGE_DURATION_DAYS, assetKey: 'premium', isVipItem: true, isActive: false, sortOrder: 103 },
-  { itemKey: 'toyota_ride', name: 'Toyota', category: 'Ride', section: 'New This Month', type: 'ride', price: 400, currency: 'chang', durationDays: 30, assetKey: 'Ride', isVipItem: false, sortOrder: 10 },
-  { itemKey: 'jupiter_rare_id', name: 'Jupiter', category: 'Rare ID', section: 'New This Month', type: 'rareId', price: 12, currency: 'chang', durationDays: 7, assetKey: 'RareId', isVipItem: false, sortOrder: 11 },
-  { itemKey: 'gilded_precious_frame', name: 'Gilded Precious', category: 'Profile', section: 'Avatar Frame', type: 'frame', price: 400, currency: 'chang', durationDays: 30, assetKey: 'profileBadge', equipValue: 'profileBadge', isVipItem: false, sortOrder: 12 },
-  { itemKey: 'panther_frame', name: 'Panther', category: 'Profile', section: 'Avatar Frame', type: 'frame', price: 400, currency: 'chang', durationDays: 30, assetKey: 'higher', equipValue: 'higher', isVipItem: false, sortOrder: 13 },
-  { itemKey: 'lion_king_frame', name: 'Lion King', category: 'Profile', section: 'Avatar Frame', type: 'frame', price: 400, currency: 'chang', durationDays: 30, assetKey: 'special', equipValue: 'special', isVipItem: false, sortOrder: 14 },
-  { itemKey: 'honor_star', name: 'Honor Star', category: 'Honor', section: 'Avatar Frame', type: 'badge', price: 250, currency: 'chang', durationDays: 15, assetKey: 'honor-star', isVipItem: false, sortOrder: 15 },
-  { itemKey: 'popular_flower', name: 'Flower Aura', category: 'Popular', section: 'Avatar Frame', type: 'frame', price: 180, currency: 'chang', durationDays: 30, assetKey: 'flower', equipValue: 'flower', isVipItem: false, sortOrder: 16 },
-  { itemKey: 'star_entry_effect', name: 'Star Entry', category: 'Popular', section: 'New This Month', type: 'entryVideo', price: 300, currency: 'chang', durationDays: 30, assetKey: 'star', previewUrl: 'https://www.w3schools.com/html/mov_bbb.mp4', equipValue: 'https://www.w3schools.com/html/mov_bbb.mp4', isVipItem: false, sortOrder: 17 }
+  { itemKey: 'toyota_ride', name: 'Toyota', category: 'Ride', section: 'New This Month', type: 'ride', price: 400, currency: 'chang', durationDays: 30, assetKey: 'Ride', sortOrder: 1 },
+  { itemKey: 'premium_badge', name: 'Premium', category: 'Honor', section: 'New This Month', type: 'badge', price: 30, currency: 'chang', durationDays: 1, assetKey: 'premium', sortOrder: 2 },
+  { itemKey: 'jupiter_rare_id', name: 'Jupiter', category: 'Rare ID', section: 'New This Month', type: 'rareId', price: 12, currency: 'chang', durationDays: 7, assetKey: 'RareId', sortOrder: 3 },
+  { itemKey: 'gilded_precious_frame', name: 'Gilded Precious', category: 'Profile', section: 'Avatar Frame', type: 'frame', price: 400, currency: 'chang', durationDays: 30, assetKey: 'profileBadge', equipValue: 'profileBadge', sortOrder: 4 },
+  { itemKey: 'panther_frame', name: 'Panther', category: 'Profile', section: 'Avatar Frame', type: 'frame', price: 400, currency: 'chang', durationDays: 30, assetKey: 'higher', equipValue: 'higher', sortOrder: 5 },
+  { itemKey: 'lion_king_frame', name: 'Lion King', category: 'Profile', section: 'Avatar Frame', type: 'frame', price: 400, currency: 'chang', durationDays: 30, assetKey: 'special', equipValue: 'special', sortOrder: 6 },
+  { itemKey: 'honor_star', name: 'Honor Star', category: 'Honor', section: 'Avatar Frame', type: 'badge', price: 250, currency: 'chang', durationDays: 15, assetKey: 'honor-star', sortOrder: 7 },
+  { itemKey: 'popular_flower', name: 'Flower Aura', category: 'Popular', section: 'Avatar Frame', type: 'frame', price: 180, currency: 'chang', durationDays: 30, assetKey: 'flower', equipValue: 'flower', sortOrder: 8 },
+  { itemKey: 'star_entry_effect', name: 'Star Entry', category: 'Popular', section: 'New This Month', type: 'entryVideo', price: 300, currency: 'chang', durationDays: 30, assetKey: 'star', previewUrl: 'https://www.w3schools.com/html/mov_bbb.mp4', equipValue: 'https://www.w3schools.com/html/mov_bbb.mp4', sortOrder: 9 }
 ];
 
 const ensureDefaultStoreItems = async () => {
@@ -982,44 +160,15 @@ const clearExpiredStoreItems = async (userId, session = null) => {
   }
 };
 
-const getUserVipStatus = async (userId) => {
-  if (!mongoose.Types.ObjectId.isValid(userId)) {
-    return { isVip: false, vipExpiresAt: null, vipItemKey: '', vipBadgeUrl: '' };
-  }
-
-  const now = new Date();
-  const vipItem = await UserStoreItem.findOne({
-    userId,
-    $and: [
-      { $or: [{ type: 'vip' }, { itemKey: 'premium_badge' }] },
-      { $or: [{ expiresAt: null }, { expiresAt: { $gt: now } }] }
-    ]
-  })
-    .populate('itemId', 'imageUrl previewUrl equipValue assetKey name')
-    .sort({ expiresAt: -1, createdAt: -1 })
-    .lean();
-
-  const vipStoreItem = vipItem?.itemId && typeof vipItem.itemId === 'object' ? vipItem.itemId : {};
-  const vipBadgeUrl = vipStoreItem.equipValue || vipStoreItem.imageUrl || vipStoreItem.previewUrl || '';
-
-  return {
-    isVip: !!vipItem,
-    vipExpiresAt: vipItem?.expiresAt || null,
-    vipItemKey: vipItem?.itemKey || '',
-    vipBadgeUrl
-  };
-};
 const getStoreWallet = async (userId) => {
   await clearExpiredStoreItems(userId);
   const user = await User.findById(userId).select('daimon chang frameUrl entryVideoUrl');
   if (!user) return null;
-  const vip = await getUserVipStatus(userId);
   return {
     daimon: user.daimon || 0,
     chang: user.chang || 0,
     frameUrl: user.frameUrl || '',
-    entryVideoUrl: user.entryVideoUrl || '',
-    ...vip
+    entryVideoUrl: user.entryVideoUrl || ''
   };
 };
 
@@ -1265,7 +414,7 @@ io.on('connection', (socket) => {
   console.log(`User connected to socket cluster: ${socket.id}`);
 
   // 1. EVENT: Join Room
-  socket.on('join_audio_room', async ({ roomId, userId, numericUid, name, profilePic, entryVideoUrl }) => {
+  socket.on('join_audio_room', async ({ roomId, userId, name, profilePic, entryVideoUrl }) => {
     try {
       await clearExpiredStoreItems(userId);
       const userData = await User.findById(userId).select('frameUrl entryVideoUrl');
@@ -1275,7 +424,6 @@ io.on('connection', (socket) => {
       socket.join(stringRoomId);
       socket.roomId = stringRoomId;
       socket.userId = userId;
-      socket.numericUid = numericUid;
       socket.userName = name;
 
       // Map connection instance to verify host mappings directly on requests
@@ -1283,27 +431,7 @@ io.on('connection', (socket) => {
         activeUsers[userId.toString()] = socket.id;
       }
 
-      let roomHostId = null;
-      if (stringRoomId.startsWith('glix_')) {
-        const roomDoc = await Room.findOne({ channelName: stringRoomId }).select('hostId');
-        roomHostId = roomDoc?.hostId || null;
-      } else if (mongoose.Types.ObjectId.isValid(stringRoomId)) {
-        const audioRoomDoc = await AudioRoom.findById(stringRoomId).select('hostId');
-        roomHostId = audioRoomDoc?.hostId || null;
-      }
-
-      if (roomHostId && String(roomHostId) === String(userId)) {
-        clearHostDisconnectClosure(stringRoomId, userId);
-      }
-
       console.log(`${name} joined real-time room channel: ${stringRoomId}`);
-
-      upsertRoomMember(stringRoomId, {
-        userId,
-        name,
-        profilePic,
-        socketId: socket.id
-      });
 
       const finalEntryVideoUrl = userData?.entryVideoUrl || entryVideoUrl || null;
 
@@ -1320,20 +448,36 @@ io.on('connection', (socket) => {
         socket.emit('play_my_own_entry_effect', { entryVideoUrl: finalEntryVideoUrl });
       }
 
-      const completeLayoutMatrix = await buildRoomSlotsSnapshot(stringRoomId);
-      if (mongoose.Types.ObjectId.isValid(stringRoomId)) {
-        const roomMeta = await AudioRoom.findById(stringRoomId).select('micSeatCount micLayoutType backgroundThemeId backgroundThemeUrl').lean();
-        const backgroundThemeId = getAudioRoomBackgroundThemeId(roomMeta);
-        socket.emit('initialize_room_slots', {
-          slots: completeLayoutMatrix,
-          micSeatCount: normalizeAudioMicSeatCount(roomMeta?.micSeatCount),
-          micLayoutType: normalizeAudioLayoutType(roomMeta?.micLayoutType),
-          backgroundThemeId,
-          backgroundThemeUrl: backgroundThemeId
-        });
+      const isVideoRoom = stringRoomId.startsWith('glix_');
+      let completeLayoutMatrix = createCleanSlotsBlueprint();
+
+      if (isVideoRoom) {
+        const videoRoomDoc = await Room.findOne({ channelName: stringRoomId });
+        if (videoRoomDoc && videoRoomDoc.slots) {
+          completeLayoutMatrix = videoRoomDoc.slots;
+        }
       } else {
-        socket.emit('initialize_room_slots', completeLayoutMatrix);
+        if (mongoose.Types.ObjectId.isValid(stringRoomId)) {
+          const audioRoomDoc = await AudioRoom.findById(stringRoomId).populate('speakers.userId', 'name profilePic');
+          if (audioRoomDoc && audioRoomDoc.speakers) {
+            audioRoomDoc.speakers.filter(speaker => speaker && speaker.userId).forEach(speaker => {
+              const index = speaker.slotIndex;
+              if (index >= 0 && index < 25) {
+                completeLayoutMatrix[index] = {
+                  ...completeLayoutMatrix[index],
+                  uid: speaker.numericUid || null,
+                  username: speaker.userId?.name || "Broadcaster",
+                  avatar: speaker.userId?.profilePic || null,
+                  frameUrl: speaker.frameUrl || null,
+                  isMuted: speaker.isMuted || false
+                };
+              }
+            });
+          }
+        }
       }
+
+      socket.emit('initialize_room_slots', completeLayoutMatrix);
       await emitRoomStats(stringRoomId);
 
     } catch (err) {
@@ -1342,17 +486,8 @@ io.on('connection', (socket) => {
   });
 
   // 2. EVENT: Request Slot Change
-  socket.on('request_slot_change', async ({ roomId, userId, name, profilePic, frameUrl, targetSlotIndex, numericUid, isMuted, locked, cameraOn }) => {
+  socket.on('request_slot_change', async ({ roomId, userId, name, profilePic, frameUrl, targetSlotIndex, numericUid, isMuted, cameraOn }) => {
     try {
-      const stringRoomId = roomId ? roomId.toString() : '';
-
-      if (typeof locked === 'boolean') {
-        io.to(stringRoomId).emit('slot_lock_changed', {
-          slotIndex: targetSlotIndex,
-          locked
-        });
-        return;
-      }
 
       let finalFrameUrl = frameUrl;
 
@@ -1362,79 +497,63 @@ io.on('connection', (socket) => {
         finalFrameUrl = dbUser?.frameUrl || null;
       }
 
+      const stringRoomId = roomId ? roomId.toString() : '';
       const isVideoRoom = stringRoomId.startsWith('glix_');
+      const normalizedSlotIndex = Number(targetSlotIndex);
+      if (!Number.isInteger(normalizedSlotIndex) || normalizedSlotIndex < 0) return;
       const queryFilter = isVideoRoom ? { channelName: stringRoomId } : { _id: stringRoomId };
 
       if (isVideoRoom) {
-        const videoRoom = await Room.findOne({ channelName: stringRoomId });
+        if (normalizedSlotIndex > 2) return;
+
+        const videoRoom = await Room.findOne({ channelName: stringRoomId }).select('hostId slots');
         if (!videoRoom) {
           socket.emit('error_notice', { message: 'Video room not found.' });
           return;
         }
 
-        const normalizedTargetSlotIndex = Number(targetSlotIndex);
-        if (normalizedTargetSlotIndex < 0 || normalizedTargetSlotIndex >= 3) {
-          socket.emit('error_notice', { message: 'This video slot is not available.' });
-          return;
+        if (normalizedSlotIndex === 0) {
+          const isRoomHost = String(userId || '') === String(videoRoom.hostId || '');
+          const isClearingHostSlot = profilePic === null || numericUid === null || numericUid === undefined;
+
+          if (!isRoomHost || isClearingHostSlot) {
+            socket.emit('error_notice', { message: 'The first video slot is reserved for the room creator.' });
+            return;
+          }
         }
 
-        const incomingUid = numericUid !== null && numericUid !== undefined ? parseInt(numericUid, 10) : null;
-        const incomingUserId = userId ? userId.toString() : null;
+        const updateData = profilePic === null
+          ? {
+            "slots.$.uid": null,
+            "slots.$.username": normalizedSlotIndex === 0 ? 'Main Host' : `Co-Host ${normalizedSlotIndex + 1}`,
+            "slots.$.avatar": null,
+            "slots.$.frameUrl": null,
+            "slots.$.isMuted": false,
+            "slots.$.cameraOn": normalizedSlotIndex === 0
+          }
+          : {
+            "slots.$.uid": parseInt(numericUid, 10),
+            "slots.$.username": name,
+            "slots.$.avatar": profilePic,
+            "slots.$.frameUrl": finalFrameUrl,
+            "slots.$.isMuted": !!isMuted,
+            "slots.$.cameraOn": !!cameraOn
+          };
 
-        const resetVideoSlotDoc = (slot, index) => {
-          slot.userId = null;
-          slot.uid = null;
-          slot.username = index === 0 ? 'Main Host' : `Co-Host ${index}`;
-          slot.avatar = null;
-          slot.frameUrl = null;
-          slot.isMuted = false;
-          slot.cameraOn = index === 0;
-        };
-
-        videoRoom.slots.forEach((slot, index) => {
-          const sameTarget = index === normalizedTargetSlotIndex;
-          const sameUser = incomingUserId && slot.userId && String(slot.userId) === incomingUserId;
-          const sameUid = incomingUid !== null && slot.uid !== null && slot.uid !== undefined && String(slot.uid) === String(incomingUid);
-          if (sameTarget || sameUser || sameUid) resetVideoSlotDoc(slot, index);
-        });
-
-        if (profilePic !== null) {
-          const targetSlot = videoRoom.slots[normalizedTargetSlotIndex];
-          targetSlot.userId = incomingUserId;
-          targetSlot.uid = incomingUid;
-          targetSlot.username = name || (normalizedTargetSlotIndex === 0 ? 'Main Host' : `Co-Host ${normalizedTargetSlotIndex}`);
-          targetSlot.avatar = profilePic || null;
-          targetSlot.frameUrl = finalFrameUrl || null;
-          targetSlot.isMuted = !!isMuted;
-          targetSlot.cameraOn = typeof cameraOn === 'boolean' ? cameraOn : normalizedTargetSlotIndex === 0;
-        }
-
-        await videoRoom.save();
+        await Room.findOneAndUpdate(
+          { channelName: stringRoomId, "slots.id": normalizedSlotIndex + 1 },
+          { $set: updateData }
+        );
       } else {
         if (!mongoose.Types.ObjectId.isValid(stringRoomId)) return;
-        const roomMeta = await AudioRoom.findById(stringRoomId).select('micSeatCount').lean();
-        const seatCount = normalizeAudioMicSeatCount(roomMeta?.micSeatCount);
-        if (Number(targetSlotIndex) < 0 || Number(targetSlotIndex) >= seatCount) {
-          socket.emit('error_notice', { message: 'This mic slot is not available in the current arrangement.' });
-          return;
-        }
 
         if (profilePic === null) {
           await AudioRoom.findOneAndUpdate(queryFilter, {
             $pull: { speakers: { slotIndex: targetSlotIndex } }
           });
         } else {
-          if (!finalFrameUrl) {
-            const existingRoom = await AudioRoom.findById(stringRoomId).select('speakers').lean();
-            const existingSpeaker = existingRoom?.speakers?.find(speaker => (
-              (speaker?.userId && String(speaker.userId) === String(userId)) ||
-              Number(speaker?.slotIndex) === Number(targetSlotIndex)
-            ));
-            finalFrameUrl = existingSpeaker?.frameUrl || null;
-          }
-
           await AudioRoom.findOneAndUpdate(queryFilter, {
-            $pull: { speakers: { $or: [{ userId: userId }, { slotIndex: targetSlotIndex }] } }
+            $pull: { speakers: { userId: userId } }
           });
 
           await AudioRoom.findOneAndUpdate(queryFilter, {
@@ -1444,7 +563,7 @@ io.on('connection', (socket) => {
                 slotIndex: targetSlotIndex,
                 numericUid: parseInt(numericUid, 10),
                 isMuted: isMuted || false,
-                frameUrl: finalFrameUrl
+                frameUrl: frameUrl
               }
             }
           });
@@ -1452,7 +571,7 @@ io.on('connection', (socket) => {
       }
 
       io.to(stringRoomId).emit('slot_state_changed', {
-        slotIndex: targetSlotIndex,
+        slotIndex: normalizedSlotIndex,
         user: {
           uid: numericUid ? parseInt(numericUid, 10) : null,
           userId,
@@ -1463,7 +582,6 @@ io.on('connection', (socket) => {
           cameraOn: !!cameraOn
         }
       });
-      await emitRoomSlotsSnapshot(stringRoomId);
 
     } catch (error) {
       console.log("Socket array persistence exception error:", error);
@@ -1471,252 +589,9 @@ io.on('connection', (socket) => {
     }
   });
 
-  socket.on('update_audio_room_layout', async ({ roomId, requesterId, micSeatCount, micLayoutType, backgroundThemeId, backgroundThemeUrl }) => {
-    try {
-      const stringRoomId = roomId ? roomId.toString() : '';
-      const actingUserId = requesterId || socket.userId;
-
-      if (!mongoose.Types.ObjectId.isValid(stringRoomId)) {
-        socket.emit('error_notice', { message: 'Invalid audio room.' });
-        return;
-      }
-
-      const room = await AudioRoom.findById(stringRoomId).select('hostId speakers micSeatCount micLayoutType backgroundThemeId backgroundThemeUrl');
-      if (!room) {
-        socket.emit('error_notice', { message: 'Audio room not found.' });
-        return;
-      }
-
-      const canChangeLayout = String(room.hostId) === String(actingUserId) || isAudioRoomController(stringRoomId, actingUserId);
-      if (!canChangeLayout) {
-        socket.emit('error_notice', { message: 'Only the host can change mic arrangement.' });
-        return;
-      }
-
-      const requestedCount = micSeatCount === undefined || micSeatCount === null
-        ? normalizeAudioMicSeatCount(room.micSeatCount)
-        : Number(micSeatCount);
-      if (!AUDIO_MIC_SEAT_COUNTS.includes(Number(requestedCount))) {
-        socket.emit('error_notice', { message: 'Invalid mic seat count.' });
-        return;
-      }
-
-      const nextSeatCount = Number(requestedCount);
-      const nextLayoutType = micLayoutType === undefined || micLayoutType === null
-        ? normalizeAudioLayoutType(room.micLayoutType)
-        : normalizeAudioLayoutType(micLayoutType);
-
-      const incomingBackgroundTheme = backgroundThemeId !== undefined ? backgroundThemeId : backgroundThemeUrl;
-      const nextBackgroundThemeId = incomingBackgroundTheme === undefined
-        ? getAudioRoomBackgroundThemeId(room)
-        : normalizeAudioBackgroundThemeId(incomingBackgroundTheme);
-
-      const occupiedOutsideLayout = (room.speakers || []).some(speaker => (
-        speaker?.userId &&
-        Number(speaker.slotIndex) >= nextSeatCount
-      ));
-
-      if (occupiedOutsideLayout) {
-        socket.emit('error_notice', { message: 'Please clear higher mic slots before reducing seats.' });
-        return;
-      }
-
-      await AudioRoom.findByIdAndUpdate(stringRoomId, {
-        $set: {
-          micSeatCount: nextSeatCount,
-          micLayoutType: nextLayoutType,
-          backgroundThemeId: nextBackgroundThemeId,
-          backgroundThemeUrl: nextBackgroundThemeId
-        }
-      });
-
-      const slots = await buildRoomSlotsSnapshot(stringRoomId);
-      io.to(stringRoomId).emit('room_layout_changed', {
-        micSeatCount: nextSeatCount,
-        micLayoutType: nextLayoutType,
-        backgroundThemeId: nextBackgroundThemeId,
-        backgroundThemeUrl: nextBackgroundThemeId,
-        slots
-      });
-    } catch (error) {
-      console.log('Audio room layout update error:', error);
-      socket.emit('error_notice', { message: 'Failed to update mic arrangement.' });
-    }
-  });
-
-  socket.on('assign_audio_room_host', async ({ roomId, requesterId, targetUserId, targetUid, targetSlotIndex }) => {
-    try {
-      const stringRoomId = roomId ? roomId.toString() : '';
-      const actingUserId = requesterId || socket.userId;
-
-      if (!mongoose.Types.ObjectId.isValid(stringRoomId)) {
-        socket.emit('error_notice', { message: 'Invalid audio room.' });
-        return;
-      }
-
-      const room = await AudioRoom.findById(stringRoomId)
-        .populate('speakers.userId', 'name profilePic')
-        .select('hostId speakers isLive');
-
-      if (!room || !room.isLive) {
-        socket.emit('error_notice', { message: 'Audio room is not live.' });
-        return;
-      }
-
-      if (!actingUserId || String(room.hostId) !== String(actingUserId)) {
-        socket.emit('error_notice', { message: 'Only the current host can assign hosting.' });
-        return;
-      }
-
-      const targetSpeaker = getSpeakerMatch(room.speakers, { targetUserId, targetUid, targetSlotIndex });
-      const nextHostUserId = targetSpeaker?.userId?._id || targetSpeaker?.userId;
-
-      if (!targetSpeaker || !nextHostUserId) {
-        socket.emit('error_notice', { message: 'Selected user must be on a mic slot.' });
-        return;
-      }
-
-      addAudioRoomController(stringRoomId, nextHostUserId);
-
-      const pending = pendingHostDisconnects.get(stringRoomId);
-      if (pending) {
-        clearTimeout(pending.timer);
-        pendingHostDisconnects.delete(stringRoomId);
-      }
-
-      const assignedHostPayload = {
-        roomId: stringRoomId,
-        hostId: room.hostId.toString(),
-        assignedHostId: nextHostUserId.toString(),
-        assignedByUserId: actingUserId.toString(),
-        controller: {
-          userId: nextHostUserId.toString(),
-          uid: targetSpeaker.numericUid ?? null,
-          username: targetSpeaker.userId?.name || 'Host',
-          avatar: targetSpeaker.userId?.profilePic || null,
-          frameUrl: targetSpeaker.frameUrl || null,
-          slotIndex: targetSpeaker.slotIndex,
-        },
-        message: `${targetSpeaker.userId?.name || 'A mic user'} can now manage this room with the host.`
-      };
-
-      io.to(stringRoomId).emit('audio_room_host_assigned', assignedHostPayload);
-      await emitRoomSlotsSnapshot(stringRoomId);
-    } catch (error) {
-      console.log('Assign audio room host error:', error);
-      socket.emit('error_notice', { message: 'Failed to assign room host.' });
-    }
-  });
-
-  socket.on('remove_audio_mic_user', async ({ roomId, requesterId, targetUserId, targetUid, targetSlotIndex }) => {
-    try {
-      const stringRoomId = roomId ? roomId.toString() : '';
-      const actingUserId = requesterId || socket.userId;
-
-      if (!mongoose.Types.ObjectId.isValid(stringRoomId)) {
-        socket.emit('error_notice', { message: 'Invalid audio room.' });
-        return;
-      }
-
-      const room = await AudioRoom.findById(stringRoomId)
-        .populate('speakers.userId', 'name profilePic')
-        .select('hostId speakers isLive');
-
-      if (!room || !room.isLive) {
-        socket.emit('error_notice', { message: 'Audio room is not live.' });
-        return;
-      }
-
-      const actingSpeaker = getSpeakerMatch(room.speakers, { targetUserId: actingUserId });
-      const actingUserIsHost = actingUserId && String(room.hostId) === String(actingUserId);
-      const actingUserIsController = isAudioRoomController(stringRoomId, actingUserId) && !!actingSpeaker;
-
-      if (!actingUserIsHost && !actingUserIsController) {
-        socket.emit('error_notice', { message: 'Only the host or assigned controller can remove users from mic.' });
-        return;
-      }
-
-      const targetSpeaker = getSpeakerMatch(room.speakers, { targetUserId, targetUid, targetSlotIndex });
-      const removedUserId = targetSpeaker?.userId?._id || targetSpeaker?.userId;
-
-      if (!targetSpeaker || !removedUserId) {
-        socket.emit('error_notice', { message: 'Selected user is not on a mic slot.' });
-        return;
-      }
-
-      if (String(removedUserId) === String(room.hostId)) {
-        socket.emit('error_notice', { message: 'Host cannot be removed from mic using this option.' });
-        return;
-      }
-
-      await AudioRoom.findByIdAndUpdate(stringRoomId, {
-        $pull: { speakers: { userId: removedUserId } },
-        $addToSet: { audience: removedUserId }
-      });
-
-      const removedSlotIndex = targetSpeaker.slotIndex;
-      const removedPayload = {
-        roomId: stringRoomId,
-        targetUserId: removedUserId.toString(),
-        targetUid: targetSpeaker.numericUid ?? null,
-        targetSlotIndex: removedSlotIndex,
-        message: 'The host removed you from the mic slot.'
-      };
-
-      io.to(stringRoomId).emit('audio_mic_user_removed', removedPayload);
-      io.to(stringRoomId).emit('slot_state_changed', {
-        slotIndex: removedSlotIndex,
-        user: {
-          uid: null,
-          userId: null,
-          username: "",
-          avatar: null,
-          frameUrl: null,
-          isMuted: false
-        }
-      });
-      await emitRoomSlotsSnapshot(stringRoomId);
-    } catch (error) {
-      console.log('Remove audio mic user error:', error);
-      socket.emit('error_notice', { message: 'Failed to remove mic user.' });
-    }
-  });
-
-  socket.on('send_expressive_emoji', (payload = {}) => {
-    const stringRoomId = payload.roomId ? payload.roomId.toString() : '';
-    if (!stringRoomId) return;
-
-    io.to(stringRoomId).emit('receive_expressive_emoji', {
-      ...payload,
-      id: payload.id || Date.now().toString() + Math.random().toString(),
-      type: 'expressive_emoji',
-      emoji: payload.emoji || payload.text,
-      text: payload.text || payload.emoji,
-      animationKey: payload.animationKey || payload.emojiId || null,
-      emojiId: payload.emojiId || payload.animationKey || null
-    });
-  });
-
   // 3. EVENT: Chat Messages
-  socket.on('send_message', ({ roomId, senderName, text, userId, type, emoji, animationKey, emojiId, numericUid, targetSlotIndex }) => {
+  socket.on('send_message', ({ roomId, senderName, text, userId }) => {
     const stringRoomId = roomId ? roomId.toString() : '';
-    if (type === 'expressive_emoji') {
-      io.to(stringRoomId).emit('receive_message', {
-        id: Date.now().toString() + Math.random().toString(),
-        type: 'expressive_emoji',
-        sender: senderName,
-        senderName,
-        text: text || emoji,
-        emoji: emoji || text,
-        animationKey: animationKey || emojiId || null,
-        emojiId: emojiId || animationKey || null,
-        userId,
-        numericUid,
-        targetSlotIndex
-      });
-      return;
-    }
-
     io.to(stringRoomId).emit('receive_message', {
       id: Date.now().toString() + Math.random().toString(),
       type: 'user',
@@ -1726,19 +601,13 @@ io.on('connection', (socket) => {
     });
   });
 
-  socket.on('send_gift', async ({ roomId, senderName, hostId, receiverIds, gift, giftName, avatar, userId, quantity, coins }) => {
+  socket.on('send_gift', async ({ roomId, senderName, hostId, gift, giftName, avatar, userId, quantity, coins }) => {
 
     console.log('gift data:', userId, roomId, hostId, coins);
 
-    const targetIds = Array.from(new Set(
-      (Array.isArray(receiverIds) && receiverIds.length ? receiverIds : [hostId])
-        .filter(id => id && mongoose.Types.ObjectId.isValid(id))
-        .map(id => id.toString())
-    ));
-
-    if (!targetIds.length) {
-      console.error("Backend Error: Received no valid gift receivers!");
-      socket.emit('gift_error', { message: "Invalid receiver ID received." });
+    if (!hostId) {
+      console.error("Backend Error: Received null hostId!");
+      socket.emit('gift_error', { message: "Invalid host ID received." });
       return;
     }
 
@@ -1750,8 +619,7 @@ io.on('connection', (socket) => {
       return;
     }
 
-    const perReceiverCost = coinPrice * giftQuantity;
-    const totalCost = perReceiverCost * targetIds.length;
+    const totalCost = coinPrice * giftQuantity;
 
     const session = await mongoose.startSession();
     session.startTransaction();
@@ -1766,32 +634,25 @@ io.on('connection', (socket) => {
 
       if (!sender) throw new Error("Insufficient coins");
 
-      // 2. Add earned diamonds to selected receivers.
-      const receiverUpdate = await User.updateMany(
-        { _id: { $in: targetIds } },
-        { $inc: { daimon: perReceiverCost } },
+      // 2. Add earned diamonds to Receiver (Host)
+      await User.findByIdAndUpdate(
+        hostId,
+        { $inc: { daimon: totalCost } },
         { session }
       );
 
-      if (receiverUpdate.matchedCount !== targetIds.length) throw new Error("Gift receiver not found");
-
-      await GiftTransaction.create(targetIds.map(receiverId => ({
+      await GiftTransaction.create([{
         roomId: roomId?.toString(),
         senderId: userId,
-        receiverId,
+        receiverId: hostId,
         giftName,
         giftImage: gift,
         coinPrice,
         quantity: giftQuantity,
-        totalCost: perReceiverCost
-      })), { session });
+        totalCost
+      }], { session });
 
 
-            await recordMonthlyAgencyCommission({
-        receiverIds: targetIds,
-        perReceiverCost,
-        session
-      });
       await session.commitTransaction();
       await recordRewardActivity(userId, 'send_gift', { roomId: roomId?.toString(), totalCost });
 
@@ -1812,9 +673,7 @@ io.on('connection', (socket) => {
       giftName: giftName,
       avatar: avatar,
       quantity: giftQuantity,
-      perReceiverCost,
       totalCost,
-      receiverIds: targetIds,
       userId: userId
     });
     await emitRoomStats(stringRoomId);
@@ -1824,15 +683,19 @@ io.on('connection', (socket) => {
   socket.on('audience_join_request', (data) => {
     if (!data?.hostId || !data?.roomId) return;
 
-    const controllerId = data.controllerUserId ? String(data.controllerUserId) : null;
-    const hostSocketId = activeUsers[String(data.hostId)];
-    const controllerSocketId = controllerId ? activeUsers[controllerId] : null;
-    const targetSocketId = data.hostAway && controllerSocketId ? controllerSocketId : hostSocketId;
+    const stringRoomId = data.roomId?.toString?.() || '';
+    if (stringRoomId.startsWith('glix_')) {
+      const requestedSlotIndex = Number(data.requestedSlotIndex);
+      if (!Number.isInteger(requestedSlotIndex) || requestedSlotIndex < 1 || requestedSlotIndex > 2) {
+        socket.emit('error_notice', { message: 'Use the Call button to request slot 2 or slot 3.' });
+        return;
+      }
+    }
 
-    if (targetSocketId) {
-      io.to(targetSocketId).emit('receive_join_request', data);
-    } else if (controllerSocketId) {
-      io.to(controllerSocketId).emit('receive_join_request', data);
+    const hostSocketId = activeUsers[String(data.hostId)];
+
+    if (hostSocketId) {
+      io.to(hostSocketId).emit('receive_join_request', data);
     } else {
       io.to(String(data.roomId)).emit('receive_join_request', data);
     }
@@ -1842,12 +705,46 @@ io.on('connection', (socket) => {
   socket.on('host_request_response', async (data) => {
     try {
       const stringRoomId = data.roomId?.toString();
+      const isVideoRoom = stringRoomId?.startsWith?.('glix_');
+      const isApproved = data.accepted === true || data.approved === true;
+      const acceptedSlotIndex = Number(data.requestedSlotIndex ?? data.slotIndex ?? data.targetSlotIndex);
+
+      if (isVideoRoom) {
+        if (isApproved && (!Number.isInteger(acceptedSlotIndex) || acceptedSlotIndex < 1 || acceptedSlotIndex > 2)) {
+          socket.emit('error_notice', { message: 'Video callers can only be approved for slot 2 or slot 3.' });
+          return;
+        }
+
+        const videoPayload = Number.isInteger(acceptedSlotIndex)
+          ? { ...data, slotIndex: acceptedSlotIndex, requestedSlotIndex: acceptedSlotIndex }
+          : data;
+
+        io.to(stringRoomId).emit('join_request_result', videoPayload);
+
+        if (!isApproved || !data.user) return;
+        const acceptedUserId = data.user.userId || data.user._id || data.user.id || data.userId;
+        if (!acceptedUserId) return;
+
+        io.to(stringRoomId).emit('slot_state_changed', {
+          slotIndex: acceptedSlotIndex,
+          user: {
+            uid: data.user.uid,
+            userId: acceptedUserId,
+            username: data.user.username,
+            avatar: data.user.avatar,
+            frameUrl: data.user.frameUrl || null,
+            isMuted: false,
+            cameraOn: data.user.cameraOn !== false
+          }
+        });
+        return;
+      }
 
       // Send response to all users
       io.to(stringRoomId).emit('join_request_result', data);
 
       // If request rejected, stop here
-      if (!data.accepted || !data.user) return;
+      if (!isApproved || !data.user) return;
       const acceptedUserId = data.user.userId || data.user._id || data.user.id || data.userId;
       if (!acceptedUserId) {
         console.warn('Accepted mic request missing database userId:', data);
@@ -1869,7 +766,6 @@ io.on('connection', (socket) => {
           speakers: {
             $or: [
               { userId: acceptedUserId },
-              { slotIndex: data.requestedSlotIndex },
               { userId: { $exists: false } },
               { userId: null }
             ]
@@ -1881,7 +777,7 @@ io.on('connection', (socket) => {
         $push: {
           speakers: {
             userId: acceptedUserId,
-            slotIndex: data.requestedSlotIndex,
+            slotIndex: acceptedSlotIndex,
             numericUid: data.user.uid,
             frameUrl: data.user.frameUrl || null,
             isMuted: false
@@ -1894,7 +790,7 @@ io.on('connection', (socket) => {
       // ===========================
 
       io.to(stringRoomId).emit('slot_state_changed', {
-        slotIndex: data.requestedSlotIndex,
+        slotIndex: acceptedSlotIndex,
         user: {
           uid: data.user.uid,
           userId: acceptedUserId,
@@ -1904,7 +800,6 @@ io.on('connection', (socket) => {
           isMuted: false
         }
       });
-      await emitRoomSlotsSnapshot(stringRoomId);
 
     } catch (err) {
       console.log("Host response error:", err);
@@ -1941,25 +836,6 @@ io.on('connection', (socket) => {
 
       // TARGET THE ROOM NAME
       io.to(receiverId.toString()).emit('receive_direct_message', serverPayload);
-
-      sendPushNotification({
-        userId: receiverId,
-        title: senderName || 'New message',
-        body: text?.length > 120 ? `${text.slice(0, 117)}...` : text,
-        data: {
-          type: 'direct_message',
-          senderId,
-          receiverId,
-          senderName,
-          messageId: savedMessage._id.toString()
-        }
-      });
-
-      notifyQuantumNexusMessage({
-        sendUID: senderId,
-        receiveUID: receiverId,
-        count: 1
-      });
 
       // Echo back to sender
       socket.emit('message_sent_ack', { localId, _id: savedMessage._id.toString() });
@@ -2086,14 +962,42 @@ io.on('connection', (socket) => {
     }
   });
 
+
+  socket.on('room_heartbeat', async ({ roomId, userId }) => {
+    try {
+      const stringRoomId = roomId ? roomId.toString() : '';
+      if (!stringRoomId || !userId) return;
+
+      const now = new Date();
+      const videoFilter = getVideoRoomFilter(stringRoomId);
+      if (videoFilter) {
+        const videoRoom = await Room.findOne(videoFilter);
+        if (videoRoom) {
+          if (String(videoRoom.hostId) === String(userId)) {
+            await Room.updateOne(
+              { _id: videoRoom._id },
+              { $set: { isLive: true, lastHeartbeatAt: now } }
+            );
+          }
+          return;
+        }
+      }
+
+      if (!mongoose.Types.ObjectId.isValid(stringRoomId)) return;
+      await AudioRoom.updateOne(
+        { _id: stringRoomId, hostId: userId, isLive: true },
+        { $set: { lastHeartbeatAt: now } }
+      );
+    } catch (error) {
+      console.log('Room heartbeat error:', error);
+    }
+  });
+
   // 7. EVENT: Safe Disconnect Handler
   socket.on('disconnect', async () => {
     try {
       if (socket.userId) {
-        const userKey = socket.userId.toString();
-        if (activeUsers[userKey] === socket.id) {
-          delete activeUsers[userKey];
-        }
+        delete activeUsers[socket.userId.toString()];
       } else {
         // Find key by value (the socket.id) to clean up if we didn't store userId on socket object
         for (const userId in activeUsers) {
@@ -2107,8 +1011,6 @@ io.on('connection', (socket) => {
 
       const roomId = socket.roomId.toString();
       const currentUserId = socket.userId.toString();
-      const currentNumericUid = socket.numericUid;
-      removeRoomMember(roomId, currentUserId, socket.id);
 
       if (roomId.startsWith('glix_')) {
         const videoRoomDoc = await Room.findOne({ channelName: roomId });
@@ -2118,45 +1020,12 @@ io.on('connection', (socket) => {
           videoRoomDoc.hostId &&
           videoRoomDoc.hostId.toString() === currentUserId
         ) {
-          scheduleHostDisconnectClosure(roomId, currentUserId);
-          console.log(`Video room host disconnected, waiting for reconnect: ${roomId}`);
-        } else if (videoRoomDoc?.slots?.length) {
-          const removedSlotIndexes = [];
-          videoRoomDoc.slots.forEach((slot, index) => {
-            const slotMatchesUser = slot.userId && String(slot.userId) === currentUserId;
-            const slotMatchesUid = currentNumericUid !== null && currentNumericUid !== undefined && slot.uid !== null && slot.uid !== undefined && String(slot.uid) === String(currentNumericUid);
-            if (slotMatchesUser || slotMatchesUid) {
-              slot.userId = null;
-              slot.uid = null;
-              slot.username = index === 0 ? 'Main Host' : `Co-Host ${index}`;
-              slot.avatar = null;
-              slot.frameUrl = null;
-              slot.isMuted = false;
-              slot.cameraOn = index === 0;
-              removedSlotIndexes.push(index);
-            }
+          io.to(roomId).emit('room_closing', {
+            message: 'Host disconnected. Room closed.'
           });
 
-          if (removedSlotIndexes.length) {
-            await videoRoomDoc.save();
-            removedSlotIndexes.forEach(slotIndex => {
-              io.to(roomId).emit('slot_state_changed', {
-                slotIndex,
-                user: {
-                  uid: null,
-                  userId: null,
-                  username: slotIndex === 0 ? 'Main Host' : `Co-Host ${slotIndex}`,
-                  avatar: null,
-                  frameUrl: null,
-                  isMuted: false,
-                  cameraOn: slotIndex === 0
-                }
-              });
-            });
-            await emitRoomSlotsSnapshot(roomId);
-          }
-
-          await emitRoomStats(roomId);
+          await Room.deleteOne({ channelName: roomId });
+          console.log(`Video room closed because host disconnected: ${roomId}`);
         } else {
           await emitRoomStats(roomId);
         }
@@ -2164,16 +1033,6 @@ io.on('connection', (socket) => {
       }
 
       const room = await AudioRoom.findById(roomId);
-
-      if (
-        room &&
-        room.hostId &&
-        room.hostId.toString() === currentUserId
-      ) {
-        scheduleHostDisconnectClosure(roomId, currentUserId);
-        console.log(`Audio room host disconnected, waiting for reconnect: ${roomId}`);
-        return;
-      }
 
       const speaker = room?.speakers?.find(
         s => String(s.userId) === currentUserId
@@ -2202,13 +1061,31 @@ io.on('connection', (socket) => {
             isMuted: false
           }
         });
-        await emitRoomSlotsSnapshot(roomId);
       }
 
       if (!roomId || roomId.length !== 24 || !/^[0-9a-fA-F]{24}$/.test(roomId)) {
         return;
       }
 
+      const audioRoomDoc = await AudioRoom.findById(roomId);
+
+      if (
+        audioRoomDoc &&
+        audioRoomDoc.hostId &&
+        audioRoomDoc.hostId.toString() === currentUserId
+      ) {
+        audioRoomDoc.isLive = false;
+        audioRoomDoc.speakers = [];
+        audioRoomDoc.audience = [];
+
+        await audioRoomDoc.save();
+
+        io.to(roomId).emit('audio_room_ended', {
+          message: 'Host disconnected. Room closed.'
+        });
+
+        console.log(`Audio room closed because host disconnected: ${roomId}`);
+      }
     } catch (err) {
       console.log('Critical Error logged inside disconnect pipeline:', err);
     }
@@ -2313,536 +1190,13 @@ app.get('/Friends/:userId', async (req, res) => {
     const friendCount = result.length > 0 ? result[0].friendCount : 0;
 
     // 3. Return the combined data
-    const vip = await getUserVipStatus(userId);
     res.status(200).json({
       ...user._doc,
-      friends: friendCount, // This matches your profile UI needs
-      ...vip
+      friends: friendCount // This matches your profile UI needs
     });
 
   } catch (error) {
     res.status(500).json({ message: "Server error", error: error.message });
-  }
-});
-
-const handleQuantumNexusUserInfo = async (req, res) => {
-  try {
-    const gameId = String(req.body?.gameId || '').trim();
-    const uid = String(req.body?.uid || '').trim();
-    const token = String(req.body?.token || '').trim();
-    const roomId = String(req.body?.roomId || '').trim();
-    const sign = String(req.body?.sign || '').trim().toLowerCase();
-    const sharedKey = getQuantumNexusSharedKey();
-
-    if (!sharedKey) {
-      return res.status(500).json({
-        errorCode: 500,
-        errorMsg: 'Quantum Nexus shared key is not configured.',
-        data: null
-      });
-    }
-
-    if (!gameId || !uid || !token || !sign) {
-      return res.status(400).json({
-        errorCode: 400,
-        errorMsg: 'gameId, uid, token and sign are required.',
-        data: null
-      });
-    }
-
-    if (!mongoose.Types.ObjectId.isValid(uid)) {
-      return res.status(400).json({
-        errorCode: 400,
-        errorMsg: 'Invalid uid.',
-        data: null
-      });
-    }
-
-    const expectedSign = buildQuantumNexusSign(gameId, uid, token, roomId, sharedKey);
-    if (sign !== expectedSign) {
-      return res.status(401).json({
-        errorCode: 401,
-        errorMsg: 'Invalid signature.',
-        data: null
-      });
-    }
-
-    const authPayload = await verifyAuthToken(token);
-    if (String(authPayload.sub) !== uid) {
-      return res.status(401).json({
-        errorCode: 401,
-        errorMsg: 'Token does not match uid.',
-        data: null
-      });
-    }
-
-    const user = await User.findById(uid).select('name glixId profilePic chang').lean();
-    if (!user) {
-      return res.status(404).json({
-        errorCode: 404,
-        errorMsg: 'User not found.',
-        data: null
-      });
-    }
-
-    return res.status(200).json({
-      errorCode: 0,
-      errorMsg: 'Success',
-      data: {
-        uid: user._id.toString(),
-        nickname: user.name || user.glixId || 'Glix User',
-        avatar: user.profilePic || '',
-        coin: Math.max(0, Math.floor(Number(user.chang || 0)))
-      }
-    });
-  } catch (error) {
-    console.log('Quantum Nexus user info error:', error);
-    const statusCode = error?.statusCode || 500;
-    return res.status(statusCode).json({
-      errorCode: statusCode,
-      errorMsg: statusCode === 401 ? 'Invalid auth token.' : 'Internal server error.',
-      data: null
-    });
-  }
-};
-
-app.post('/api/user/info', handleQuantumNexusUserInfo);
-app.post('/api/game/user-info', handleQuantumNexusUserInfo);
-const handleQuantumNexusCoinUpdate = async (req, res) => {
-  const session = await mongoose.startSession();
-
-  try {
-    const orderId = String(req.body?.orderId || '').trim();
-    const gameId = String(req.body?.gameId || '').trim();
-    const roundId = String(req.body?.roundId || '').trim();
-    const uid = String(req.body?.uid || '').trim();
-    const coinRaw = String(req.body?.coin ?? '').trim();
-    const typeRaw = String(req.body?.type ?? '').trim();
-    const rewardTypeRaw = String(req.body?.rewardType ?? '').trim();
-    const token = String(req.body?.token || '').trim();
-    const winId = String(req.body?.winId ?? '').trim();
-    const roomId = String(req.body?.roomid ?? req.body?.roomId ?? '').trim();
-    const sign = String(req.body?.sign || '').trim().toLowerCase();
-    const sharedKey = getQuantumNexusSharedKey();
-
-    if (!sharedKey) {
-      return res.status(500).json({
-        errorCode: 500,
-        errorMsg: 'Quantum Nexus shared key is not configured.',
-        data: null
-      });
-    }
-
-    if (!orderId || !gameId || !roundId || !uid || coinRaw === '' || typeRaw === '' || rewardTypeRaw === '' || !token || !sign) {
-      return res.status(400).json({
-        errorCode: 400,
-        errorMsg: 'orderId, gameId, roundId, uid, coin, type, rewardType, token and sign are required.',
-        data: null
-      });
-    }
-
-    if (!mongoose.Types.ObjectId.isValid(uid)) {
-      return res.status(400).json({
-        errorCode: 400,
-        errorMsg: 'Invalid uid.',
-        data: null
-      });
-    }
-
-    const coin = Number(coinRaw);
-    const type = Number(typeRaw);
-    const rewardType = Number(rewardTypeRaw);
-
-    if (!Number.isSafeInteger(coin) || coin < 0) {
-      return res.status(400).json({ errorCode: 400, errorMsg: 'coin must be an unsigned integer.', data: null });
-    }
-
-    if (![1, 2].includes(type)) {
-      return res.status(400).json({ errorCode: 400, errorMsg: 'type must be 1 consume or 2 obtain.', data: null });
-    }
-
-    if (!Number.isSafeInteger(rewardType) || rewardType < 0) {
-      return res.status(400).json({ errorCode: 400, errorMsg: 'rewardType must be an integer.', data: null });
-    }
-
-    const expectedSign = buildQuantumNexusSign(orderId, gameId, roundId, uid, coinRaw, typeRaw, rewardTypeRaw, token, winId, sharedKey);
-    if (sign !== expectedSign) {
-      return res.status(401).json({
-        errorCode: 401,
-        errorMsg: 'Invalid signature.',
-        data: null
-      });
-    }
-
-    const authPayload = await verifyAuthToken(token);
-    if (String(authPayload.sub) !== uid) {
-      return res.status(401).json({
-        errorCode: 401,
-        errorMsg: 'Token does not match uid.',
-        data: null
-      });
-    }
-
-    const existingTransaction = await GameCoinTransaction.findOne({ orderId }).select('balanceAfter').lean();
-    if (existingTransaction) {
-      return res.status(200).json({
-        errorCode: 0,
-        errorMsg: 'Success',
-        data: { coin: Math.max(0, Math.floor(Number(existingTransaction.balanceAfter || 0))) }
-      });
-    }
-
-    let updatedUser = null;
-    await session.withTransaction(async () => {
-      await GameCoinTransaction.create([{
-        orderId,
-        gameId,
-        roundId,
-        userId: uid,
-        coin,
-        type,
-        rewardType,
-        winId,
-        roomId,
-        balanceAfter: 0
-      }], { session });
-
-      const increment = type === 1 ? -coin : coin;
-      const userFilter = type === 1
-        ? { _id: uid, chang: { $gte: coin } }
-        : { _id: uid };
-
-      updatedUser = await User.findOneAndUpdate(
-        userFilter,
-        { $inc: { chang: increment } },
-        { new: true, session, select: 'chang' }
-      );
-
-      if (!updatedUser) {
-        const error = new Error(type === 1 ? 'Insufficient coins.' : 'User not found.');
-        error.statusCode = type === 1 ? 402 : 404;
-        throw error;
-      }
-
-      await GameCoinTransaction.updateOne(
-        { orderId },
-        { $set: { balanceAfter: Math.max(0, Math.floor(Number(updatedUser.chang || 0))) } },
-        { session }
-      );
-    });
-
-    return res.status(200).json({
-      errorCode: 0,
-      errorMsg: 'Success',
-      data: { coin: Math.max(0, Math.floor(Number(updatedUser?.chang || 0))) }
-    });
-  } catch (error) {
-    console.log('Quantum Nexus coin update error:', error);
-
-    if (error?.code === 11000) {
-      const existingTransaction = await GameCoinTransaction.findOne({ orderId: String(req.body?.orderId || '').trim() }).select('balanceAfter').lean();
-      return res.status(200).json({
-        errorCode: 0,
-        errorMsg: 'Success',
-        data: { coin: Math.max(0, Math.floor(Number(existingTransaction?.balanceAfter || 0))) }
-      });
-    }
-
-    const statusCode = error?.statusCode || 500;
-    return res.status(statusCode).json({
-      errorCode: statusCode,
-      errorMsg: error?.message || 'Internal server error.',
-      data: null
-    });
-  } finally {
-    session.endSession();
-  }
-};
-
-const handleQuantumNexusCoinSupplement = async (req, res) => {
-  const session = await mongoose.startSession();
-
-  try {
-    const orderId = String(req.body?.orderId || '').trim();
-    const gameId = String(req.body?.gameId || '').trim();
-    const roundId = String(req.body?.roundId || '').trim();
-    const uid = String(req.body?.uid || '').trim();
-    const coinRaw = String(req.body?.coin ?? '').trim();
-    const rewardTypeRaw = String(req.body?.rewardType ?? '').trim();
-    const winId = String(req.body?.winId ?? '').trim();
-    const roomId = String(req.body?.roomid ?? req.body?.roomId ?? '').trim();
-    const sign = String(req.body?.sign || '').trim().toLowerCase();
-    const sharedKey = getQuantumNexusSharedKey();
-
-    if (!sharedKey) {
-      return res.status(500).json({
-        errorCode: 500,
-        errorMsg: 'Quantum Nexus shared key is not configured.',
-        data: null
-      });
-    }
-
-    if (!orderId || !gameId || !roundId || !uid || coinRaw === '' || rewardTypeRaw === '' || !sign) {
-      return res.status(400).json({
-        errorCode: 400,
-        errorMsg: 'orderId, gameId, roundId, uid, coin, rewardType and sign are required.',
-        data: null
-      });
-    }
-
-    if (!mongoose.Types.ObjectId.isValid(uid)) {
-      return res.status(400).json({
-        errorCode: 400,
-        errorMsg: 'Invalid uid.',
-        data: null
-      });
-    }
-
-    const coin = Number(coinRaw);
-    const rewardType = Number(rewardTypeRaw);
-
-    if (!Number.isSafeInteger(coin) || coin < 0) {
-      return res.status(400).json({ errorCode: 400, errorMsg: 'coin must be an unsigned integer.', data: null });
-    }
-
-    if (!Number.isSafeInteger(rewardType) || rewardType < 0) {
-      return res.status(400).json({ errorCode: 400, errorMsg: 'rewardType must be an integer.', data: null });
-    }
-
-    const expectedSign = buildQuantumNexusSign(orderId, gameId, roundId, uid, coinRaw, rewardTypeRaw, winId, sharedKey);
-    if (sign !== expectedSign) {
-      return res.status(401).json({
-        errorCode: 401,
-        errorMsg: 'Invalid signature.',
-        data: null
-      });
-    }
-
-    const existingTransaction = await GameCoinTransaction.findOne({ orderId }).select('balanceAfter').lean();
-    if (existingTransaction) {
-      return res.status(200).json({
-        errorCode: 0,
-        errorMsg: 'Success',
-        data: { coin: Math.max(0, Math.floor(Number(existingTransaction.balanceAfter || 0))) }
-      });
-    }
-
-    let updatedUser = null;
-    await session.withTransaction(async () => {
-      await GameCoinTransaction.create([{
-        orderId,
-        gameId,
-        roundId,
-        userId: uid,
-        coin,
-        type: 2,
-        rewardType,
-        winId,
-        roomId,
-        balanceAfter: 0
-      }], { session });
-
-      updatedUser = await User.findOneAndUpdate(
-        { _id: uid },
-        { $inc: { chang: coin } },
-        { new: true, session, select: 'chang' }
-      );
-
-      if (!updatedUser) {
-        const error = new Error('User not found.');
-        error.statusCode = 404;
-        throw error;
-      }
-
-      await GameCoinTransaction.updateOne(
-        { orderId },
-        { $set: { balanceAfter: Math.max(0, Math.floor(Number(updatedUser.chang || 0))) } },
-        { session }
-      );
-    });
-
-    return res.status(200).json({
-      errorCode: 0,
-      errorMsg: 'Success',
-      data: { coin: Math.max(0, Math.floor(Number(updatedUser?.chang || 0))) }
-    });
-  } catch (error) {
-    console.log('Quantum Nexus coin supplement error:', error);
-
-    if (error?.code === 11000) {
-      const existingTransaction = await GameCoinTransaction.findOne({ orderId: String(req.body?.orderId || '').trim() }).select('balanceAfter').lean();
-      return res.status(200).json({
-        errorCode: 0,
-        errorMsg: 'Success',
-        data: { coin: Math.max(0, Math.floor(Number(existingTransaction?.balanceAfter || 0))) }
-      });
-    }
-
-    const statusCode = error?.statusCode || 500;
-    return res.status(statusCode).json({
-      errorCode: statusCode,
-      errorMsg: error?.message || 'Internal server error.',
-      data: null
-    });
-  } finally {
-    session.endSession();
-  }
-};
-app.post('/api/game/coin/update', handleQuantumNexusCoinUpdate);
-app.post('/api/game/update-coin', handleQuantumNexusCoinUpdate);
-app.post('/api/game/coin/supplement', handleQuantumNexusCoinSupplement);
-app.post('/api/game/supplement-coin', handleQuantumNexusCoinSupplement);
-app.post('/api/friends/list', async (req, res) => {
-  try {
-    const uid = String(req.body?.uid || '').trim();
-    const token = String(req.body?.token || '').trim();
-    const sign = String(req.body?.sign || '').trim().toLowerCase();
-    const sharedKey = getQuantumNexusSharedKey();
-
-    if (!sharedKey) {
-      return res.status(500).json({
-        errorCode: 500,
-        errorMsg: 'Quantum Nexus shared key is not configured.',
-        data: []
-      });
-    }
-
-    if (!uid || !token || !sign) {
-      return res.status(400).json({
-        errorCode: 400,
-        errorMsg: 'uid, token and sign are required.',
-        data: []
-      });
-    }
-
-    if (!mongoose.Types.ObjectId.isValid(uid)) {
-      return res.status(400).json({
-        errorCode: 400,
-        errorMsg: 'Invalid uid.',
-        data: []
-      });
-    }
-
-    const expectedSign = buildQuantumNexusSign(uid, token, sharedKey);
-    if (sign !== expectedSign) {
-      return res.status(401).json({
-        errorCode: 401,
-        errorMsg: 'Invalid signature.',
-        data: []
-      });
-    }
-
-    const authPayload = await verifyAuthToken(token);
-    if (String(authPayload.sub) !== uid) {
-      return res.status(401).json({
-        errorCode: 401,
-        errorMsg: 'Token does not match uid.',
-        data: []
-      });
-    }
-
-    const user = await User.findById(uid).select('_id').lean();
-    if (!user) {
-      return res.status(404).json({
-        errorCode: 404,
-        errorMsg: 'User not found.',
-        data: []
-      });
-    }
-
-    const userObjectId = new mongoose.Types.ObjectId(uid);
-    const mutualRows = await Follow.aggregate([
-      { $match: { followerId: userObjectId } },
-      {
-        $lookup: {
-          from: 'follows',
-          let: { followingObjectId: '$followingId' },
-          pipeline: [
-            {
-              $match: {
-                $expr: {
-                  $and: [
-                    { $eq: ['$followerId', '$$followingObjectId'] },
-                    { $eq: ['$followingId', userObjectId] }
-                  ]
-                }
-              }
-            }
-          ],
-          as: 'isMutual'
-        }
-      },
-      { $match: { 'isMutual.0': { $exists: true } } },
-      {
-        $lookup: {
-          from: 'users',
-          localField: 'followingId',
-          foreignField: '_id',
-          as: 'friend'
-        }
-      },
-      { $unwind: '$friend' },
-      {
-        $project: {
-          _id: '$friend._id',
-          name: '$friend.name',
-          glixId: '$friend.glixId',
-          profilePic: '$friend.profilePic'
-        }
-      }
-    ]);
-
-    return res.status(200).json({
-      errorCode: 0,
-      errorMsg: 'Success',
-      data: mutualRows.map(normalizeGameUser)
-    });
-  } catch (error) {
-    console.log('Quantum Nexus friend list error:', error);
-    const statusCode = error?.statusCode || 500;
-    return res.status(statusCode).json({
-      errorCode: statusCode,
-      errorMsg: statusCode === 401 ? 'Invalid auth token.' : 'Internal server error.',
-      data: []
-    });
-  }
-});
-
-app.post('/users/fcm-token', async (req, res) => {
-  try {
-    const authUser = await requireAuthUser(req, res);
-    if (!authUser) return;
-
-    const requestedUserId = req.body?.userId ? String(req.body.userId) : authUser._id.toString();
-    const fcmToken = String(req.body?.fcmToken || '').trim();
-    const platform = ['android', 'ios', 'web'].includes(req.body?.platform) ? req.body.platform : 'unknown';
-
-    if (requestedUserId !== authUser._id.toString()) {
-      return res.status(403).json({ success: false, message: 'Cannot update another user notification token.' });
-    }
-
-    if (!fcmToken) {
-      return res.status(400).json({ success: false, message: 'FCM token is required.' });
-    }
-
-    await User.updateMany(
-      { 'fcmTokens.token': fcmToken },
-      { $pull: { fcmTokens: { token: fcmToken } } }
-    );
-
-    await User.findByIdAndUpdate(authUser._id, {
-      $push: {
-        fcmTokens: {
-          token: fcmToken,
-          platform,
-          updatedAt: new Date()
-        }
-      }
-    });
-
-    return res.status(200).json({ success: true });
-  } catch (error) {
-    return res.status(500).json({ success: false, message: error.message });
   }
 });
 
@@ -2858,9 +1212,6 @@ app.post('/create-video', async (req, res) => {
 
     if (!hostId) return res.status(400).json({ success: false, error: 'Host identifier missing' });
     if (!numericUid) return res.status(400).json({ success: false, error: 'Numeric UID missing for token generation' });
-    if (!(await canCreateLiveRoom(hostId))) {
-      return res.status(403).json({ success: false, error: 'Login is required to create live rooms.' });
-    }
 
     const uniqueChannelName = `glix_${hostId}_${Date.now().toString().slice(-4)}`;
 
@@ -2868,23 +1219,20 @@ app.post('/create-video', async (req, res) => {
       {
         id: 1,
         locked: false,
-        userId: hostId,
         uid: parseInt(numericUid, 10),
         username: name || 'Main Host',
         avatar: profilePic || null,
         isMe: false,
-        isMuted: false,
-        cameraOn: true
+        isMuted: false
       },
-      { id: 2, locked: false, userId: null, uid: null, username: 'Co-Host 1', avatar: null, isMe: false, isMuted: false, cameraOn: false },
-      { id: 3, locked: false, userId: null, uid: null, username: 'Co-Host 2', avatar: null, isMe: false, isMuted: false, cameraOn: false },
+      { id: 2, locked: false, uid: null, username: 'Co-Host 1', avatar: null, isMe: false, isMuted: false },
+      { id: 3, locked: false, uid: null, username: 'Co-Host 2', avatar: null, isMe: false, isMuted: false },
     ];
 
     const newRoom = new Room({
       channelName: uniqueChannelName,
       hostId,
       title: title || "Glix Live Room",
-      isLive: true,
       slots: initialSlots
     });
 
@@ -2909,7 +1257,8 @@ app.post('/create-video', async (req, res) => {
       success: true,
       room: {
         hostId: newRoom.hostId,
-        _id: uniqueChannelName
+        _id: newRoom._id.toString(),
+        channelName: uniqueChannelName
       },
       channelName: uniqueChannelName,
       agoraToken: token,
@@ -2931,53 +1280,28 @@ app.get('/gift-history/room/:roomId', async (req, res) => {
       roomMatchValues.push(new mongoose.Types.ObjectId(roomId));
     }
 
-    const [summaryResult, receiverRows] = await Promise.all([
-      GiftTransaction.aggregate([
-        {
-          $match: {
-            roomId: { $in: roomMatchValues }
-          }
-        },
-        {
-          $group: {
-            _id: "$roomId",
-            totalCoins: { $sum: "$totalCost" },
-            totalGifts: { $sum: "$quantity" },
-            totalTransactions: { $sum: 1 }
-          }
+    const result = await GiftTransaction.aggregate([
+      {
+        $match: {
+          roomId: { $in: roomMatchValues }
         }
-      ]),
-      GiftTransaction.aggregate([
-        {
-          $match: {
-            roomId: { $in: roomMatchValues }
-          }
-        },
-        {
-          $group: {
-            _id: "$receiverId",
-            totalCoins: { $sum: "$totalCost" },
-            totalGifts: { $sum: "$quantity" },
-            totalTransactions: { $sum: 1 }
-          }
+      },
+      {
+        $group: {
+          _id: "$roomId",
+          totalCoins: { $sum: "$totalCost" },
+          totalGifts: { $sum: "$quantity" },
+          totalTransactions: { $sum: 1 }
         }
-      ])
+      }
     ]);
-
-    const receiverTotals = receiverRows.reduce((totals, row) => {
-      if (row?._id) totals[row._id.toString()] = row.totalCoins || 0;
-      return totals;
-    }, {});
 
     res.status(200).json({
       success: true,
-      data: {
-        ...(summaryResult[0] || {
-          totalCoins: 0,
-          totalGifts: 0,
-          totalTransactions: 0
-        }),
-        receiverTotals
+      data: result[0] || {
+        totalCoins: 0,
+        totalGifts: 0,
+        totalTransactions: 0
       }
     });
 
@@ -2988,6 +1312,7 @@ app.get('/gift-history/room/:roomId', async (req, res) => {
     });
   }
 });
+
 app.get('/gift-history/host/:hostId', async (req, res) => {
   try {
     const { hostId } = req.params;
@@ -3027,21 +1352,13 @@ app.get('/gift-history/host/:hostId', async (req, res) => {
 
 app.post('/create', async (req, res) => {
   try {
-    const { title, hostId, numericUid, micSeatCount, micLayoutType, backgroundThemeId, backgroundThemeUrl } = req.body;
-    if (!hostId) return res.status(400).json({ success: false, error: 'Host identifier missing' });
-    if (!(await canCreateLiveRoom(hostId))) {
-      return res.status(403).json({ success: false, error: 'Login is required to create live rooms.' });
-    }
+    const { title, hostId, numericUid } = req.body;
     const sanitizedUid = parseInt(numericUid, 10) || 0;
 
     const newRoom = new AudioRoom({
       title: title || "Live Audio Room",
       hostId,
       isLive: true,
-      micSeatCount: normalizeAudioMicSeatCount(micSeatCount),
-      micLayoutType: normalizeAudioLayoutType(micLayoutType),
-      backgroundThemeId: normalizeAudioBackgroundThemeId(backgroundThemeId || backgroundThemeUrl),
-      backgroundThemeUrl: normalizeAudioBackgroundThemeId(backgroundThemeId || backgroundThemeUrl),
       speakers: [{ userId: hostId, isMuted: false, slotIndex: 0, numericUid: sanitizedUid }],
       audience: []
     });
@@ -3075,11 +1392,8 @@ app.post('/join', async (req, res) => {
     const { roomId, userId, numericUid } = req.body;
     if (!roomId || !userId || !numericUid) return res.status(400).json({ error: "Missing required fields" });
 
-
-
     const sanitizedUid = parseInt(numericUid, 10) || 0;
     const stringRoomId = roomId.toString();
-    const isVideoRoom = stringRoomId.startsWith('glix_');
 
     const appId = process.env.AGORA_APP_ID;
     const appCertificate = process.env.AGORA_APP_CERTIFICATE;
@@ -3088,25 +1402,36 @@ app.post('/join', async (req, res) => {
     const privilegeExpiredTs = currentTimestamp + expirationTimeInSeconds;
 
     let roomObj = null;
-    let userRole = RtcRole.SUBSCRIBER; // Default role for audio rooms
+    let isVideoRoom = false;
+    let channelName = stringRoomId;
+    let userRole = RtcRole.SUBSCRIBER;
 
-    if (isVideoRoom) {
-      roomObj = await Room.findOne({ channelName: stringRoomId });
-      if (!roomObj) return res.status(404).json({ error: "Video room not found" });
-      if (roomObj.isLive === false) return res.status(400).json({ error: "This room has already ended" });
-    } else {
+    const videoFilter = getVideoRoomFilter(stringRoomId);
+    if (videoFilter) {
+      roomObj = await Room.findOne(videoFilter);
+      if (roomObj) {
+        isVideoRoom = true;
+        channelName = roomObj.channelName;
+        await Room.findByIdAndUpdate(roomObj._id, {
+          $set: { isLive: true, lastHeartbeatAt: new Date() }
+        });
+      }
+    }
+
+    if (!isVideoRoom) {
       if (!mongoose.Types.ObjectId.isValid(stringRoomId)) return res.status(400).json({ error: "Invalid Room ID format" });
       roomObj = await AudioRoom.findById(stringRoomId);
       if (!roomObj) return res.status(404).json({ error: "Audio room not found" });
       if (!roomObj.isLive) return res.status(400).json({ error: "This room has already ended" });
 
-      await AudioRoom.findByIdAndUpdate(roomId, {
+      await AudioRoom.findByIdAndUpdate(stringRoomId, {
         $pull: {
           speakers: { userId }
-        }
+        },
+        $set: { lastHeartbeatAt: new Date() }
       });
 
-      roomObj = await AudioRoom.findById(roomId);
+      roomObj = await AudioRoom.findById(stringRoomId);
 
       const currentSpeakers = Array.isArray(roomObj.speakers) ? roomObj.speakers : [];
       const currentAudience = Array.isArray(roomObj.audience) ? roomObj.audience : [];
@@ -3118,41 +1443,39 @@ app.post('/join', async (req, res) => {
         await roomObj.save();
       }
 
-      // Check if user is already a speaker
       const isAlreadySpeaker = validSpeakers.some(s => String(s.userId) === String(userId));
       const isAlreadyAudience = validAudience.some(id => String(id) === String(userId));
 
       if (isAlreadySpeaker) {
-        // User is a speaker - give them PUBLISHER role so they can transmit audio
         userRole = RtcRole.PUBLISHER;
       } else if (!isAlreadyAudience) {
-        // New audience member - add them
         roomObj.audience.push(userId);
         await roomObj.save();
       }
     }
 
+    if (!roomObj) return res.status(404).json({ error: "Room not found" });
+
     const token = RtcTokenBuilder.buildTokenWithUid(
       appId,
       appCertificate,
-      stringRoomId,
+      channelName,
       sanitizedUid,
       userRole,
       privilegeExpiredTs
     );
 
-    await recordRewardActivity(userId, isVideoRoom ? 'join_video_room' : 'join_audio_room', { roomId: stringRoomId });
+    await recordRewardActivity(userId, isVideoRoom ? 'join_video_room' : 'join_audio_room', { roomId: roomObj._id?.toString?.() || stringRoomId });
 
     return res.status(200).json({
       success: true,
       room: {
         hostId: roomObj.hostId,
-        _id: isVideoRoom
-          ? roomObj.channelName
-          : roomObj._id.toString()
+        _id: roomObj._id.toString(),
+        channelName
       },
       agoraToken: token,
-      channelName: stringRoomId,
+      channelName,
       appId: appId,
       userRole: userRole === RtcRole.PUBLISHER ? 'speaker' : 'audience'
     });
@@ -3161,7 +1484,6 @@ app.post('/join', async (req, res) => {
   }
 });
 
-// NEW: Regenerate token when user is promoted to speaker
 app.post('/regenerate-token', async (req, res) => {
   try {
     const { roomId, userId, numericUid, isBecomingSpeaker } = req.body;
@@ -3204,43 +1526,40 @@ app.post('/rooms/end', async (req, res) => {
     if (!roomId || !hostId) return res.status(400).json({ success: false, error: "Missing properties context" });
 
     const stringRoomId = roomId.toString();
-    const pending = pendingHostDisconnects.get(stringRoomId);
-    if (pending) {
-      clearTimeout(pending.timer);
-      pendingHostDisconnects.delete(stringRoomId);
-    }
+    const videoFilter = getVideoRoomFilter(stringRoomId);
 
-    if (stringRoomId.startsWith('glix_')) {
-      const room = await Room.findOne({ channelName: stringRoomId });
+    if (videoFilter) {
+      const videoRoom = await Room.findOne(videoFilter);
+      if (videoRoom) {
+        if (!videoRoom.hostId || videoRoom.hostId.toString() !== String(hostId)) {
+          return res.status(403).json({ success: false, error: 'Unauthorized' });
+        }
 
-      if (!room) return res.status(404).json({ success: false, error: 'Room not found' });
-      if (
-        !room.hostId ||
-        !hostId ||
-        room.hostId.toString() !== String(hostId))
-        return res.status(403).json({ success: false, error: 'Unauthorized' });
-
-      io.to(stringRoomId).emit('room_closing', { message: 'The host has ended the video live stream.' });
-      room.isLive = false;
-      await room.save();
-      await new Promise(resolve => setTimeout(resolve, 500));
-
-    } else {
-      if (!mongoose.Types.ObjectId.isValid(stringRoomId)) return res.status(400).json({ error: "Malformed ID structure" });
-
-      const room = await AudioRoom.findById(stringRoomId);
-      if (room && room.hostId && room.hostId.toString() === hostId) {
-        room.isLive = false;
-        room.speakers = [];
-        room.audience = [];
-        await room.save();
-        audioRoomControllers.delete(stringRoomId);
-
-        io.to(stringRoomId).emit('audio_room_ended', {
-          message: "The live audio room has been closed by the host."
-        });
+        io.to(videoRoom.channelName).emit('room_closing', { message: 'The host has ended the video live stream.' });
+        await Room.deleteOne({ _id: videoRoom._id });
+        await new Promise(resolve => setTimeout(resolve, 500));
+        return res.status(200).json({ success: true, message: "Room closed cleanly." });
       }
     }
+
+    if (!mongoose.Types.ObjectId.isValid(stringRoomId)) return res.status(400).json({ error: "Malformed ID structure" });
+
+    const room = await AudioRoom.findById(stringRoomId);
+    if (!room) return res.status(404).json({ success: false, error: 'Room not found' });
+    if (!room.hostId || room.hostId.toString() !== String(hostId)) {
+      return res.status(403).json({ success: false, error: 'Unauthorized' });
+    }
+
+    room.isLive = false;
+    room.speakers = [];
+    room.audience = [];
+    room.endedAt = new Date();
+    await room.save();
+
+    io.to(stringRoomId).emit('audio_room_ended', {
+      message: "The live audio room has been closed by the host."
+    });
+
     return res.status(200).json({ success: true, message: "Room closed cleanly." });
   } catch (error) {
     return res.status(500).json({ error: error.message });
@@ -3266,12 +1585,11 @@ app.get('/rooms/:roomId', async (req, res) => {
 
 app.get('/video-rooms', async (req, res) => {
   try {
-    const rooms = await Room.find({
-      $or: [{ isLive: true }, { isLive: { $exists: false } }]
+    await closeStaleLiveRooms();
+    const liveRooms = await Room.find({
+      isLive: true,
+      lastHeartbeatAt: { $gte: getLiveRoomFreshCutoff() }
     }).sort({ createdAt: -1 });
-    const liveRooms = rooms.filter(room =>
-      room.isLive === true || io.sockets.adapter.rooms.get(room.channelName)?.size > 0
-    );
     return res.status(200).json({ success: true, rooms: liveRooms });
   } catch (error) {
     return res.status(500).json({ error: error.message });
@@ -3280,1467 +1598,22 @@ app.get('/video-rooms', async (req, res) => {
 
 app.get('/rooms', async (req, res) => {
   try {
-    const liveRooms = await AudioRoom.find({ isLive: true }).populate('hostId', 'name profilePic username').sort({ createdAt: -1 });
+    await closeStaleLiveRooms();
+    const liveRooms = await AudioRoom.find({
+      isLive: true,
+      lastHeartbeatAt: { $gte: getLiveRoomFreshCutoff() }
+    }).populate('hostId', 'name profilePic username').sort({ createdAt: -1 });
     const formattedRooms = liveRooms.map(room => ({
       id: room._id,
       title: room.title,
       host: room.hostId,
       speakerCount: room.speakers.length,
       audienceCount: room.audience.length,
-      micSeatCount: normalizeAudioMicSeatCount(room.micSeatCount),
-      micLayoutType: normalizeAudioLayoutType(room.micLayoutType),
-      backgroundThemeId: getAudioRoomBackgroundThemeId(room),
-      backgroundThemeUrl: getAudioRoomBackgroundThemeId(room),
       createdAt: room.createdAt
     }));
     return res.status(200).json({ success: true, rooms: formattedRooms });
   } catch (error) {
     return res.status(500).json({ error: error.message });
-  }
-});
-
-app.post('/coin-seller/register', async (req, res) => {
-  try {
-    const name = sanitizeWithdrawalText(req.body?.name, 80);
-    const normalizedEmail = normalizeAccessEmail(req.body?.email);
-    const password = String(req.body?.password || '');
-    const phoneNumber = sanitizeWithdrawalText(req.body?.phoneNumber || req.body?.phone, 40);
-    const city = sanitizeWithdrawalText(req.body?.city, 80);
-    const paymentMethod = sanitizeWithdrawalText(req.body?.paymentMethod, 80);
-    const note = sanitizeWithdrawalText(req.body?.note, 300);
-
-    if (!name) return res.status(400).json({ success: false, message: 'Name is required.' });
-    if (!normalizedEmail) return res.status(400).json({ success: false, message: 'Email is required.' });
-    if (!password || password.length < 6) return res.status(400).json({ success: false, message: 'Password must be at least 6 characters.' });
-    if (!phoneNumber) return res.status(400).json({ success: false, message: 'Phone number is required.' });
-    if (!paymentMethod) return res.status(400).json({ success: false, message: 'Payment method is required.' });
-
-    let user = await User.findOne({ email: normalizedEmail }).select('name email password role glixId coinSellerStatus coinSellerRegistration');
-    if (user) {
-      if (user.role === 'coin_seller' && user.coinSellerStatus === 'approved') {
-        return res.status(400).json({ success: false, message: 'This email is already approved as a coin seller.' });
-      }
-      if (user.password) {
-        const passwordMatches = await bcrypt.compare(password, user.password);
-        if (!passwordMatches) return res.status(401).json({ success: false, message: 'This email already exists. Enter the correct password.' });
-      } else {
-        const salt = await bcrypt.genSalt(10);
-        user.password = await bcrypt.hash(password, salt);
-      }
-      if (!user.glixId) user = await ensureUserPublicId(user);
-      user.name = user.name || name;
-    } else {
-      const salt = await bcrypt.genSalt(10);
-      user = new User({
-        name,
-        email: normalizedEmail,
-        password: await bcrypt.hash(password, salt),
-        glixId: await createUniqueUserPublicId()
-      });
-    }
-
-    user.coinSellerStatus = 'pending';
-    user.coinSellerRejectionReason = '';
-    user.coinSellerRegistration = {
-      fullName: name,
-      phoneNumber,
-      city,
-      paymentMethod,
-      note,
-      status: 'pending',
-      rejectionReason: '',
-      reviewedBy: null,
-      reviewedAt: null,
-      registeredAt: new Date()
-    };
-    await user.save();
-
-    return res.status(200).json({ success: true, message: 'Coin seller request submitted. Wait for admin approval.' });
-  } catch (error) {
-    if (error?.code === 11000) return res.status(409).json({ success: false, message: 'This email is already registered.' });
-    return res.status(500).json({ success: false, message: error.message });
-  }
-});
-
-app.post('/coin-seller/login', async (req, res) => {
-  try {
-    const normalizedEmail = normalizeAccessEmail(req.body?.email);
-    const password = String(req.body?.password || '');
-    if (!normalizedEmail) return res.status(400).json({ success: false, message: 'Email is required.' });
-    if (!password) return res.status(400).json({ success: false, message: 'Password is required.' });
-
-    const user = await User.findOne({ email: normalizedEmail }).select('name email password glixId role coinSellerStatus sellerBalance sellerTotalSold coinSellerRegistration accountStatus');
-    if (!user || !user.password) return res.status(401).json({ success: false, message: 'Invalid email or password.' });
-
-    const passwordMatches = await bcrypt.compare(password, user.password);
-    if (!passwordMatches) return res.status(401).json({ success: false, message: 'Invalid email or password.' });
-
-    if (user.role !== 'coin_seller' || user.coinSellerStatus !== 'approved') {
-      return res.status(403).json({
-        success: false,
-        message: user.coinSellerStatus === 'pending'
-          ? 'Your coin seller request is pending admin approval.'
-          : user.coinSellerStatus === 'rejected'
-            ? 'Your coin seller request was rejected.'
-            : 'This account is not approved as a coin seller.',
-        coinSellerStatus: user.coinSellerStatus || 'none'
-      });
-    }
-    if (user.accountStatus !== 'active') return res.status(403).json({ success: false, message: 'This seller account is not active.' });
-
-    user.lastLogin = new Date();
-    await user.save();
-
-    const token = await signAuthToken(user);
-    return res.status(200).json({ success: true, token, seller: buildCoinSellerProfile(user) });
-  } catch (error) {
-    return res.status(500).json({ success: false, message: error.message });
-  }
-});
-
-app.get('/coin-seller/me', async (req, res) => {
-  try {
-    const seller = await requireCoinSellerUser(req, res);
-    if (!seller) return;
-    return res.status(200).json({ success: true, seller: buildCoinSellerProfile(seller) });
-  } catch (error) {
-    return res.status(500).json({ success: false, message: error.message });
-  }
-});
-
-app.get('/coin-seller/transactions', async (req, res) => {
-  try {
-    const seller = await requireCoinSellerUser(req, res);
-    if (!seller) return;
-    const transactions = await CoinSellerTransaction.find({ sellerId: seller._id })
-      .populate('buyerId', 'name email glixId profilePic chang')
-      .sort({ createdAt: -1 })
-      .limit(200)
-      .lean();
-    return res.status(200).json({ success: true, transactions });
-  } catch (error) {
-    return res.status(500).json({ success: false, message: error.message });
-  }
-});
-
-app.post('/coin-seller/sell', async (req, res) => {
-  const session = await mongoose.startSession();
-  session.startTransaction();
-
-  try {
-    const sellerAuth = await requireCoinSellerUser(req, res);
-    if (!sellerAuth) {
-      await session.abortTransaction();
-      return;
-    }
-
-    const glixId = normalizeGlixId(req.body?.glixId);
-    const coins = Math.floor(Number(req.body?.coins));
-    const paymentMethod = sanitizeWithdrawalText(req.body?.paymentMethod, 80);
-    const note = sanitizeWithdrawalText(req.body?.note, 300);
-
-    if (!glixId) throw new Error('Buyer Glix ID is required.');
-    if (!Number.isFinite(coins) || coins <= 0) throw new Error('Enter a valid coin amount.');
-
-    const buyer = await User.findOne({ glixId: { $regex: `^${glixId.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}$`, $options: 'i' } })
-      .select('_id name email glixId chang')
-      .session(session);
-    if (!buyer) throw new Error('No user found with this Glix ID.');
-    if (String(buyer._id) === String(sellerAuth._id)) throw new Error('You cannot sell coins to yourself.');
-
-    const seller = await User.findOneAndUpdate(
-      {
-        _id: sellerAuth._id,
-        role: 'coin_seller',
-        coinSellerStatus: 'approved',
-        accountStatus: 'active',
-        sellerBalance: { $gte: coins }
-      },
-      { $inc: { sellerBalance: -coins, sellerTotalSold: coins } },
-      { new: true, session }
-    ).select('_id sellerBalance sellerTotalSold name email glixId role coinSellerStatus coinSellerRegistration');
-
-    if (!seller) throw new Error('Insufficient seller balance. Ask admin to add more balance.');
-
-    buyer.chang = (buyer.chang || 0) + coins;
-    await buyer.save({ session });
-
-    const [transaction] = await CoinSellerTransaction.create([{
-      sellerId: seller._id,
-      buyerId: buyer._id,
-      buyerGlixId: buyer.glixId,
-      coins,
-      paymentMethod,
-      note,
-      status: 'completed',
-      sellerBalanceAfter: seller.sellerBalance || 0,
-      buyerCoinsAfter: buyer.chang || 0
-    }], { session });
-
-    await session.commitTransaction();
-
-    return res.status(200).json({
-      success: true,
-      message: 'Coins added successfully.',
-      seller: buildCoinSellerProfile(seller),
-      buyer: { id: buyer._id, name: buyer.name, glixId: buyer.glixId, chang: buyer.chang },
-      transaction
-    });
-  } catch (error) {
-    await session.abortTransaction();
-    return res.status(400).json({ success: false, message: error.message });
-  } finally {
-    session.endSession();
-  }
-});
-
-app.get('/admin/coin-seller/requests', async (req, res) => {
-  try {
-    const adminUser = await requireAuthUser(req, res);
-    if (!adminUser) return;
-    if (!(await canUseAdminPanel(adminUser._id))) {
-      return res.status(403).json({ success: false, message: 'Only admin can review coin seller requests.' });
-    }
-
-    const sellerStatuses = ['pending', 'approved', 'rejected', 'suspended'];
-    const status = [...sellerStatuses, 'all'].includes(req.query.status) ? req.query.status : 'pending';
-    const filter = status === 'all'
-      ? {
-        $or: [
-          { coinSellerStatus: { $in: sellerStatuses } },
-          { 'coinSellerRegistration.status': { $in: sellerStatuses } }
-        ]
-      }
-      : {
-        $or: [
-          { coinSellerStatus: status },
-          { 'coinSellerRegistration.status': status }
-        ]
-      };
-    const requests = await User.find(filter)
-      .select('name email profilePic glixId role coinSellerStatus coinSellerRejectionReason coinSellerRegistration sellerBalance sellerTotalSold createdAt')
-      .populate('coinSellerRegistration.reviewedBy', 'name email glixId')
-      .sort({ 'coinSellerRegistration.registeredAt': -1, createdAt: -1 })
-      .limit(500)
-      .lean();
-
-    const normalizedRequests = requests.map((requestItem) => {
-      const registrationStatus = requestItem.coinSellerRegistration?.status;
-      const normalizedStatus = requestItem.coinSellerStatus && requestItem.coinSellerStatus !== 'none'
-        ? requestItem.coinSellerStatus
-        : registrationStatus || 'none';
-      return { ...requestItem, coinSellerStatus: normalizedStatus };
-    });
-
-    return res.status(200).json({ success: true, requests: normalizedRequests });
-  } catch (error) {
-    return res.status(500).json({ success: false, message: error.message });
-  }
-});
-
-app.patch('/admin/coin-seller/requests/:userId', async (req, res) => {
-  try {
-    const adminUser = await requireAuthUser(req, res);
-    if (!adminUser) return;
-    if (!(await canUseAdminPanel(adminUser._id))) {
-      return res.status(403).json({ success: false, message: 'Only admin can review coin seller requests.' });
-    }
-
-    const { userId } = req.params;
-    if (!mongoose.Types.ObjectId.isValid(userId)) return res.status(400).json({ success: false, message: 'Invalid user id.' });
-    const status = req.body?.status;
-    if (!['approved', 'rejected', 'suspended'].includes(status)) return res.status(400).json({ success: false, message: 'Select approved, rejected, or suspended.' });
-
-    const seller = await User.findById(userId).select('role coinSellerStatus coinSellerRegistration coinSellerRejectionReason sellerBalance');
-    if (!seller) return res.status(404).json({ success: false, message: 'Coin seller request not found.' });
-
-    if (status === 'approved') {
-      seller.role = 'coin_seller';
-      seller.coinSellerStatus = 'approved';
-      seller.coinSellerRejectionReason = '';
-      seller.coinSellerRegistration.status = 'approved';
-      seller.coinSellerRegistration.rejectionReason = '';
-      if (!Number.isFinite(Number(seller.sellerBalance))) seller.sellerBalance = 0;
-    } else if (status === 'suspended') {
-      seller.coinSellerStatus = 'suspended';
-      seller.coinSellerRegistration.status = 'suspended';
-    } else {
-      const reason = sanitizeWithdrawalText(req.body?.reason, 300);
-      seller.coinSellerStatus = 'rejected';
-      seller.coinSellerRejectionReason = reason;
-      seller.coinSellerRegistration.status = 'rejected';
-      seller.coinSellerRegistration.rejectionReason = reason;
-      if (seller.role === 'coin_seller') seller.role = 'user';
-    }
-
-    seller.coinSellerRegistration.reviewedBy = adminUser._id;
-    seller.coinSellerRegistration.reviewedAt = new Date();
-    await seller.save();
-
-    return res.status(200).json({ success: true, message: `Coin seller request ${status}.`, seller });
-  } catch (error) {
-    return res.status(500).json({ success: false, message: error.message });
-  }
-});
-
-app.get('/admin/coin-sellers', async (req, res) => {
-  try {
-    const adminUser = await requireAuthUser(req, res);
-    if (!adminUser) return;
-    if (!(await canUseAdminPanel(adminUser._id))) {
-      return res.status(403).json({ success: false, message: 'Only admin can view coin sellers.' });
-    }
-
-    const sellers = await User.find({ coinSellerStatus: { $in: ['approved', 'suspended'] } })
-      .select('name email profilePic glixId role coinSellerStatus sellerBalance sellerTotalSold coinSellerRegistration createdAt')
-      .sort({ sellerTotalSold: -1, createdAt: -1 })
-      .limit(500)
-      .lean();
-
-    return res.status(200).json({ success: true, sellers });
-  } catch (error) {
-    return res.status(500).json({ success: false, message: error.message });
-  }
-});
-
-app.patch('/admin/coin-sellers/:sellerId/balance', async (req, res) => {
-  try {
-    const adminUser = await requireAuthUser(req, res);
-    if (!adminUser) return;
-    if (!(await canUseAdminPanel(adminUser._id))) {
-      return res.status(403).json({ success: false, message: 'Only admin can update seller balance.' });
-    }
-
-    const { sellerId } = req.params;
-    if (!mongoose.Types.ObjectId.isValid(sellerId)) return res.status(400).json({ success: false, message: 'Invalid seller id.' });
-    const amount = Math.floor(Number(req.body?.amount));
-    const type = req.body?.type === 'deduct' ? 'deduct' : 'add';
-    if (!Number.isFinite(amount) || amount <= 0) return res.status(400).json({ success: false, message: 'Enter a valid amount.' });
-
-    const inc = type === 'deduct' ? -amount : amount;
-    const filter = type === 'deduct'
-      ? { _id: sellerId, coinSellerStatus: { $in: ['approved', 'suspended'] }, sellerBalance: { $gte: amount } }
-      : { _id: sellerId, coinSellerStatus: { $in: ['approved', 'suspended'] } };
-    const seller = await User.findOneAndUpdate(filter, { $inc: { sellerBalance: inc } }, { new: true })
-      .select('name email glixId role coinSellerStatus sellerBalance sellerTotalSold coinSellerRegistration');
-
-    if (!seller) return res.status(400).json({ success: false, message: 'Seller not found or insufficient balance.' });
-    return res.status(200).json({ success: true, seller, message: 'Seller balance updated.' });
-  } catch (error) {
-    return res.status(500).json({ success: false, message: error.message });
-  }
-});
-
-app.get('/admin/coin-seller/transactions', async (req, res) => {
-  try {
-    const adminUser = await requireAuthUser(req, res);
-    if (!adminUser) return;
-    if (!(await canUseAdminPanel(adminUser._id))) {
-      return res.status(403).json({ success: false, message: 'Only admin can view seller transactions.' });
-    }
-
-    const transactions = await CoinSellerTransaction.find({})
-      .populate('sellerId', 'name email glixId')
-      .populate('buyerId', 'name email glixId chang')
-      .sort({ createdAt: -1 })
-      .limit(500)
-      .lean();
-
-    return res.status(200).json({ success: true, transactions });
-  } catch (error) {
-    return res.status(500).json({ success: false, message: error.message });
-  }
-});
-app.post('/admin/access/request', async (req, res) => {
-  try {
-    const authUser = await requireAuthUser(req, res);
-    if (!authUser) return;
-
-    const requestedRole = sanitizeAdminAccessRole(req.body?.requestedRole);
-    const note = sanitizeWithdrawalText(req.body?.note, 300);
-    if (!requestedRole) return res.status(400).json({ success: false, message: 'Select manager or admin access.' });
-
-    const user = await User.findById(authUser._id).select('name email role adminAccessRequest');
-    if (!user) return res.status(404).json({ success: false, message: 'User not found' });
-    if (['admin', 'manager'].includes(user.role || 'user')) {
-      return res.status(400).json({ success: false, message: 'This account already has admin portal access.' });
-    }
-    if (!isAdminAccessEmailAllowed(user.email)) {
-      return res.status(403).json({ success: false, message: 'This email is not allowed to request admin portal access.' });
-    }
-
-    user.adminAccessRequest = {
-      requestedRole,
-      status: 'pending',
-      note,
-      rejectionReason: '',
-      reviewedBy: null,
-      reviewedAt: null,
-      requestedAt: new Date()
-    };
-    await user.save();
-
-    return res.status(200).json({ success: true, message: 'Access request submitted for admin approval.', request: user.adminAccessRequest });
-  } catch (error) {
-    return res.status(500).json({ success: false, message: error.message });
-  }
-});
-
-app.post('/admin/access/register', async (req, res) => {
-  try {
-    const name = sanitizeWithdrawalText(req.body?.name, 80);
-    const normalizedEmail = normalizeAccessEmail(req.body?.email);
-    const password = String(req.body?.password || '');
-    const requestedRole = sanitizeAdminAccessRole(req.body?.requestedRole);
-    const note = sanitizeWithdrawalText(req.body?.note, 300);
-
-    if (!name) return res.status(400).json({ success: false, message: 'Name is required.' });
-    if (!normalizedEmail) return res.status(400).json({ success: false, message: 'Email is required.' });
-    if (!password || password.length < 6) return res.status(400).json({ success: false, message: 'Password must be at least 6 characters.' });
-    if (!requestedRole) return res.status(400).json({ success: false, message: 'Select manager or admin access.' });
-    if (!isAdminAccessEmailAllowed(normalizedEmail)) {
-      return res.status(403).json({ success: false, message: 'This email is not allowed to request admin portal access.' });
-    }
-
-    let user = await User.findOne({ email: normalizedEmail }).select('name email password role adminAccessRequest glixId');
-    if (user) {
-      if (['admin', 'manager'].includes(user.role || 'user')) {
-        return res.status(400).json({ success: false, message: 'This account already has admin portal access. Please sign in.' });
-      }
-      if (user.password) {
-        const passwordMatches = await bcrypt.compare(password, user.password);
-        if (!passwordMatches) return res.status(401).json({ success: false, message: 'This email already exists. Enter the correct password or request from the app profile.' });
-      } else {
-        const salt = await bcrypt.genSalt(10);
-        user.password = await bcrypt.hash(password, salt);
-      }
-      if (!user.glixId) user = await ensureUserPublicId(user);
-      user.name = user.name || name;
-    } else {
-      const salt = await bcrypt.genSalt(10);
-      user = new User({
-        name,
-        email: normalizedEmail,
-        password: await bcrypt.hash(password, salt),
-        glixId: await createUniqueUserPublicId()
-      });
-    }
-
-    user.adminAccessRequest = {
-      requestedRole,
-      status: 'pending',
-      note,
-      rejectionReason: '',
-      reviewedBy: null,
-      reviewedAt: null,
-      requestedAt: new Date()
-    };
-    await user.save();
-
-    return res.status(200).json({ success: true, message: 'Access request submitted. An existing admin must approve it before you can sign in.' });
-  } catch (error) {
-    if (error?.code === 11000) return res.status(409).json({ success: false, message: 'This email is already registered.' });
-    return res.status(500).json({ success: false, message: error.message });
-  }
-});
-
-app.get('/admin/access/requests', async (req, res) => {
-  try {
-    const adminUser = await requireAuthUser(req, res);
-    if (!adminUser) return;
-    if (!(await canUseAdminPanel(adminUser._id))) {
-      return res.status(403).json({ success: false, message: 'Only admin can review access requests.' });
-    }
-
-    const status = ['pending', 'approved', 'rejected', 'all'].includes(req.query.status) ? req.query.status : 'pending';
-    const filter = status === 'all'
-      ? { 'adminAccessRequest.status': { $in: ['pending', 'approved', 'rejected'] } }
-      : { 'adminAccessRequest.status': status };
-    const requests = await User.find(filter)
-      .select('name email profilePic glixId role adminAccessRequest createdAt')
-      .populate('adminAccessRequest.reviewedBy', 'name email glixId')
-      .sort({ 'adminAccessRequest.requestedAt': -1 })
-      .limit(500)
-      .lean();
-
-    return res.status(200).json({ success: true, requests });
-  } catch (error) {
-    return res.status(500).json({ success: false, message: error.message });
-  }
-});
-
-app.patch('/admin/access/requests/:userId', async (req, res) => {
-  try {
-    const adminUser = await requireAuthUser(req, res);
-    if (!adminUser) return;
-    if (!(await canUseAdminPanel(adminUser._id))) {
-      return res.status(403).json({ success: false, message: 'Only admin can review access requests.' });
-    }
-
-    const { userId } = req.params;
-    if (!mongoose.Types.ObjectId.isValid(userId)) return res.status(400).json({ success: false, message: 'Invalid user id.' });
-
-    const status = req.body?.status;
-    if (!['approved', 'rejected'].includes(status)) return res.status(400).json({ success: false, message: 'Select approved or rejected.' });
-
-    const target = await User.findById(userId).select('name email role adminAccessRequest managerPermissions');
-    if (!target) return res.status(404).json({ success: false, message: 'Request user not found.' });
-    if (target.adminAccessRequest?.status !== 'pending') {
-      return res.status(400).json({ success: false, message: 'This access request is not pending.' });
-    }
-
-    const requestedRole = sanitizeAdminAccessRole(req.body?.role) || sanitizeAdminAccessRole(target.adminAccessRequest?.requestedRole);
-    if (!requestedRole) return res.status(400).json({ success: false, message: 'Request role is invalid.' });
-
-    if (status === 'approved') {
-      if (!isAdminAccessEmailAllowed(target.email)) {
-        return res.status(403).json({ success: false, message: 'This email is not in the allowed admin access list.' });
-      }
-      target.role = requestedRole;
-      if (requestedRole === 'manager' && (!target.managerPermissions || !target.managerPermissions.length)) {
-        target.managerPermissions = ['host_review', 'withdrawals'];
-      }
-      target.adminAccessRequest.status = 'approved';
-      target.adminAccessRequest.rejectionReason = '';
-    } else {
-      target.adminAccessRequest.status = 'rejected';
-      target.adminAccessRequest.rejectionReason = sanitizeWithdrawalText(req.body?.reason, 300);
-    }
-
-    target.adminAccessRequest.reviewedBy = adminUser._id;
-    target.adminAccessRequest.reviewedAt = new Date();
-    await target.save();
-
-    return res.status(200).json({ success: true, message: `Access request ${status}.`, user: target });
-  } catch (error) {
-    return res.status(500).json({ success: false, message: error.message });
-  }
-});
-app.post('/host/register', async (req, res) => {
-  try {
-    const {
-      userId,
-      fullName,
-      gender,
-      hostType,
-      agencySelection,
-      agencyCode,
-      phoneCountryCode,
-      phoneNumber,
-      acceptedTerms,
-      verificationImages = {}
-    } = req.body;
-
-    if (!mongoose.Types.ObjectId.isValid(userId)) {
-      return res.status(400).json({ message: 'Valid user is required' });
-    }
-
-    const cleanName = String(fullName || '').trim();
-    const cleanPhone = String(phoneNumber || '').trim();
-    const cleanCountryCode = String(phoneCountryCode || '').trim() || '+92';
-    const cleanAgencyCode = String(agencyCode || '').trim().toUpperCase();
-    const cleanGender = ['Male', 'Female', 'Other'].includes(gender) ? gender : '';
-    const cleanHostType = ['Video Live Host', 'Voice Live Host'].includes(hostType) ? hostType : '';
-    const cleanAgencySelection = ['Official', 'Other Agency'].includes(agencySelection) ? agencySelection : '';
-
-    if (!cleanName) return res.status(400).json({ message: 'Full real name is required' });
-    if (!cleanGender) return res.status(400).json({ message: 'Gender is required' });
-    if (!cleanHostType) return res.status(400).json({ message: 'Host type is required' });
-    if (!cleanAgencySelection) return res.status(400).json({ message: 'Agency selection is required' });
-    if (!cleanPhone) return res.status(400).json({ message: 'Phone number is required' });
-    if (!acceptedTerms) return res.status(400).json({ message: 'Terms acceptance is required' });
-    if (!verificationImages.selfiePhoto) return res.status(400).json({ message: 'Selfie verification photo is required' });
-
-    let agencyId = null;
-    if (cleanAgencySelection === 'Other Agency' && cleanAgencyCode) {
-      const agencyUser = await User.findOne({ role: 'agency', agencyCode: cleanAgencyCode }).select('_id').lean();
-      agencyId = agencyUser?._id || null;
-    }
-
-    const existingUser = await User.findById(userId).select('role').lean();
-    if (!existingUser) return res.status(404).json({ message: 'User not found' });
-
-    const [selfiePhotoUrl] = await Promise.all([
-      uploadHostVerificationImage({ userId, key: 'selfie-photo', image: verificationImages.selfiePhoto })
-    ]);
-
-    const submittedAgencyCode = cleanAgencyCode || (cleanAgencySelection === 'Official' ? 'OFFICIAL' : '');
-    const preservedRole = HOST_REVIEWER_ROLES.includes(existingUser.role) || existingUser.role === 'agency'
-      ? existingUser.role
-      : 'user';
-    const user = await User.findByIdAndUpdate(
-      userId,
-      {
-        $set: {
-          name: cleanName,
-          role: preservedRole,
-          hostStatus: 'pending',
-          hostRejectionReason: '',
-          agencyId,
-          agencyCode: submittedAgencyCode,
-          hostRegistration: {
-            fullName: cleanName,
-            gender: cleanGender,
-            hostType: cleanHostType,
-            agencySelection: cleanAgencySelection,
-            agencyCode: submittedAgencyCode,
-            phoneCountryCode: cleanCountryCode,
-            phoneNumber: cleanPhone,
-            profilePhotoUrl: '',
-            idFrontUrl: '',
-            idBackUrl: '',
-            selfiePhotoUrl,
-            status: 'pending',
-            rejectionReason: '',
-            reviewedBy: null,
-            reviewedAt: null,
-            acceptedTerms: true,
-            registeredAt: new Date()
-          }
-        }
-      },
-      { new: true }
-    ).select(PUBLIC_USER_FIELDS);
-
-    if (!user) return res.status(404).json({ message: 'User not found' });
-
-    return res.status(200).json({
-      message: 'Host registration submitted for verification',
-      user
-    });
-  } catch (error) {
-    return res.status(500).json({ message: error.message });
-  }
-});
-
-app.get('/host/requests', async (req, res) => {
-  try {
-    const reviewer = await requireAuthUser(req, res);
-    if (!reviewer) return;
-    if (!(await canReviewHostRequests(reviewer._id))) {
-      return res.status(403).json({ success: false, message: 'Only admin or manager can review host requests' });
-    }
-
-    const requests = await User.find({ hostStatus: 'pending' })
-      .select('name email profilePic glixId role agencyId agencyCode hostStatus hostRegistration createdAt')
-      .sort({ 'hostRegistration.registeredAt': -1 })
-      .lean();
-
-    return res.status(200).json({ success: true, requests });
-  } catch (error) {
-    return res.status(500).json({ success: false, message: error.message });
-  }
-});
-
-app.patch('/host/requests/:userId', async (req, res) => {
-  try {
-    const reviewer = await requireAuthUser(req, res);
-    if (!reviewer) return;
-    const { status, reason = '' } = req.body;
-    const targetUserId = req.params.userId;
-
-    if (!(await canReviewHostRequests(reviewer._id))) {
-      return res.status(403).json({ success: false, message: 'Only admin or manager can review host requests' });
-    }
-    if (!mongoose.Types.ObjectId.isValid(targetUserId)) {
-      return res.status(400).json({ success: false, message: 'Valid host request user is required' });
-    }
-    if (!['approved', 'rejected'].includes(status)) {
-      return res.status(400).json({ success: false, message: 'Review status must be approved or rejected' });
-    }
-
-    const update = {
-      hostStatus: status,
-      hostRejectionReason: status === 'rejected' ? String(reason || '').trim() : '',
-      'hostRegistration.status': status,
-      'hostRegistration.rejectionReason': status === 'rejected' ? String(reason || '').trim() : '',
-      'hostRegistration.reviewedBy': reviewer._id,
-      'hostRegistration.reviewedAt': new Date()
-    };
-
-    if (status === 'approved') {
-      update.role = 'host';
-    } else {
-      update.role = 'user';
-    }
-
-    const user = await User.findByIdAndUpdate(targetUserId, { $set: update }, { new: true }).select(PUBLIC_USER_FIELDS);
-    if (!user) return res.status(404).json({ success: false, message: 'Host request not found' });
-
-    return res.status(200).json({ success: true, user });
-  } catch (error) {
-    return res.status(500).json({ success: false, message: error.message });
-  }
-});
-
-app.post('/agency/register', async (req, res) => {
-  try {
-    const authUser = await requireAuthUser(req, res);
-    if (!authUser) return;
-
-    const {
-      agencyName,
-      ownerName,
-      agencyCode,
-      phoneCountryCode,
-      phoneNumber,
-      city,
-      expectedHosts,
-      experience,
-      acceptedTerms,
-      verificationImages = {}
-    } = req.body;
-
-    const userId = authUser._id;
-    const cleanAgencyName = String(agencyName || '').trim();
-    const cleanOwnerName = String(ownerName || '').trim();
-    const cleanCode = normalizeAgencyCode(agencyCode);
-    const cleanPhone = String(phoneNumber || '').trim();
-    const cleanCountryCode = String(phoneCountryCode || '').trim() || '+92';
-    const cleanCity = String(city || '').trim();
-    const hostCount = Math.max(0, Math.floor(Number(expectedHosts) || 0));
-    const cleanExperience = String(experience || '').trim().slice(0, 500);
-
-    if (!cleanAgencyName) return res.status(400).json({ success: false, message: 'Agency name is required' });
-    if (!cleanOwnerName) return res.status(400).json({ success: false, message: 'Owner name is required' });
-    if (!cleanCode) return res.status(400).json({ success: false, message: 'Agency code is required' });
-    if (!cleanPhone) return res.status(400).json({ success: false, message: 'Phone number is required' });
-    if (!cleanCity) return res.status(400).json({ success: false, message: 'City is required' });
-    if (!acceptedTerms) return res.status(400).json({ success: false, message: 'Terms acceptance is required' });
-    if (!verificationImages.profilePhoto) return res.status(400).json({ success: false, message: 'Profile photo is required' });
-    if (!verificationImages.idFront) return res.status(400).json({ success: false, message: 'ID front photo is required' });
-    if (!verificationImages.idBack) return res.status(400).json({ success: false, message: 'ID back photo is required' });
-    if (!verificationImages.selfiePhoto) return res.status(400).json({ success: false, message: 'Selfie verification photo is required' });
-
-    const existingCode = await User.findOne({ agencyCode: cleanCode, _id: { $ne: userId } }).select('_id').lean();
-    if (existingCode) return res.status(400).json({ success: false, message: 'Agency code is already used' });
-
-    const [profilePhotoUrl, idFrontUrl, idBackUrl, selfiePhotoUrl] = await Promise.all([
-      uploadHostVerificationImage({ userId, key: 'agency-profile-photo', image: verificationImages.profilePhoto }),
-      uploadHostVerificationImage({ userId, key: 'agency-id-front', image: verificationImages.idFront }),
-      uploadHostVerificationImage({ userId, key: 'agency-id-back', image: verificationImages.idBack }),
-      uploadHostVerificationImage({ userId, key: 'agency-selfie-photo', image: verificationImages.selfiePhoto })
-    ]);
-
-    const user = await User.findByIdAndUpdate(
-      userId,
-      {
-        $set: {
-          agencyStatus: 'pending',
-          agencyRejectionReason: '',
-          agencyRegistration: {
-            agencyName: cleanAgencyName,
-            ownerName: cleanOwnerName,
-            requestedAgencyCode: cleanCode,
-            phoneCountryCode: cleanCountryCode,
-            phoneNumber: cleanPhone,
-            city: cleanCity,
-            expectedHosts: hostCount,
-            experience: cleanExperience,
-            profilePhotoUrl,
-            idFrontUrl,
-            idBackUrl,
-            selfiePhotoUrl,
-            status: 'pending',
-            rejectionReason: '',
-            reviewedBy: null,
-            reviewedAt: null,
-            acceptedTerms: true,
-            registeredAt: new Date()
-          }
-        }
-      },
-      { new: true }
-    ).select(PUBLIC_USER_FIELDS);
-
-    if (!user) return res.status(404).json({ success: false, message: 'User not found' });
-    return res.status(200).json({ success: true, message: 'Agency registration submitted for review', user });
-  } catch (error) {
-    return res.status(500).json({ success: false, message: error.message });
-  }
-});
-
-app.get('/agency/requests', async (req, res) => {
-  try {
-    const admin = await requireAuthUser(req, res);
-    if (!admin) return;
-    if (!(await canUseAdminPanel(admin._id))) {
-      return res.status(403).json({ success: false, message: 'Only admin can review agency requests' });
-    }
-
-    const requests = await User.find({ agencyStatus: 'pending' })
-      .select('name email profilePic glixId role agencyStatus agencyRegistration createdAt')
-      .sort({ 'agencyRegistration.registeredAt': -1 })
-      .lean();
-
-    return res.status(200).json({ success: true, requests });
-  } catch (error) {
-    return res.status(500).json({ success: false, message: error.message });
-  }
-});
-
-app.patch('/agency/requests/:userId', async (req, res) => {
-  try {
-    const admin = await requireAuthUser(req, res);
-    if (!admin) return;
-    const targetUserId = req.params.userId;
-    const { status, reason = '' } = req.body;
-
-    if (!(await canUseAdminPanel(admin._id))) {
-      return res.status(403).json({ success: false, message: 'Only admin can review agency requests' });
-    }
-    if (!mongoose.Types.ObjectId.isValid(targetUserId)) {
-      return res.status(400).json({ success: false, message: 'Valid agency request user is required' });
-    }
-    if (!['approved', 'rejected'].includes(status)) {
-      return res.status(400).json({ success: false, message: 'Review status must be approved or rejected' });
-    }
-
-    const applicant = await User.findById(targetUserId).select('agencyRegistration agencyStatus glixId role');
-    if (!applicant || applicant.agencyStatus !== 'pending') {
-      return res.status(404).json({ success: false, message: 'Agency request not found' });
-    }
-
-    const requestedCode = normalizeAgencyCode(applicant.agencyRegistration?.requestedAgencyCode) || normalizeAgencyCode(applicant.glixId) || `AG${Date.now().toString().slice(-6)}`;
-    const existingCode = await User.findOne({ agencyCode: requestedCode, _id: { $ne: targetUserId } }).select('_id').lean();
-    if (status === 'approved' && existingCode) {
-      return res.status(400).json({ success: false, message: 'Requested agency code is already used' });
-    }
-
-    const update = {
-      agencyStatus: status,
-      agencyRejectionReason: status === 'rejected' ? String(reason || '').trim() : '',
-      'agencyRegistration.status': status,
-      'agencyRegistration.rejectionReason': status === 'rejected' ? String(reason || '').trim() : '',
-      'agencyRegistration.reviewedBy': admin._id,
-      'agencyRegistration.reviewedAt': new Date()
-    };
-
-    if (status === 'approved') {
-      update.role = 'agency';
-      update.agencyCode = requestedCode;
-    }
-
-    const user = await User.findByIdAndUpdate(targetUserId, { $set: update }, { new: true }).select(PUBLIC_USER_FIELDS);
-    if (!user) return res.status(404).json({ success: false, message: 'Agency request not found' });
-
-    const agency = status === 'approved' ? await buildAgencySummary(user.toObject()) : null;
-    return res.status(200).json({ success: true, user, agency });
-  } catch (error) {
-    return res.status(500).json({ success: false, message: error.message });
-  }
-});
-
-app.get('/admin/agencies', async (req, res) => {
-  try {
-    const admin = await requireAuthUser(req, res);
-    if (!admin) return;
-    if (!(await canUseAdminPanel(admin._id))) {
-      return res.status(403).json({ success: false, message: 'Only admin can access agencies' });
-    }
-
-    await settleCompletedMonthlyCommissions();
-
-    const agencies = await User.find({ role: 'agency' })
-      .select('name email profilePic glixId agencyCode commissionBalance totalHostCoins createdAt')
-      .sort({ createdAt: -1 })
-      .lean();
-
-    const rows = await Promise.all(agencies.map(buildAgencySummary));
-    return res.status(200).json({ success: true, agencies: rows });
-  } catch (error) {
-    return res.status(500).json({ success: false, message: error.message });
-  }
-});
-
-app.post('/admin/agencies', async (req, res) => {
-  try {
-    const admin = await requireAuthUser(req, res);
-    if (!admin) return;
-    const { identifier, agencyCode } = req.body;
-    if (!(await canUseAdminPanel(admin._id))) {
-      return res.status(403).json({ success: false, message: 'Only admin can assign agencies' });
-    }
-
-    const cleanIdentifier = String(identifier || '').trim();
-    if (!cleanIdentifier) return res.status(400).json({ success: false, message: 'Email or Glix ID is required' });
-
-    const query = cleanIdentifier.includes('@')
-      ? { email: cleanIdentifier.toLowerCase() }
-      : { glixId: cleanIdentifier };
-
-    const target = await User.findOne(query);
-    if (!target) return res.status(404).json({ success: false, message: 'User not found' });
-    if (target.role === 'admin') return res.status(400).json({ success: false, message: 'Admin account cannot be converted to agency' });
-
-    const cleanCode = normalizeAgencyCode(agencyCode) || normalizeAgencyCode(target.glixId) || `AG${Date.now().toString().slice(-6)}`;
-    const existingCode = await User.findOne({ agencyCode: cleanCode, _id: { $ne: target._id } }).select('_id').lean();
-    if (existingCode) return res.status(400).json({ success: false, message: 'Agency code is already used' });
-
-    target.role = 'agency';
-    target.agencyCode = cleanCode;
-    await target.save();
-
-    const agency = await buildAgencySummary(target.toObject());
-    return res.status(200).json({ success: true, agency });
-  } catch (error) {
-    return res.status(500).json({ success: false, message: error.message });
-  }
-});
-
-app.patch('/admin/agencies/:agencyId', async (req, res) => {
-  try {
-    const admin = await requireAuthUser(req, res);
-    if (!admin) return;
-    const { agencyCode } = req.body;
-    const { agencyId } = req.params;
-    if (!(await canUseAdminPanel(admin._id))) {
-      return res.status(403).json({ success: false, message: 'Only admin can update agencies' });
-    }
-    if (!mongoose.Types.ObjectId.isValid(agencyId)) return res.status(400).json({ success: false, message: 'Invalid agency id' });
-
-    const cleanCode = normalizeAgencyCode(agencyCode);
-    if (!cleanCode) return res.status(400).json({ success: false, message: 'Agency code is required' });
-
-    const existingCode = await User.findOne({ agencyCode: cleanCode, _id: { $ne: agencyId } }).select('_id').lean();
-    if (existingCode) return res.status(400).json({ success: false, message: 'Agency code is already used' });
-
-    const updated = await User.findOneAndUpdate(
-      { _id: agencyId, role: 'agency' },
-      { $set: { agencyCode: cleanCode } },
-      { new: true }
-    ).select('name email profilePic glixId agencyCode commissionBalance totalHostCoins createdAt');
-
-    if (!updated) return res.status(404).json({ success: false, message: 'Agency not found' });
-    const agency = await buildAgencySummary(updated.toObject());
-    return res.status(200).json({ success: true, agency });
-  } catch (error) {
-    return res.status(500).json({ success: false, message: error.message });
-  }
-});
-
-app.get('/admin/agencies/:agencyId/hosts', async (req, res) => {
-  try {
-    const admin = await requireAuthUser(req, res);
-    if (!admin) return;
-    const { agencyId } = req.params;
-    if (!(await canUseAdminPanel(admin._id))) {
-      return res.status(403).json({ success: false, message: 'Only admin can view agency hosts' });
-    }
-    if (!mongoose.Types.ObjectId.isValid(agencyId)) return res.status(400).json({ success: false, message: 'Invalid agency id' });
-
-    const hosts = await User.find({ agencyId })
-      .select('name email profilePic glixId hostStatus daimon totalHostCoins createdAt')
-      .sort({ createdAt: -1 })
-      .lean();
-
-    return res.status(200).json({ success: true, hosts });
-  } catch (error) {
-    return res.status(500).json({ success: false, message: error.message });
-  }
-});
-
-app.get('/admin/monthly-commissions', async (req, res) => {
-  try {
-    const adminUser = await requireAuthUser(req, res);
-    if (!adminUser) return;
-    if (!(await canUseAdminPanel(adminUser._id))) {
-      return res.status(403).json({ success: false, message: 'Only admin can view monthly commissions' });
-    }
-
-    await settleCompletedMonthlyCommissions();
-
-    const status = ['pending', 'settled', 'all'].includes(req.query.status) ? req.query.status : 'all';
-    const month = String(req.query.month || '').trim();
-    const filter = {};
-    if (status !== 'all') filter.status = status;
-    if (/^\d{4}-\d{2}$/.test(month)) filter.month = month;
-
-    const commissions = await MonthlyCommission.find(filter)
-      .populate('beneficiaryId', 'name email glixId agencyCode role commissionBalance')
-      .populate('hostId', 'name email glixId profilePic')
-      .sort({ month: -1, updatedAt: -1 })
-      .limit(1000)
-      .lean();
-
-    const totals = commissions.reduce((acc, row) => {
-      acc.sourceCoins += Number(row.sourceCoins || 0);
-      acc.commissionAmount += Number(row.commissionAmount || 0);
-      return acc;
-    }, { sourceCoins: 0, commissionAmount: 0 });
-
-    return res.status(200).json({ success: true, commissions, totals });
-  } catch (error) {
-    return res.status(500).json({ success: false, message: error.message });
-  }
-});
-app.get('/admin/dashboard', async (req, res) => {
-  try {
-    const reviewer = await requireAuthUser(req, res);
-    if (!reviewer) return;
-    if (!(await canReviewHostRequests(reviewer._id))) {
-      return res.status(403).json({ success: false, message: 'Admin access required' });
-    }
-
-    const since = new Date();
-    since.setDate(since.getDate() - 7);
-
-    const [
-      totalUsers,
-      activeUsersCount,
-      suspendedUsers,
-      pendingHosts,
-      pendingAgencies,
-      pendingWithdrawals,
-      liveAudioRooms,
-      liveVideoRooms,
-      giftSummary
-    ] = await Promise.all([
-      User.countDocuments(),
-      User.countDocuments({ accountStatus: { $ne: 'banned' } }),
-      User.countDocuments({ accountStatus: { $in: ['suspended', 'banned'] } }),
-      User.countDocuments({ hostStatus: 'pending' }),
-      User.countDocuments({ agencyStatus: 'pending' }),
-      Withdrawal.countDocuments({ status: 'pending' }),
-      AudioRoom.countDocuments({ isLive: true }),
-      Room.countDocuments({ isLive: true }),
-      GiftTransaction.aggregate([
-        { $match: { createdAt: { $gte: since } } },
-        {
-          $group: {
-            _id: null,
-            totalCoins: { $sum: '$totalCost' },
-            totalGifts: { $sum: '$quantity' },
-            totalTransactions: { $sum: 1 }
-          }
-        }
-      ])
-    ]);
-
-    return res.status(200).json({
-      success: true,
-      stats: {
-        totalUsers,
-        activeUsers: activeUsersCount,
-        suspendedUsers,
-        pendingHosts,
-        pendingAgencies,
-        pendingWithdrawals,
-        liveRooms: liveAudioRooms + liveVideoRooms,
-        liveAudioRooms,
-        liveVideoRooms,
-        weeklyGiftCoins: giftSummary[0]?.totalCoins || 0,
-        weeklyGiftCount: giftSummary[0]?.totalGifts || 0,
-        weeklyGiftTransactions: giftSummary[0]?.totalTransactions || 0
-      }
-    });
-  } catch (error) {
-    return res.status(500).json({ success: false, message: error.message });
-  }
-});
-
-app.get('/admin/users', async (req, res) => {
-  try {
-    const admin = await requireAuthUser(req, res);
-    if (!admin) return;
-    if (!(await canUseAdminPanel(admin._id))) {
-      return res.status(403).json({ success: false, message: 'Only admin can view users' });
-    }
-
-    const page = Math.max(parseInt(req.query.page, 10) || 1, 1);
-    const limit = Math.min(Math.max(parseInt(req.query.limit, 10) || 25, 1), 100);
-    const search = String(req.query.search || '').trim();
-    const role = String(req.query.role || '').trim();
-    const accountStatus = String(req.query.accountStatus || '').trim();
-
-    const filter = {};
-    if (role && role !== 'all') filter.role = role;
-    if (accountStatus && accountStatus !== 'all') filter.accountStatus = accountStatus;
-    if (search) {
-      const regex = new RegExp(search.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'i');
-      filter.$or = [
-        { name: regex },
-        { email: regex },
-        { glixId: regex },
-        ...(mongoose.Types.ObjectId.isValid(search) ? [{ _id: search }] : [])
-      ];
-    }
-
-    const [users, total] = await Promise.all([
-      User.find(filter)
-        .select('name email profilePic glixId role hostStatus agencyStatus accountStatus adminNote chang daimon followersCount followingCount createdAt lastLogin')
-        .sort({ createdAt: -1 })
-        .skip((page - 1) * limit)
-        .limit(limit)
-        .lean(),
-      User.countDocuments(filter)
-    ]);
-
-    return res.status(200).json({ success: true, users, page, limit, total, pages: Math.ceil(total / limit) });
-  } catch (error) {
-    return res.status(500).json({ success: false, message: error.message });
-  }
-});
-
-app.patch('/admin/users/:userId', async (req, res) => {
-  try {
-    const admin = await requireAuthUser(req, res);
-    if (!admin) return;
-    if (!(await canUseAdminPanel(admin._id))) {
-      return res.status(403).json({ success: false, message: 'Only admin can update users' });
-    }
-
-    const { userId } = req.params;
-    if (!mongoose.Types.ObjectId.isValid(userId)) {
-      return res.status(400).json({ success: false, message: 'Invalid user id' });
-    }
-
-    const allowedRoles = ['user', 'host', 'agency', 'manager', 'admin', 'coin_seller'];
-    const allowedHostStatuses = ['none', 'pending', 'approved', 'rejected'];
-    const allowedAgencyStatuses = ['none', 'pending', 'approved', 'rejected'];
-    const allowedAccountStatuses = ['active', 'suspended', 'banned'];
-    const update = {};
-
-    if (req.body.role !== undefined && allowedRoles.includes(req.body.role)) update.role = req.body.role;
-    if (req.body.hostStatus !== undefined && allowedHostStatuses.includes(req.body.hostStatus)) update.hostStatus = req.body.hostStatus;
-    if (req.body.agencyStatus !== undefined && allowedAgencyStatuses.includes(req.body.agencyStatus)) update.agencyStatus = req.body.agencyStatus;
-    if (req.body.accountStatus !== undefined && allowedAccountStatuses.includes(req.body.accountStatus)) update.accountStatus = req.body.accountStatus;
-    if (req.body.adminNote !== undefined) update.adminNote = sanitizeWithdrawalText(req.body.adminNote, 300);
-    if (req.body.chang !== undefined) update.chang = Math.max(0, Number(req.body.chang) || 0);
-    if (req.body.daimon !== undefined) update.daimon = Math.max(0, Number(req.body.daimon) || 0);
-
-    const user = await User.findByIdAndUpdate(userId, { $set: update }, { new: true })
-      .select('name email profilePic glixId role hostStatus agencyStatus accountStatus adminNote chang daimon followersCount followingCount createdAt lastLogin')
-      .lean();
-
-    if (!user) return res.status(404).json({ success: false, message: 'User not found' });
-    return res.status(200).json({ success: true, user });
-  } catch (error) {
-    return res.status(500).json({ success: false, message: error.message });
-  }
-});
-
-app.get('/admin/store/items', async (req, res) => {
-  try {
-    const admin = await requireAuthUser(req, res);
-    if (!admin) return;
-    if (!(await canUseAdminPanel(admin._id))) {
-      return res.status(403).json({ success: false, message: 'Only admin can manage store items' });
-    }
-
-    await ensureDefaultStoreItems();
-    const items = await StoreItem.find({}).sort({ category: 1, section: 1, sortOrder: 1, createdAt: -1 }).lean();
-    return res.status(200).json({ success: true, items });
-  } catch (error) {
-    return res.status(500).json({ success: false, message: error.message });
-  }
-});
-
-app.post('/admin/store/items', async (req, res) => {
-  try {
-    const admin = await requireAuthUser(req, res);
-    if (!admin) return;
-    if (!(await canUseAdminPanel(admin._id))) {
-      return res.status(403).json({ success: false, message: 'Only admin can manage store items' });
-    }
-
-    const item = await StoreItem.create(sanitizeStoreItemPayload(req.body));
-    return res.status(201).json({ success: true, item });
-  } catch (error) {
-    return res.status(500).json({ success: false, message: error.message });
-  }
-});
-
-app.patch('/admin/store/items/:itemId', async (req, res) => {
-  try {
-    const admin = await requireAuthUser(req, res);
-    if (!admin) return;
-    if (!(await canUseAdminPanel(admin._id))) {
-      return res.status(403).json({ success: false, message: 'Only admin can manage store items' });
-    }
-
-    const { itemId } = req.params;
-    if (!mongoose.Types.ObjectId.isValid(itemId)) {
-      return res.status(400).json({ success: false, message: 'Invalid store item id' });
-    }
-
-    const item = await StoreItem.findByIdAndUpdate(itemId, { $set: sanitizeStoreItemPayload(req.body) }, { new: true }).lean();
-    if (!item) return res.status(404).json({ success: false, message: 'Store item not found' });
-    return res.status(200).json({ success: true, item });
-  } catch (error) {
-    return res.status(500).json({ success: false, message: error.message });
-  }
-});
-
-app.delete('/admin/store/items/:itemId', async (req, res) => {
-  try {
-    const admin = await requireAuthUser(req, res);
-    if (!admin) return;
-    if (!(await canUseAdminPanel(admin._id))) {
-      return res.status(403).json({ success: false, message: 'Only admin can manage store items' });
-    }
-
-    const { itemId } = req.params;
-    if (!mongoose.Types.ObjectId.isValid(itemId)) {
-      return res.status(400).json({ success: false, message: 'Invalid store item id' });
-    }
-
-    const item = await StoreItem.findByIdAndUpdate(itemId, { $set: { isActive: false } }, { new: true }).lean();
-    if (!item) return res.status(404).json({ success: false, message: 'Store item not found' });
-    return res.status(200).json({ success: true, item });
-  } catch (error) {
-    return res.status(500).json({ success: false, message: error.message });
-  }
-});
-
-app.post('/admin/notifications/send', async (req, res) => {
-  try {
-    const admin = await requireAuthUser(req, res);
-    if (!admin) return;
-    if (!(await canUseAdminPanel(admin._id))) {
-      return res.status(403).json({ success: false, message: 'Only admin can send notifications' });
-    }
-
-    const title = sanitizeWithdrawalText(req.body.title, 80) || 'Glix Live';
-    const body = sanitizeWithdrawalText(req.body.body, 180);
-    const target = req.body.target || 'all';
-    const userIds = Array.isArray(req.body.userIds) ? req.body.userIds.filter(mongoose.Types.ObjectId.isValid) : [];
-
-    if (!body) return res.status(400).json({ success: false, message: 'Notification body is required' });
-
-    const filter = target === 'selected' && userIds.length
-      ? { _id: { $in: userIds } }
-      : target === 'hosts'
-        ? { role: 'host', hostStatus: 'approved' }
-        : {};
-
-    const users = await User.find(filter).select('_id').limit(2000).lean();
-    const results = await Promise.all(users.map(user => sendPushNotification({
-      userId: user._id,
-      title,
-      body,
-      data: { type: 'admin_broadcast' }
-    })));
-
-    const summary = results.reduce((acc, result) => {
-      const item = result || {};
-      acc.successCount += Number(item.successCount || 0);
-      acc.failureCount += Number(item.failureCount || 0);
-      acc.tokenCount += Number(item.tokenCount || 0);
-      acc.invalidTokenCount += Number(item.invalidTokenCount || 0);
-      if (item.skipped) {
-        acc.skippedUsers += 1;
-        const reason = item.reason || 'unknown';
-        acc.skippedReasons[reason] = (acc.skippedReasons[reason] || 0) + 1;
-      }
-      return acc;
-    }, {
-      successCount: 0,
-      failureCount: 0,
-      tokenCount: 0,
-      invalidTokenCount: 0,
-      skippedUsers: 0,
-      skippedReasons: {},
-    });
-
-    return res.status(200).json({
-      success: true,
-      matchedUsers: users.length,
-      sentTo: summary.successCount,
-      ...summary,
-    });
-  } catch (error) {
-    return res.status(500).json({ success: false, message: error.message });
-  }
-});
-
-app.post('/withdrawals', async (req, res) => {
-  const session = await mongoose.startSession();
-  session.startTransaction();
-
-  try {
-    const authUser = await requireAuthUser(req, res);
-    if (!authUser) {
-      await session.abortTransaction();
-      return;
-    }
-    const userId = authUser._id;
-    await settleCompletedMonthlyCommissions(session);
-    const { amount, method, accountTitle, accountNumber, note = '' } = req.body;
-    const numericAmount = Math.floor(Number(amount));
-
-    if (!Number.isFinite(numericAmount) || numericAmount < MIN_WITHDRAW_AMOUNT) {
-      await session.abortTransaction();
-      return res.status(400).json({ success: false, message: `Minimum withdrawal is ${MIN_WITHDRAW_AMOUNT}` });
-    }
-    if (!WITHDRAW_METHODS.includes(method)) {
-      await session.abortTransaction();
-      return res.status(400).json({ success: false, message: 'Select a valid withdrawal method' });
-    }
-
-    const cleanAccountTitle = sanitizeWithdrawalText(accountTitle, 70);
-    const cleanAccountNumber = sanitizeWithdrawalText(accountNumber, 50);
-    if (!cleanAccountTitle || !cleanAccountNumber) {
-      await session.abortTransaction();
-      return res.status(400).json({ success: false, message: 'Account title and number are required' });
-    }
-
-    const user = await User.findById(userId).select('role hostStatus daimon chang commissionBalance revenueBalance').session(session);
-    if (!user) {
-      await session.abortTransaction();
-      return res.status(404).json({ success: false, message: 'User not found' });
-    }
-
-    const source = getWithdrawSourceForRole(user.role);
-    if (!source) {
-      await session.abortTransaction();
-      return res.status(403).json({ success: false, message: 'Your account is not eligible for withdrawals' });
-    }
-    if (user.role === 'host' && user.hostStatus !== 'approved') {
-      await session.abortTransaction();
-      return res.status(403).json({ success: false, message: 'Host must be approved before withdrawal' });
-    }
-
-    const updatedUser = await User.findOneAndUpdate(
-      { _id: userId, [source]: { $gte: numericAmount } },
-      { $inc: { [source]: -numericAmount } },
-      { new: true, session }
-    ).select('daimon chang commissionBalance revenueBalance');
-
-    if (!updatedUser) {
-      await session.abortTransaction();
-      return res.status(400).json({ success: false, message: 'Insufficient withdrawable balance' });
-    }
-
-    const [withdrawal] = await Withdrawal.create([{
-      userId,
-      amount: numericAmount,
-      source,
-      method,
-      accountTitle: cleanAccountTitle,
-      accountNumber: cleanAccountNumber,
-      note: sanitizeWithdrawalText(note, 180),
-      status: 'pending'
-    }], { session });
-
-    await session.commitTransaction();
-    return res.status(201).json({
-      success: true,
-      message: 'Withdrawal request submitted',
-      withdrawal,
-      wallet: buildWalletSnapshot(updatedUser)
-    });
-  } catch (error) {
-    await session.abortTransaction();
-    return res.status(500).json({ success: false, message: error.message });
-  } finally {
-    session.endSession();
-  }
-});
-
-app.get('/withdrawals/my/:userId', async (req, res) => {
-  try {
-    const authUser = await requireAuthUser(req, res);
-    if (!authUser) return;
-    const userId = authUser._id;
-
-    const withdrawals = await Withdrawal.find({ userId })
-      .sort({ createdAt: -1 })
-      .limit(30)
-      .lean();
-
-    return res.status(200).json({ success: true, withdrawals });
-  } catch (error) {
-    return res.status(500).json({ success: false, message: error.message });
-  }
-});
-
-app.get('/admin/withdrawals', async (req, res) => {
-  try {
-    const reviewer = await requireAuthUser(req, res);
-    if (!reviewer) return;
-    const status = req.query.status || 'pending';
-
-    if (!(await canReviewHostRequests(reviewer._id))) {
-      return res.status(403).json({ success: false, message: 'Only admin or manager can review withdrawals' });
-    }
-
-    const filter = ['pending', 'approved', 'rejected'].includes(status) ? { status } : {};
-    const withdrawals = await Withdrawal.find(filter)
-      .populate('userId', 'name profilePic glixId role')
-      .sort({ createdAt: -1 })
-      .limit(80)
-      .lean();
-
-    return res.status(200).json({ success: true, withdrawals });
-  } catch (error) {
-    return res.status(500).json({ success: false, message: error.message });
-  }
-});
-
-app.patch('/admin/withdrawals/:withdrawalId', async (req, res) => {
-  const session = await mongoose.startSession();
-  session.startTransaction();
-
-  try {
-    const reviewer = await requireAuthUser(req, res);
-    if (!reviewer) {
-      await session.abortTransaction();
-      return;
-    }
-    const { withdrawalId } = req.params;
-    const { status, reviewNote = '', transactionRef = '' } = req.body;
-
-    if (!mongoose.Types.ObjectId.isValid(withdrawalId)) {
-      await session.abortTransaction();
-      return res.status(400).json({ success: false, message: 'Invalid withdrawal id' });
-    }
-    if (!(await canReviewHostRequests(reviewer._id))) {
-      await session.abortTransaction();
-      return res.status(403).json({ success: false, message: 'Only admin or manager can review withdrawals' });
-    }
-    if (!['approved', 'rejected'].includes(status)) {
-      await session.abortTransaction();
-      return res.status(400).json({ success: false, message: 'Review status must be approved or rejected' });
-    }
-
-    const withdrawal = await Withdrawal.findById(withdrawalId).session(session);
-    if (!withdrawal) {
-      await session.abortTransaction();
-      return res.status(404).json({ success: false, message: 'Withdrawal not found' });
-    }
-    if (withdrawal.status !== 'pending') {
-      await session.abortTransaction();
-      return res.status(400).json({ success: false, message: 'Withdrawal is already reviewed' });
-    }
-
-    withdrawal.status = status;
-    withdrawal.reviewerId = reviewer._id;
-    withdrawal.reviewNote = sanitizeWithdrawalText(reviewNote, 180);
-    withdrawal.transactionRef = status === 'approved' ? sanitizeWithdrawalText(transactionRef, 80) : '';
-    withdrawal.reviewedAt = new Date();
-
-    if (status === 'rejected') {
-      await User.findByIdAndUpdate(
-        withdrawal.userId,
-        { $inc: { [withdrawal.source]: withdrawal.amount } },
-        { session }
-      );
-    }
-
-    await withdrawal.save({ session });
-    await session.commitTransaction();
-
-    const reviewed = await Withdrawal.findById(withdrawal._id)
-      .populate('userId', 'name profilePic glixId role')
-      .lean();
-
-    return res.status(200).json({ success: true, withdrawal: reviewed });
-  } catch (error) {
-    await session.abortTransaction();
-    return res.status(500).json({ success: false, message: error.message });
-  } finally {
-    session.endSession();
   }
 });
 
@@ -4755,10 +1628,8 @@ app.post('/register', async (req, res) => {
       if (!user.glixId) {
         user = await ensureUserPublicId(user);
       }
-      const token = await signAuthToken(user);
       return res.status(200).json({
         message: 'Login successful!',
-        token,
         user: { id: user._id, name: user.name, email: user.email, glixId: user.glixId }
       });
     }
@@ -4774,10 +1645,8 @@ app.post('/register', async (req, res) => {
       glixId: await createUniqueUserPublicId()
     });
     await newUser.save();
-    const token = await signAuthToken(newUser);
     return res.status(201).json({
       message: 'Registered!',
-      token,
       user: { id: newUser._id, name: newUser.name, email: newUser.email, glixId: newUser.glixId }
     });
   } catch (error) {
@@ -4785,195 +1654,26 @@ app.post('/register', async (req, res) => {
   }
 });
 
-app.post('/login', async (req, res) => {
-  try {
-    const { email, password } = req.body;
-    const normalizedEmail = email?.toLowerCase().trim();
-
-    if (!normalizedEmail) return res.status(400).json({ message: 'Email is required' });
-    if (!password) return res.status(400).json({ message: 'Password is required' });
-
-    let user = await User.findOne({ email: normalizedEmail });
-    if (!user || !user.password) {
-      return res.status(401).json({ message: 'Invalid email or password' });
-    }
-
-    const passwordMatches = await bcrypt.compare(password, user.password);
-    if (!passwordMatches) {
-      return res.status(401).json({ message: 'Invalid email or password' });
-    }
-
-    if (!user.glixId) {
-      user = await ensureUserPublicId(user);
-    }
-
-    user.lastLogin = new Date();
-    await user.save();
-
-    const token = await signAuthToken(user);
-    return res.status(200).json({
-      success: true,
-      message: 'Login successful!',
-      token,
-      user: {
-        id: user._id,
-        name: user.name,
-        email: user.email,
-        glixId: user.glixId,
-        profilePic: user.profilePic || '',
-        role: user.role || 'user',
-        hostStatus: user.hostStatus || 'none'
-      }
-    });
-  } catch (error) {
-    return res.status(500).json({ message: error.message });
-  }
-});
-app.post('/auth/forgot-password', async (req, res) => {
-  try {
-    const normalizedEmail = req.body?.email?.toLowerCase().trim();
-    if (!normalizedEmail) return res.status(400).json({ success: false, message: 'Email is required' });
-
-    const user = await User.findOne({ email: normalizedEmail }).select('name email role');
-
-    if (user) {
-      const otp = createPasswordResetOtp();
-      user.passwordResetOtpHash = hashPasswordResetOtp(normalizedEmail, otp);
-      user.passwordResetOtpExpiresAt = new Date(Date.now() + PASSWORD_RESET_OTP_TTL_MS);
-      user.passwordResetOtpRequestedAt = new Date();
-      user.passwordResetOtpAttempts = 0;
-      await user.save();
-
-      await sendPasswordResetOtpEmail({ email: normalizedEmail, name: user.name, otp });
-
-      if (String(process.env.ALLOW_DEV_OTP_RESPONSE || '').toLowerCase() === 'true') {
-        return res.status(200).json({ success: true, message: 'OTP sent to your email.', devOtp: otp });
-      }
-    }
-
-    return res.status(200).json({ success: true, message: 'If this account exists, an OTP has been sent.' });
-  } catch (error) {
-    return res.status(error.statusCode || 500).json({ success: false, message: error.message });
-  }
-});
-
-app.post('/auth/reset-password', async (req, res) => {
-  try {
-    const normalizedEmail = req.body?.email?.toLowerCase().trim();
-    const otp = String(req.body?.otp || '').trim();
-    const newPassword = String(req.body?.newPassword || '');
-
-    if (!normalizedEmail) return res.status(400).json({ success: false, message: 'Email is required' });
-    if (!/^\d{6}$/.test(otp)) return res.status(400).json({ success: false, message: 'Enter the 6 digit OTP' });
-    if (newPassword.length < 6) return res.status(400).json({ success: false, message: 'New password must be at least 6 characters' });
-
-    const user = await User.findOne({ email: normalizedEmail }).select('email passwordResetOtpHash passwordResetOtpExpiresAt passwordResetOtpAttempts password');
-    if (!user) {
-      return res.status(400).json({ success: false, message: 'Invalid or expired OTP' });
-    }
-
-    const isExpired = !user.passwordResetOtpExpiresAt || user.passwordResetOtpExpiresAt.getTime() < Date.now();
-    const tooManyAttempts = Number(user.passwordResetOtpAttempts || 0) >= PASSWORD_RESET_MAX_ATTEMPTS;
-    const incomingHash = hashPasswordResetOtp(normalizedEmail, otp);
-
-    if (isExpired || tooManyAttempts || !user.passwordResetOtpHash || user.passwordResetOtpHash !== incomingHash) {
-      user.passwordResetOtpAttempts = Number(user.passwordResetOtpAttempts || 0) + 1;
-      await user.save();
-      return res.status(400).json({ success: false, message: 'Invalid or expired OTP' });
-    }
-
-    const salt = await bcrypt.genSalt(10);
-    user.password = await bcrypt.hash(newPassword, salt);
-    user.passwordResetOtpHash = '';
-    user.passwordResetOtpExpiresAt = null;
-    user.passwordResetOtpRequestedAt = null;
-    user.passwordResetOtpAttempts = 0;
-    await user.save();
-
-    return res.status(200).json({ success: true, message: 'Password reset successful. You can sign in now.' });
-  } catch (error) {
-    return res.status(500).json({ success: false, message: error.message });
-  }
-});
-app.post('/admin/auth/forgot-password', async (req, res) => {
-  try {
-    const normalizedEmail = req.body?.email?.toLowerCase().trim();
-    if (!normalizedEmail) return res.status(400).json({ success: false, message: 'Email is required' });
-
-    const user = await User.findOne({ email: normalizedEmail }).select('name email role');
-    const canResetAdminPassword = user && ['admin', 'manager'].includes(user.role || 'user');
-
-    if (canResetAdminPassword) {
-      const otp = createPasswordResetOtp();
-      user.passwordResetOtpHash = hashPasswordResetOtp(normalizedEmail, otp);
-      user.passwordResetOtpExpiresAt = new Date(Date.now() + PASSWORD_RESET_OTP_TTL_MS);
-      user.passwordResetOtpRequestedAt = new Date();
-      user.passwordResetOtpAttempts = 0;
-      await user.save();
-
-      await sendPasswordResetOtpEmail({ email: normalizedEmail, name: user.name, otp });
-
-      if (String(process.env.ALLOW_DEV_OTP_RESPONSE || '').toLowerCase() === 'true') {
-        return res.status(200).json({ success: true, message: 'OTP sent to your email.', devOtp: otp });
-      }
-    }
-
-    return res.status(200).json({ success: true, message: 'If this admin account exists, an OTP has been sent.' });
-  } catch (error) {
-    return res.status(error.statusCode || 500).json({ success: false, message: error.message });
-  }
-});
-
-app.post('/admin/auth/reset-password', async (req, res) => {
-  try {
-    const normalizedEmail = req.body?.email?.toLowerCase().trim();
-    const otp = String(req.body?.otp || '').trim();
-    const newPassword = String(req.body?.newPassword || '');
-
-    if (!normalizedEmail) return res.status(400).json({ success: false, message: 'Email is required' });
-    if (!/^\d{6}$/.test(otp)) return res.status(400).json({ success: false, message: 'Enter the 6 digit OTP' });
-    if (newPassword.length < 6) return res.status(400).json({ success: false, message: 'New password must be at least 6 characters' });
-
-    const user = await User.findOne({ email: normalizedEmail }).select('email role passwordResetOtpHash passwordResetOtpExpiresAt passwordResetOtpAttempts password');
-    if (!user || !['admin', 'manager'].includes(user.role || 'user')) {
-      return res.status(400).json({ success: false, message: 'Invalid or expired OTP' });
-    }
-
-    const isExpired = !user.passwordResetOtpExpiresAt || user.passwordResetOtpExpiresAt.getTime() < Date.now();
-    const tooManyAttempts = Number(user.passwordResetOtpAttempts || 0) >= PASSWORD_RESET_MAX_ATTEMPTS;
-    const incomingHash = hashPasswordResetOtp(normalizedEmail, otp);
-
-    if (isExpired || tooManyAttempts || !user.passwordResetOtpHash || user.passwordResetOtpHash !== incomingHash) {
-      user.passwordResetOtpAttempts = Number(user.passwordResetOtpAttempts || 0) + 1;
-      await user.save();
-      return res.status(400).json({ success: false, message: 'Invalid or expired OTP' });
-    }
-
-    const salt = await bcrypt.genSalt(10);
-    user.password = await bcrypt.hash(newPassword, salt);
-    user.passwordResetOtpHash = '';
-    user.passwordResetOtpExpiresAt = null;
-    user.passwordResetOtpRequestedAt = null;
-    user.passwordResetOtpAttempts = 0;
-    await user.save();
-
-    return res.status(200).json({ success: true, message: 'Password reset successful. You can sign in now.' });
-  } catch (error) {
-    return res.status(500).json({ success: false, message: error.message });
-  }
-});
 
 
-
-const getRankPeriodMatch = (period) => {
-  const rangeInDays = { day: 1, week: 7, month: 30 }[period];
-  if (!rangeInDays) return null;
+const getCurrentWeekPeriodMatch = (period) => {
+  if (!['weekday', 'weekend'].includes(period)) return null;
 
   const now = new Date();
-  const start = new Date(now);
-  start.setDate(now.getDate() - rangeInDays);
+  const day = now.getDay();
+  const monday = new Date(now);
+  monday.setDate(now.getDate() - ((day + 6) % 7));
+  monday.setHours(0, 0, 0, 0);
 
-  return { createdAt: { $gte: start, $lt: now } };
+  const friday = new Date(monday);
+  friday.setDate(monday.getDate() + 4);
+
+  const nextMonday = new Date(monday);
+  nextMonday.setDate(monday.getDate() + 7);
+
+  return period === 'weekday'
+    ? { createdAt: { $gte: monday, $lt: friday } }
+    : { createdAt: { $gte: friday, $lt: nextMonday } };
 };
 
 const getUserRankRows = async ({ sortField, limit }) => {
@@ -4994,7 +1694,7 @@ const getUserRankRows = async ({ sortField, limit }) => {
 };
 
 const getGiftRankRows = async ({ groupField, limit, period }) => {
-  const periodMatch = getRankPeriodMatch(period);
+  const periodMatch = getCurrentWeekPeriodMatch(period);
   const pipeline = [];
   if (periodMatch) pipeline.push({ $match: periodMatch });
 
@@ -5037,7 +1737,7 @@ const getGiftRankRows = async ({ groupField, limit, period }) => {
 };
 
 const getActivityRankRows = async ({ types, limit, period }) => {
-  const periodMatch = getRankPeriodMatch(period);
+  const periodMatch = getCurrentWeekPeriodMatch(period);
   const match = { type: { $in: types } };
   if (periodMatch) Object.assign(match, periodMatch);
 
@@ -5136,7 +1836,7 @@ app.post('/store/purchase', async (req, res) => {
     }
 
     const existing = await UserStoreItem.findOne({ userId, itemKey: item.itemKey }).session(session);
-    if (existing && item.type !== 'vip' && (!existing.expiresAt || existing.expiresAt > new Date())) {
+    if (existing && (!existing.expiresAt || existing.expiresAt > new Date())) {
       await session.abortTransaction();
       return res.status(400).json({ success: false, message: 'Item already owned' });
     }
@@ -5149,14 +1849,7 @@ app.post('/store/purchase', async (req, res) => {
 
     if (!user) throw new Error('Insufficient coins');
 
-    let expiresAt = getStoreExpiry(item);
-    if (item.type === 'vip' && existing?.expiresAt && existing.expiresAt > new Date()) {
-      const durationDays = getStoreDurationDays(item);
-      if (durationDays && durationDays > 0) {
-        expiresAt = new Date(existing.expiresAt);
-        expiresAt.setDate(expiresAt.getDate() + durationDays);
-      }
-    }
+    const expiresAt = getStoreExpiry(item);
     await UserStoreItem.findOneAndUpdate(
       { userId, itemKey: item.itemKey },
       {
@@ -5228,7 +1921,7 @@ app.post('/store/equip', async (req, res) => {
 app.get('/rank/:type', async (req, res) => {
   try {
     const type = (req.params.type || 'host').toLowerCase();
-    const period = (req.query.period || 'day').toLowerCase();
+    const period = (req.query.period || 'weekend').toLowerCase();
     const limit = Math.min(parseInt(req.query.limit, 10) || 20, 100);
 
     const rankConfig = {
@@ -5296,9 +1989,6 @@ app.post('/rewards/claim', async (req, res) => {
     const task = REWARD_TASKS.find(item => item.key === taskKey);
     if (!task) return res.status(404).json({ success: false, message: 'Reward task not found' });
     if (!mongoose.Types.ObjectId.isValid(userId)) return res.status(400).json({ success: false, message: 'Invalid user id' });
-    if (!(await canClaimRewards(userId))) {
-      return res.status(403).json({ success: false, message: 'Only approved hosts can claim rewards' });
-    }
 
     const now = new Date();
     const { start, end, dayKey } = getRewardDayRange(now);
@@ -5364,7 +2054,7 @@ app.post('/rewards/claim', async (req, res) => {
   }
 });
 
-const PUBLIC_USER_FIELDS = 'name email profilePic gender age birthday countryRegion voiceSignature signature albumPhotos glixId googleId createdAt lastLogin followersCount followingCount daimon chang frameUrl entryVideoUrl settings blacklistedUsers role agencyId agencyCode managerPermissions commissionBalance revenueBalance totalHostCoins hostStatus hostRejectionReason hostRegistration agencyStatus agencyRejectionReason agencyRegistration adminAccessRequest sellerBalance sellerTotalSold coinSellerStatus coinSellerRejectionReason coinSellerRegistration';
+const PUBLIC_USER_FIELDS = 'name email profilePic glixId googleId createdAt lastLogin followersCount followingCount daimon chang frameUrl entryVideoUrl settings blacklistedUsers';
 
 const sanitizeUserSettings = (settings = {}) => {
   const allowedMessagesFrom = ['everyone', 'following', 'none'];
@@ -5408,12 +2098,6 @@ app.get('/settings/:userId', async (req, res) => {
     const hasPassword = Boolean(user.password);
     delete user.password;
 
-    const vip = await getUserVipStatus(userId);
-    user.isVip = vip.isVip;
-    user.vipExpiresAt = vip.vipExpiresAt;
-    user.vipItemKey = vip.vipItemKey;
-    user.vipBadgeUrl = vip.vipBadgeUrl;
-
     return res.status(200).json({
       success: true,
       user,
@@ -5453,155 +2137,6 @@ app.patch('/settings/:userId', async (req, res) => {
 
     if (!user) return res.status(404).json({ success: false, message: 'User not found' });
     return res.status(200).json({ success: true, settings: user.settings, user });
-  } catch (error) {
-    return res.status(500).json({ success: false, message: error.message });
-  }
-});
-
-app.post('/settings/:userId/profile-picture', async (req, res) => {
-  try {
-    const { userId } = req.params;
-    const { image } = req.body;
-    if (!mongoose.Types.ObjectId.isValid(userId)) return res.status(400).json({ success: false, message: 'Invalid user id' });
-    if (!image?.base64) return res.status(400).json({ success: false, message: 'Profile picture is required' });
-
-    const profilePic = await uploadHostVerificationImage({
-      userId,
-      key: 'profile-picture',
-      image
-    });
-
-    const user = await User.findByIdAndUpdate(
-      userId,
-      { $set: { profilePic } },
-      { new: true }
-    ).select(PUBLIC_USER_FIELDS);
-
-    if (!user) return res.status(404).json({ success: false, message: 'User not found' });
-    return res.status(200).json({ success: true, profilePic, user });
-  } catch (error) {
-    return res.status(500).json({ success: false, message: error.message });
-  }
-});
-
-app.post('/settings/:userId/profile-name', async (req, res) => {
-  try {
-    const { userId } = req.params;
-    const cleanName = typeof req.body?.name === 'string' ? req.body.name.trim() : '';
-
-    if (!mongoose.Types.ObjectId.isValid(userId)) return res.status(400).json({ success: false, message: 'Invalid user id' });
-    if (cleanName.length < 2) return res.status(400).json({ success: false, message: 'Name must be at least 2 characters' });
-    if (cleanName.length > 40) return res.status(400).json({ success: false, message: 'Name must be 40 characters or less' });
-
-    const user = await User.findByIdAndUpdate(
-      userId,
-      { $set: { name: cleanName } },
-      { new: true }
-    ).select(PUBLIC_USER_FIELDS);
-
-    if (!user) return res.status(404).json({ success: false, message: 'User not found' });
-    return res.status(200).json({ success: true, name: user.name, user });
-  } catch (error) {
-    return res.status(500).json({ success: false, message: error.message });
-  }
-});
-
-app.post('/settings/:userId/profile-info', async (req, res) => {
-  try {
-    const { userId } = req.params;
-    const allowedGenders = ['Male', 'Female', 'Other', ''];
-
-    if (!mongoose.Types.ObjectId.isValid(userId)) return res.status(400).json({ success: false, message: 'Invalid user id' });
-
-    const update = {};
-
-    if (Object.prototype.hasOwnProperty.call(req.body || {}, 'gender')) {
-      const gender = typeof req.body.gender === 'string' ? req.body.gender.trim() : '';
-      if (!allowedGenders.includes(gender)) return res.status(400).json({ success: false, message: 'Invalid gender' });
-      update.gender = gender;
-    }
-
-    if (Object.prototype.hasOwnProperty.call(req.body || {}, 'birthday')) {
-      const birthday = req.body.birthday || '';
-      if (birthday && !/^\d{4}-\d{2}-\d{2}$/.test(birthday)) {
-        return res.status(400).json({ success: false, message: 'Birthday must use YYYY-MM-DD format' });
-      }
-      update.birthday = birthday;
-    }
-
-    if (Object.prototype.hasOwnProperty.call(req.body || {}, 'countryRegion')) {
-      update.countryRegion = typeof req.body.countryRegion === 'string' ? req.body.countryRegion.trim().slice(0, 80) : '';
-    }
-
-    if (Object.prototype.hasOwnProperty.call(req.body || {}, 'voiceSignature')) {
-      update.voiceSignature = typeof req.body.voiceSignature === 'string' ? req.body.voiceSignature.trim().slice(0, 120) : '';
-    }
-
-    if (Object.prototype.hasOwnProperty.call(req.body || {}, 'signature')) {
-      update.signature = typeof req.body.signature === 'string' ? req.body.signature.trim().slice(0, 160) : '';
-    }
-
-    if (!Object.keys(update).length) {
-      return res.status(400).json({ success: false, message: 'No profile info provided' });
-    }
-
-    const user = await User.findByIdAndUpdate(
-      userId,
-      { $set: update },
-      { new: true, runValidators: true }
-    ).select(PUBLIC_USER_FIELDS);
-
-    if (!user) return res.status(404).json({ success: false, message: 'User not found' });
-    return res.status(200).json({ success: true, user });
-  } catch (error) {
-    return res.status(500).json({ success: false, message: error.message });
-  }
-});
-
-app.post('/settings/:userId/album-photo', async (req, res) => {
-  try {
-    const { userId } = req.params;
-    const { image } = req.body;
-    if (!mongoose.Types.ObjectId.isValid(userId)) return res.status(400).json({ success: false, message: 'Invalid user id' });
-    if (!image?.base64) return res.status(400).json({ success: false, message: 'Album photo is required' });
-
-    const userRecord = await User.findById(userId).select('albumPhotos');
-    if (!userRecord) return res.status(404).json({ success: false, message: 'User not found' });
-    if ((userRecord.albumPhotos || []).length >= 10) return res.status(400).json({ success: false, message: 'Album can contain up to 10 photos' });
-
-    const photoUrl = await uploadHostVerificationImage({
-      userId,
-      key: 'album-photo',
-      image
-    });
-
-    const user = await User.findByIdAndUpdate(
-      userId,
-      { $addToSet: { albumPhotos: photoUrl } },
-      { new: true }
-    ).select(PUBLIC_USER_FIELDS);
-
-    return res.status(200).json({ success: true, photoUrl, user });
-  } catch (error) {
-    return res.status(500).json({ success: false, message: error.message });
-  }
-});
-
-app.delete('/settings/:userId/album-photo', async (req, res) => {
-  try {
-    const { userId } = req.params;
-    const { photoUrl } = req.body || {};
-    if (!mongoose.Types.ObjectId.isValid(userId)) return res.status(400).json({ success: false, message: 'Invalid user id' });
-    if (!photoUrl) return res.status(400).json({ success: false, message: 'Photo url is required' });
-
-    const user = await User.findByIdAndUpdate(
-      userId,
-      { $pull: { albumPhotos: photoUrl } },
-      { new: true }
-    ).select(PUBLIC_USER_FIELDS);
-
-    if (!user) return res.status(404).json({ success: false, message: 'User not found' });
-    return res.status(200).json({ success: true, user });
   } catch (error) {
     return res.status(500).json({ success: false, message: error.message });
   }
@@ -5704,11 +2239,6 @@ app.get('/settings/:userId/diagnostics', async (req, res) => {
 app.post('/settings/:userId/logout', async (req, res) => {
   try {
     const { userId } = req.params;
-    const authorization = req.headers.authorization || '';
-    const token = authorization.startsWith('Bearer ') ? authorization.slice(7).trim() : '';
-    if (token) {
-      await AuthSession.deleteOne({ tokenHash: hashAuthToken(token) });
-    }
     if (mongoose.Types.ObjectId.isValid(userId)) {
       await User.findByIdAndUpdate(userId, { $set: { lastLogin: new Date() } });
     }
@@ -5751,43 +2281,81 @@ app.delete('/settings/:userId/account', async (req, res) => {
   }
 });
 
-app.get('/users/search', async (req, res) => {
+app.get('/profile/:userId/fans', async (req, res) => {
   try {
-    const query = String(req.query.q || req.query.query || '').trim();
-    const limit = Math.min(Math.max(parseInt(req.query.limit, 10) || 20, 1), 30);
+    const { userId } = req.params;
+    const limit = Math.min(Math.max(parseInt(req.query.limit, 10) || 30, 1), 100);
 
-    if (query.length < 2) {
-      return res.status(200).json({ success: true, users: [] });
+    if (!mongoose.Types.ObjectId.isValid(userId)) {
+      return res.status(400).json({ success: false, message: 'Invalid user id' });
     }
 
-    const escapedQuery = query.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-    const regex = new RegExp(escapedQuery, 'i');
-    const filter = {
-      $or: [
-        { name: regex },
-        { glixId: regex },
-        ...(mongoose.Types.ObjectId.isValid(query) ? [{ _id: query }] : [])
-      ]
-    };
-
-    const users = await User.find(filter)
-      .select('name profilePic glixId daimon role countryRegion')
-      .sort({ followersCount: -1, createdAt: -1 })
+    const rows = await Follow.find({ followingId: userId })
+      .populate('followerId', 'name profilePic glixId daimon countryRegion')
+      .sort({ createdAt: -1 })
       .limit(limit)
       .lean();
 
-    return res.status(200).json({
-      success: true,
-      users: users.map(user => ({
-        id: user._id,
-        name: user.name || 'User',
-        profilePic: user.profilePic || '',
-        glixId: user.glixId || '',
-        daimon: user.daimon || 0,
-        role: user.role || 'user',
-        countryRegion: user.countryRegion || ''
-      }))
-    });
+    const fans = rows
+      .filter(row => row.followerId)
+      .map(row => ({
+        id: row.followerId._id,
+        name: row.followerId.name || 'User',
+        profilePic: row.followerId.profilePic || '',
+        glixId: row.followerId.glixId || '',
+        daimon: row.followerId.daimon || 0,
+        countryRegion: row.followerId.countryRegion || '',
+        followedAt: row.createdAt
+      }));
+
+    return res.status(200).json({ success: true, fans });
+  } catch (error) {
+    return res.status(500).json({ success: false, message: error.message });
+  }
+});
+
+app.get('/gift-gallery/:userId', async (req, res) => {
+  try {
+    const { userId } = req.params;
+    const limit = Math.min(Math.max(parseInt(req.query.limit, 10) || 30, 1), 100);
+
+    if (!mongoose.Types.ObjectId.isValid(userId)) {
+      return res.status(400).json({ success: false, message: 'Invalid user id' });
+    }
+
+    const gifts = await GiftTransaction.aggregate([
+      { $match: { receiverId: new mongoose.Types.ObjectId(userId) } },
+      {
+        $group: {
+          _id: { giftName: '$giftName', giftImage: '$giftImage' },
+          quantity: { $sum: '$quantity' },
+          totalCoins: { $sum: '$totalCost' },
+          transactions: { $sum: 1 },
+          latestAt: { $max: '$createdAt' }
+        }
+      },
+      { $sort: { totalCoins: -1, quantity: -1, latestAt: -1 } },
+      { $limit: limit },
+      {
+        $project: {
+          _id: 0,
+          giftName: '$_id.giftName',
+          giftImage: '$_id.giftImage',
+          quantity: 1,
+          totalCoins: 1,
+          transactions: 1,
+          latestAt: 1
+        }
+      }
+    ]);
+
+    const totals = gifts.reduce((acc, gift) => {
+      acc.quantity += Number(gift.quantity || 0);
+      acc.totalCoins += Number(gift.totalCoins || 0);
+      return acc;
+    }, { quantity: 0, totalCoins: 0 });
+
+    return res.status(200).json({ success: true, gifts, totals });
   } catch (error) {
     return res.status(500).json({ success: false, message: error.message });
   }
@@ -5800,200 +2368,9 @@ app.get('/profile/:id', async (req, res) => {
     let user = await User.findById(id).select('-password');
     if (!user) return res.status(404).json({ message: "User not found" });
     user = await ensureUserPublicId(user);
-    const vip = await getUserVipStatus(id);
-    const profile = user.toObject ? user.toObject() : user;
-    return res.status(200).json({ ...profile, ...vip });
+    return res.status(200).json(user);
   } catch (error) {
     return res.status(500).json({ message: error.message });
-  }
-});
-
-app.post('/profile/:profileUserId/visit', async (req, res) => {
-  try {
-    const { profileUserId } = req.params;
-    const { visitorId } = req.body || {};
-
-    if (!mongoose.Types.ObjectId.isValid(profileUserId) || !mongoose.Types.ObjectId.isValid(visitorId)) {
-      return res.status(400).json({ success: false, message: 'Invalid profile visit request' });
-    }
-
-    if (String(profileUserId) === String(visitorId)) {
-      return res.status(200).json({ success: true, recorded: false, message: 'Own profile visit ignored' });
-    }
-
-    const [profileUser, visitorExists] = await Promise.all([
-      User.findById(profileUserId).select('settings'),
-      User.exists({ _id: visitorId })
-    ]);
-
-    if (!profileUser || !visitorExists) {
-      return res.status(404).json({ success: false, message: 'Profile or visitor not found' });
-    }
-
-    if (profileUser.settings?.showProfileVisits === false) {
-      return res.status(200).json({ success: true, recorded: false, visible: false });
-    }
-
-    const now = new Date();
-    await ProfileVisit.findOneAndUpdate(
-      { profileUserId, visitorId },
-      {
-        $set: { visitedAt: now },
-        $inc: { visitCount: 1 }
-      },
-      { upsert: true, new: true, setDefaultsOnInsert: true }
-    );
-
-    return res.status(200).json({ success: true, recorded: true });
-  } catch (error) {
-    return res.status(500).json({ success: false, message: error.message });
-  }
-});
-
-app.get('/profile/:userId/visitors', async (req, res) => {
-  try {
-    const { userId } = req.params;
-    const { viewerId } = req.query;
-    const limit = Math.min(Math.max(parseInt(req.query.limit, 10) || 12, 1), 50);
-
-    if (!mongoose.Types.ObjectId.isValid(userId)) {
-      return res.status(400).json({ success: false, message: 'Invalid user id' });
-    }
-
-    const user = await User.findById(userId).select('settings');
-    if (!user) return res.status(404).json({ success: false, message: 'User not found' });
-
-    if (user.settings?.showProfileVisits === false) {
-      return res.status(200).json({ success: true, visible: false, visitors: [] });
-    }
-
-    const [totalVisitors, visits] = await Promise.all([
-      ProfileVisit.countDocuments({ profileUserId: userId }),
-      ProfileVisit.find({ profileUserId: userId })
-        .sort({ visitedAt: -1 })
-        .limit(limit)
-        .populate('visitorId', 'name profilePic glixId daimon countryRegion')
-        .lean()
-    ]);
-
-    const visitorIds = visits.map(visit => visit.visitorId?._id?.toString()).filter(Boolean);
-    const followingSet = new Set();
-
-    if (viewerId && mongoose.Types.ObjectId.isValid(viewerId) && visitorIds.length) {
-      const followingRows = await Follow.find({
-        followerId: viewerId,
-        followingId: { $in: visitorIds }
-      }).select('followingId').lean();
-      followingRows.forEach(row => followingSet.add(row.followingId.toString()));
-    }
-
-    const visitors = visits
-      .filter(visit => visit.visitorId)
-      .map(visit => ({
-        id: visit.visitorId._id?.toString(),
-        name: visit.visitorId.name || 'User',
-        profilePic: visit.visitorId.profilePic || '',
-        glixId: visit.visitorId.glixId || '',
-        daimon: visit.visitorId.daimon || 0,
-        countryRegion: visit.visitorId.countryRegion || '',
-        visitedAt: visit.visitedAt,
-        visitCount: visit.visitCount || 1,
-        isFollowing: followingSet.has(visit.visitorId._id?.toString())
-      }));
-
-    return res.status(200).json({ success: true, visible: true, totalVisitors, visitors });
-  } catch (error) {
-    return res.status(500).json({ success: false, message: error.message });
-  }
-});
-
-app.get('/profile/:userId/followers', async (req, res) => {
-  try {
-    const { userId } = req.params;
-    const { viewerId } = req.query;
-    const limit = Math.min(Math.max(parseInt(req.query.limit, 10) || 50, 1), 100);
-
-    if (!mongoose.Types.ObjectId.isValid(userId)) {
-      return res.status(400).json({ success: false, message: 'Invalid user id' });
-    }
-
-    const rows = await Follow.find({ followingId: userId })
-      .sort({ createdAt: -1 })
-      .limit(limit)
-      .populate('followerId', 'name profilePic glixId daimon countryRegion')
-      .lean();
-
-    const followerIds = rows.map(row => row.followerId?._id?.toString()).filter(Boolean);
-    const followingSet = new Set();
-
-    if (viewerId && mongoose.Types.ObjectId.isValid(viewerId) && followerIds.length) {
-      const followingRows = await Follow.find({
-        followerId: viewerId,
-        followingId: { $in: followerIds }
-      }).select('followingId').lean();
-      followingRows.forEach(row => followingSet.add(row.followingId.toString()));
-    }
-
-    const users = rows
-      .filter(row => row.followerId)
-      .map(row => ({
-        id: row.followerId._id?.toString(),
-        name: row.followerId.name || 'User',
-        profilePic: row.followerId.profilePic || '',
-        glixId: row.followerId.glixId || '',
-        daimon: row.followerId.daimon || 0,
-        countryRegion: row.followerId.countryRegion || '',
-        isFollowing: followingSet.has(row.followerId._id?.toString())
-      }));
-
-    return res.status(200).json({ success: true, users });
-  } catch (error) {
-    return res.status(500).json({ success: false, message: error.message });
-  }
-});
-
-app.get('/profile/:userId/following', async (req, res) => {
-  try {
-    const { userId } = req.params;
-    const { viewerId } = req.query;
-    const limit = Math.min(Math.max(parseInt(req.query.limit, 10) || 50, 1), 100);
-
-    if (!mongoose.Types.ObjectId.isValid(userId)) {
-      return res.status(400).json({ success: false, message: 'Invalid user id' });
-    }
-
-    const rows = await Follow.find({ followerId: userId })
-      .sort({ createdAt: -1 })
-      .limit(limit)
-      .populate('followingId', 'name profilePic glixId daimon countryRegion')
-      .lean();
-
-    const followingIds = rows.map(row => row.followingId?._id?.toString()).filter(Boolean);
-    const followingSet = new Set();
-
-    if (viewerId && mongoose.Types.ObjectId.isValid(viewerId) && followingIds.length) {
-      const followingRows = await Follow.find({
-        followerId: viewerId,
-        followingId: { $in: followingIds }
-      }).select('followingId').lean();
-      followingRows.forEach(row => followingSet.add(row.followingId.toString()));
-    }
-
-    const users = rows
-      .filter(row => row.followingId)
-      .map(row => ({
-        id: row.followingId._id?.toString(),
-        name: row.followingId.name || 'User',
-        profilePic: row.followingId.profilePic || '',
-        glixId: row.followingId.glixId || '',
-        daimon: row.followingId.daimon || 0,
-        countryRegion: row.followingId.countryRegion || '',
-        isFollowing: followingSet.has(row.followingId._id?.toString())
-      }));
-
-    return res.status(200).json({ success: true, users });
-  } catch (error) {
-    return res.status(500).json({ success: false, message: error.message });
   }
 });
 
@@ -6018,34 +2395,875 @@ app.post('/check-follow', async (req, res) => {
   }
 });
 
-server.listen(PORT, () => {
-  console.log(`Server listening on port ${PORT}`);
+
+
+const OFFICIAL_SESSION_DAYS = Number(process.env.OFFICIAL_SESSION_DAYS || 7);
+const OFFICIAL_SESSION_MS = OFFICIAL_SESSION_DAYS * 24 * 60 * 60 * 1000;
+
+const hashToken = (token) => crypto.createHash('sha256').update(String(token || '')).digest('hex');
+
+const officialUserProjection = 'name email profilePic glixId role accountStatus createdAt lastLogin chang daimon hostStatus agencyStatus coinSellerStatus sellerBalance sellerTotalSold adminNote';
+
+const serializeOfficialUser = (user) => {
+  if (!user) return null;
+  const plain = typeof user.toObject === 'function' ? user.toObject() : user;
+  const { password, passwordResetOtpHash, ...safe } = plain;
+  return safe;
+};
+
+const createOfficialSession = async (userId) => {
+  const token = crypto.randomBytes(32).toString('hex');
+  await AuthSession.create({
+    userId,
+    tokenHash: hashToken(token),
+    expiresAt: new Date(Date.now() + OFFICIAL_SESSION_MS),
+  });
+  return token;
+};
+
+const requireOfficial = async (req, res, next) => {
+  try {
+    const authHeader = req.headers.authorization || '';
+    const token = authHeader.startsWith('Bearer ') ? authHeader.slice(7).trim() : '';
+    if (!token) return res.status(401).json({ success: false, message: 'Official token missing' });
+
+    const session = await AuthSession.findOne({
+      tokenHash: hashToken(token),
+      expiresAt: { $gt: new Date() },
+    }).populate('userId');
+
+    const officialUser = session?.userId;
+    if (!officialUser) return res.status(401).json({ success: false, message: 'Official session expired' });
+    if (officialUser.role !== 'super_admin') {
+      return res.status(403).json({ success: false, message: 'Only the Super Admin can access the Official Portal' });
+    }
+    if ((officialUser.accountStatus || 'active') !== 'active') {
+      return res.status(403).json({ success: false, message: `Official account is ${officialUser.accountStatus}` });
+    }
+
+    req.officialUser = officialUser;
+    session.lastUsedAt = new Date();
+    session.save().catch(() => {});
+    next();
+  } catch (error) {
+    return res.status(401).json({ success: false, message: error.message || 'Official auth failed' });
+  }
+};
+
+const findUserByIdentifier = async (identifier) => {
+  const clean = String(identifier || '').trim();
+  if (!clean) return null;
+  const or = [{ email: clean.toLowerCase() }, { glixId: clean }];
+  if (mongoose.Types.ObjectId.isValid(clean)) or.push({ _id: clean });
+  return User.findOne({ $or: or });
+};
+
+const getMonthRange = (monthValue) => {
+  const now = new Date();
+  const clean = String(monthValue || '').trim() || now.toISOString().slice(0, 7);
+  const [year, month] = clean.split('-').map(Number);
+  if (!year || !month) return { month: now.toISOString().slice(0, 7), start: new Date(now.getFullYear(), now.getMonth(), 1), end: new Date(now.getFullYear(), now.getMonth() + 1, 1) };
+  return { month: clean, start: new Date(year, month - 1, 1), end: new Date(year, month, 1) };
+};
+
+app.post('/login', async (req, res) => {
+  try {
+    const email = String(req.body?.email || '').trim().toLowerCase();
+    const password = String(req.body?.password || '');
+    if (!email || !password) return res.status(400).json({ success: false, message: 'Email and password are required' });
+
+    const user = await User.findOne({ email });
+    if (!user || !user.password) return res.status(401).json({ success: false, message: 'Invalid email or password' });
+
+    const ok = await bcrypt.compare(password, user.password);
+    if (!ok) return res.status(401).json({ success: false, message: 'Invalid email or password' });
+
+    if (user.role !== 'super_admin') {
+      return res.status(403).json({ success: false, message: 'Only the Super Admin can access the Official Portal' });
+    }
+    if ((user.accountStatus || 'active') !== 'active') {
+      return res.status(403).json({ success: false, message: `Your account is ${user.accountStatus}` });
+    }
+
+    user.lastLogin = new Date();
+    if (!user.glixId) user.glixId = await createUniqueUserPublicId();
+    await user.save();
+
+    const token = await createOfficialSession(user._id);
+    return res.json({ success: true, token, user: serializeOfficialUser(user) });
+  } catch (error) {
+    return res.status(500).json({ success: false, message: error.message });
+  }
+});
+
+app.post('/admin/auth/forgot-password', async (req, res) => {
+  try {
+    const email = String(req.body?.email || '').trim().toLowerCase();
+    const user = await User.findOne({ email });
+    if (!user || user.role !== 'super_admin') {
+      return res.status(404).json({ success: false, message: 'Official account not found' });
+    }
+
+    const otp = String(Math.floor(100000 + Math.random() * 900000));
+    user.passwordResetOtpHash = await bcrypt.hash(otp, 10);
+    user.passwordResetOtpExpiresAt = new Date(Date.now() + 10 * 60 * 1000);
+    user.passwordResetOtpRequestedAt = new Date();
+    user.passwordResetOtpAttempts = 0;
+    await user.save();
+
+    console.log(`Official portal password reset OTP for ${email}: ${otp}`);
+    return res.json({ success: true, message: 'OTP generated. Check backend logs or configure email delivery.', devOtp: otp });
+  } catch (error) {
+    return res.status(500).json({ success: false, message: error.message });
+  }
+});
+
+app.post('/admin/auth/reset-password', async (req, res) => {
+  try {
+    const email = String(req.body?.email || '').trim().toLowerCase();
+    const otp = String(req.body?.otp || '').trim();
+    const newPassword = String(req.body?.newPassword || '');
+    const user = await User.findOne({ email });
+    if (!user || user.role !== 'super_admin') return res.status(404).json({ success: false, message: 'Official account not found' });
+    if (!user.passwordResetOtpHash || !user.passwordResetOtpExpiresAt || user.passwordResetOtpExpiresAt < new Date()) {
+      return res.status(400).json({ success: false, message: 'OTP expired. Request a new code.' });
+    }
+    if ((user.passwordResetOtpAttempts || 0) >= 5) {
+      return res.status(429).json({ success: false, message: 'Too many OTP attempts. Request a new code.' });
+    }
+    const validOtp = await bcrypt.compare(otp, user.passwordResetOtpHash);
+    if (!validOtp) {
+      user.passwordResetOtpAttempts = (user.passwordResetOtpAttempts || 0) + 1;
+      await user.save();
+      return res.status(400).json({ success: false, message: 'Invalid OTP' });
+    }
+    if (newPassword.length < 6) return res.status(400).json({ success: false, message: 'Password must be at least 6 characters' });
+
+    user.password = await bcrypt.hash(newPassword, 10);
+    user.passwordResetOtpHash = '';
+    user.passwordResetOtpExpiresAt = null;
+    user.passwordResetOtpRequestedAt = null;
+    user.passwordResetOtpAttempts = 0;
+    await user.save();
+    await AuthSession.deleteMany({ userId: user._id });
+    return res.json({ success: true, message: 'Password reset successful' });
+  } catch (error) {
+    return res.status(500).json({ success: false, message: error.message });
+  }
+});
+
+app.post('/admin/access/register', async (req, res) => {
+  try {
+    const name = String(req.body?.name || '').trim();
+    const email = String(req.body?.email || '').trim().toLowerCase();
+    const password = String(req.body?.password || '');
+    const note = String(req.body?.note || '').trim();
+    const requestedRole = ['admin', 'manager', 'super_admin'].includes(req.body?.requestedRole)
+      ? req.body.requestedRole
+      : 'super_admin';
+    if (!name || !email || password.length < 6) {
+      return res.status(400).json({ success: false, message: 'Name, email and a 6 character password are required' });
+    }
+
+    let user = await User.findOne({ email });
+    if (!user) {
+      user = await User.create({
+        name,
+        email,
+        password: await bcrypt.hash(password, 10),
+        glixId: await createUniqueUserPublicId(),
+        role: 'user',
+      });
+    }
+
+    user.adminAccessRequest = {
+      requestedRole,
+      status: 'pending',
+      note,
+      rejectionReason: '',
+      reviewedBy: null,
+      reviewedAt: null,
+      requestedAt: new Date(),
+    };
+    await user.save();
+    return res.json({ success: true, message: 'Official access request submitted' });
+  } catch (error) {
+    return res.status(500).json({ success: false, message: error.message });
+  }
+});
+
+app.post('/admin/access/request', async (req, res) => {
+  try {
+    const userId = String(req.body?.userId || '').trim();
+    const requestedRole = String(req.body?.requestedRole || '').trim();
+    const note = String(req.body?.note || '').trim();
+
+    if (!mongoose.Types.ObjectId.isValid(userId)) {
+      return res.status(400).json({ success: false, message: 'Invalid user id' });
+    }
+    if (!['admin', 'manager'].includes(requestedRole)) {
+      return res.status(400).json({ success: false, message: 'Only admin or manager can be requested from the app' });
+    }
+
+    const user = await User.findById(userId);
+    if (!user) return res.status(404).json({ success: false, message: 'User not found' });
+    if (user.role === requestedRole) {
+      return res.status(400).json({ success: false, message: `You already have ${requestedRole} access` });
+    }
+    if (user.adminAccessRequest?.status === 'pending' && user.adminAccessRequest?.requestedRole === requestedRole) {
+      return res.status(409).json({ success: false, message: 'This request is already pending' });
+    }
+
+    user.adminAccessRequest = {
+      requestedRole,
+      status: 'pending',
+      note,
+      rejectionReason: '',
+      reviewedBy: null,
+      reviewedAt: null,
+      requestedAt: new Date(),
+    };
+    await user.save();
+
+    return res.json({ success: true, message: 'Request submitted for Super Admin approval.' });
+  } catch (error) {
+    return res.status(500).json({ success: false, message: error.message });
+  }
+});
+app.get('/admin/dashboard', requireOfficial, async (req, res) => {
+  try {
+    await closeStaleLiveRooms();
+    const weekStart = new Date();
+    weekStart.setDate(weekStart.getDate() - 7);
+    const [totalUsers, activeUsers, suspendedUsers, pendingHosts, pendingAgencies, pendingWithdrawals, liveAudioRooms, liveVideoRooms, weeklyGiftAgg] = await Promise.all([
+      User.countDocuments({}),
+      User.countDocuments({ accountStatus: 'active' }),
+      User.countDocuments({ accountStatus: { $in: ['suspended', 'banned'] } }),
+      User.countDocuments({ hostStatus: 'pending' }),
+      User.countDocuments({ agencyStatus: 'pending' }),
+      Withdrawal.countDocuments({ status: 'pending' }),
+      AudioRoom.countDocuments({ isLive: true, lastHeartbeatAt: { $gte: getLiveRoomFreshCutoff() } }),
+      Room.countDocuments({ lastHeartbeatAt: { $gte: getLiveRoomFreshCutoff() } }),
+      GiftTransaction.aggregate([
+        { $match: { createdAt: { $gte: weekStart } } },
+        { $group: { _id: null, coins: { $sum: '$totalCost' }, count: { $sum: 1 } } },
+      ]),
+    ]);
+    const weeklyGift = weeklyGiftAgg?.[0] || {};
+    return res.json({
+      success: true,
+      stats: {
+        totalUsers,
+        activeUsers,
+        suspendedUsers,
+        pendingHosts,
+        pendingAgencies,
+        pendingWithdrawals,
+        liveRooms: liveAudioRooms + liveVideoRooms,
+        liveAudioRooms,
+        liveVideoRooms,
+        weeklyGiftCoins: weeklyGift.coins || 0,
+        weeklyGiftTransactions: weeklyGift.count || 0,
+      }
+    });
+  } catch (error) {
+    return res.status(500).json({ success: false, message: error.message });
+  }
+});
+
+app.get('/admin/users', requireOfficial, async (req, res) => {
+  try {
+    const page = Math.max(1, Number(req.query.page || 1));
+    const limit = Math.min(100, Math.max(1, Number(req.query.limit || 25)));
+    const query = {};
+    if (req.query.role && req.query.role !== 'all') query.role = req.query.role;
+    if (req.query.accountStatus && req.query.accountStatus !== 'all') query.accountStatus = req.query.accountStatus;
+    const search = String(req.query.search || '').trim();
+    if (search) {
+      query.$or = [
+        { name: { $regex: search, $options: 'i' } },
+        { email: { $regex: search, $options: 'i' } },
+        { glixId: { $regex: search, $options: 'i' } },
+      ];
+    }
+
+    const [total, users] = await Promise.all([
+      User.countDocuments(query),
+      User.find(query).select(officialUserProjection).sort({ createdAt: -1 }).skip((page - 1) * limit).limit(limit).lean(),
+    ]);
+    return res.json({ success: true, users, page, pages: Math.max(1, Math.ceil(total / limit)), total });
+  } catch (error) {
+    return res.status(500).json({ success: false, message: error.message });
+  }
+});
+
+app.patch('/admin/users/:userId', requireOfficial, async (req, res) => {
+  try {
+    const allowed = ['role', 'accountStatus', 'hostStatus', 'agencyStatus', 'chang', 'daimon', 'adminNote'];
+    const update = {};
+    for (const key of allowed) {
+      if (Object.prototype.hasOwnProperty.call(req.body, key)) update[key] = req.body[key];
+    }
+    if (update.chang !== undefined) update.chang = Math.max(0, Number(update.chang) || 0);
+    if (update.daimon !== undefined) update.daimon = Math.max(0, Number(update.daimon) || 0);
+
+    if (String(req.params.userId) === String(req.officialUser._id)) {
+      if (update.role && update.role !== 'super_admin') return res.status(400).json({ success: false, message: 'You cannot remove your own Super Admin role' });
+      if (update.accountStatus && update.accountStatus !== 'active') return res.status(400).json({ success: false, message: 'You cannot disable your own Official account' });
+    }
+
+    const user = await User.findByIdAndUpdate(req.params.userId, { $set: update }, { new: true, runValidators: true }).select(officialUserProjection);
+    if (!user) return res.status(404).json({ success: false, message: 'User not found' });
+    return res.json({ success: true, user });
+  } catch (error) {
+    return res.status(500).json({ success: false, message: error.message });
+  }
+});
+
+app.get('/host/requests', requireOfficial, async (req, res) => {
+  try {
+    const requests = await User.find({ hostStatus: 'pending' }).select('-password -passwordResetOtpHash').sort({ 'hostRegistration.registeredAt': -1, createdAt: -1 }).lean();
+    return res.json({ success: true, requests });
+  } catch (error) {
+    return res.status(500).json({ success: false, message: error.message });
+  }
+});
+
+app.patch('/host/requests/:userId', requireOfficial, async (req, res) => {
+  try {
+    const status = ['approved', 'rejected'].includes(req.body?.status) ? req.body.status : null;
+    if (!status) return res.status(400).json({ success: false, message: 'Invalid host status' });
+    const update = {
+      hostStatus: status,
+      hostRejectionReason: status === 'rejected' ? String(req.body?.reason || '') : '',
+      'hostRegistration.status': status,
+      'hostRegistration.rejectionReason': status === 'rejected' ? String(req.body?.reason || '') : '',
+      'hostRegistration.reviewedBy': req.officialUser._id,
+      'hostRegistration.reviewedAt': new Date(),
+    };
+    if (status === 'approved') update.role = 'host';
+    const user = await User.findByIdAndUpdate(req.params.userId, { $set: update }, { new: true });
+    if (!user) return res.status(404).json({ success: false, message: 'User not found' });
+    return res.json({ success: true, user: serializeOfficialUser(user) });
+  } catch (error) {
+    return res.status(500).json({ success: false, message: error.message });
+  }
+});
+
+app.get('/agency/requests', requireOfficial, async (req, res) => {
+  try {
+    const requests = await User.find({ agencyStatus: 'pending' }).select('-password -passwordResetOtpHash').sort({ 'agencyRegistration.registeredAt': -1, createdAt: -1 }).lean();
+    return res.json({ success: true, requests });
+  } catch (error) {
+    return res.status(500).json({ success: false, message: error.message });
+  }
+});
+
+app.patch('/agency/requests/:userId', requireOfficial, async (req, res) => {
+  try {
+    const status = ['approved', 'rejected'].includes(req.body?.status) ? req.body.status : null;
+    if (!status) return res.status(400).json({ success: false, message: 'Invalid agency status' });
+    const user = await User.findById(req.params.userId);
+    if (!user) return res.status(404).json({ success: false, message: 'User not found' });
+    user.agencyStatus = status;
+    user.agencyRejectionReason = status === 'rejected' ? String(req.body?.reason || '') : '';
+    user.agencyRegistration.status = status;
+    user.agencyRegistration.rejectionReason = user.agencyRejectionReason;
+    user.agencyRegistration.reviewedBy = req.officialUser._id;
+    user.agencyRegistration.reviewedAt = new Date();
+    if (status === 'approved') {
+      user.role = 'agency';
+      user.agencyCode = (user.agencyRegistration?.requestedAgencyCode || user.agencyCode || `AG${String(user.glixId || user._id).slice(-5)}`).toUpperCase();
+    }
+    await user.save();
+    return res.json({ success: true, user: serializeOfficialUser(user) });
+  } catch (error) {
+    return res.status(500).json({ success: false, message: error.message });
+  }
+});
+
+app.get('/admin/access/requests', requireOfficial, async (req, res) => {
+  try {
+    const status = String(req.query.status || 'pending');
+    const query = status === 'all' ? { 'adminAccessRequest.status': { $ne: 'none' } } : { 'adminAccessRequest.status': status };
+    const requests = await User.find(query).select('-password -passwordResetOtpHash').sort({ 'adminAccessRequest.requestedAt': -1 }).lean();
+    return res.json({ success: true, requests });
+  } catch (error) {
+    return res.status(500).json({ success: false, message: error.message });
+  }
+});
+
+app.patch('/admin/access/requests/:userId', requireOfficial, async (req, res) => {
+  try {
+    const status = ['approved', 'rejected'].includes(req.body?.status) ? req.body.status : null;
+    if (!status) return res.status(400).json({ success: false, message: 'Invalid request status' });
+
+    const targetUser = await User.findById(req.params.userId).select('adminAccessRequest');
+    if (!targetUser) return res.status(404).json({ success: false, message: 'User not found' });
+
+    const requestedRole = ['admin', 'manager', 'super_admin'].includes(req.body?.role)
+      ? req.body.role
+      : targetUser.adminAccessRequest?.requestedRole;
+    if (status === 'approved' && !['admin', 'manager', 'super_admin'].includes(requestedRole)) {
+      return res.status(400).json({ success: false, message: 'Invalid requested role' });
+    }
+
+    const update = {
+      'adminAccessRequest.status': status,
+      'adminAccessRequest.reviewedBy': req.officialUser._id,
+      'adminAccessRequest.reviewedAt': new Date(),
+      'adminAccessRequest.rejectionReason': status === 'rejected' ? String(req.body?.reason || '') : '',
+    };
+    if (status === 'approved') {
+      update.role = requestedRole;
+      update.accountStatus = 'active';
+    }
+    const user = await User.findByIdAndUpdate(req.params.userId, { $set: update }, { new: true, runValidators: true });
+    return res.json({ success: true, user: serializeOfficialUser(user) });
+  } catch (error) {
+    return res.status(500).json({ success: false, message: error.message });
+  }
+});
+app.get('/admin/withdrawals', requireOfficial, async (req, res) => {
+  try {
+    const status = String(req.query.status || 'pending');
+    const query = status === 'all' ? {} : { status };
+    const withdrawals = await Withdrawal.find(query).populate('userId', 'name email glixId').sort({ createdAt: -1 }).lean();
+    return res.json({ success: true, withdrawals });
+  } catch (error) {
+    return res.status(500).json({ success: false, message: error.message });
+  }
+});
+
+app.patch('/admin/withdrawals/:withdrawalId', requireOfficial, async (req, res) => {
+  try {
+    const status = ['approved', 'rejected'].includes(req.body?.status) ? req.body.status : null;
+    if (!status) return res.status(400).json({ success: false, message: 'Invalid withdrawal status' });
+    const withdrawal = await Withdrawal.findByIdAndUpdate(req.params.withdrawalId, {
+      $set: {
+        status,
+        reviewerId: req.officialUser._id,
+        reviewNote: String(req.body?.reason || ''),
+        reviewedAt: new Date(),
+      }
+    }, { new: true }).populate('userId', 'name email glixId');
+    if (!withdrawal) return res.status(404).json({ success: false, message: 'Withdrawal not found' });
+    return res.json({ success: true, withdrawal });
+  } catch (error) {
+    return res.status(500).json({ success: false, message: error.message });
+  }
+});
+
+app.get('/admin/agencies', requireOfficial, async (req, res) => {
+  try {
+    const agencies = await User.aggregate([
+      { $match: { $or: [{ role: 'agency' }, { agencyStatus: 'approved' }] } },
+      { $lookup: { from: 'users', localField: '_id', foreignField: 'agencyId', as: 'hosts' } },
+      { $project: { name: 1, email: 1, glixId: 1, agencyCode: 1, totalHostCoins: 1, commissionBalance: 1, hostsCount: { $size: '$hosts' } } },
+      { $sort: { createdAt: -1 } },
+    ]);
+    return res.json({ success: true, agencies });
+  } catch (error) {
+    return res.status(500).json({ success: false, message: error.message });
+  }
+});
+
+app.post('/admin/agencies', requireOfficial, async (req, res) => {
+  try {
+    const agency = await findUserByIdentifier(req.body?.identifier);
+    if (!agency) return res.status(404).json({ success: false, message: 'Agency user not found' });
+    const agencyCode = String(req.body?.agencyCode || agency.agencyCode || `AG${String(agency.glixId || agency._id).slice(-5)}`).trim().toUpperCase();
+    agency.role = 'agency';
+    agency.agencyStatus = 'approved';
+    agency.agencyCode = agencyCode;
+    agency.agencyRegistration.status = 'approved';
+    agency.agencyRegistration.reviewedBy = req.officialUser._id;
+    agency.agencyRegistration.reviewedAt = new Date();
+    await agency.save();
+    return res.json({ success: true, agency: serializeOfficialUser(agency) });
+  } catch (error) {
+    return res.status(500).json({ success: false, message: error.message });
+  }
+});
+
+app.get('/admin/store/items', requireOfficial, async (req, res) => {
+  try {
+    const items = await StoreItem.find({}).sort({ sortOrder: 1, createdAt: -1 }).lean();
+    return res.json({ success: true, items });
+  } catch (error) {
+    return res.status(500).json({ success: false, message: error.message });
+  }
+});
+
+app.post('/admin/store/items', requireOfficial, async (req, res) => {
+  try {
+    const payload = { ...req.body, price: Number(req.body?.price) || 0, durationDays: Number(req.body?.durationDays) || 0, sortOrder: Number(req.body?.sortOrder) || 0 };
+    const item = await StoreItem.create(payload);
+    return res.status(201).json({ success: true, item });
+  } catch (error) {
+    return res.status(500).json({ success: false, message: error.message });
+  }
+});
+
+app.patch('/admin/store/items/:itemId', requireOfficial, async (req, res) => {
+  try {
+    const payload = { ...req.body };
+    if (payload.price !== undefined) payload.price = Number(payload.price) || 0;
+    if (payload.durationDays !== undefined) payload.durationDays = Number(payload.durationDays) || 0;
+    if (payload.sortOrder !== undefined) payload.sortOrder = Number(payload.sortOrder) || 0;
+    const item = await StoreItem.findByIdAndUpdate(req.params.itemId, { $set: payload }, { new: true, runValidators: true });
+    if (!item) return res.status(404).json({ success: false, message: 'Store item not found' });
+    return res.json({ success: true, item });
+  } catch (error) {
+    return res.status(500).json({ success: false, message: error.message });
+  }
 });
 
 
+const sellerProjection = 'name email profilePic glixId role accountStatus coinSellerStatus coinSellerRegistration sellerBalance sellerTotalSold createdAt';
 
+const serializeSeller = (user) => {
+  if (!user) return null;
+  const plain = typeof user.toObject === 'function' ? user.toObject() : user;
+  const { password, passwordResetOtpHash, adminAccessRequest, ...safe } = plain;
+  return safe;
+};
 
+const requireCoinSeller = async (req, res, next) => {
+  try {
+    const authHeader = req.headers.authorization || '';
+    const token = authHeader.startsWith('Bearer ') ? authHeader.slice(7).trim() : '';
+    if (!token) return res.status(401).json({ success: false, message: 'Seller token missing' });
 
+    const session = await AuthSession.findOne({
+      tokenHash: hashToken(token),
+      expiresAt: { $gt: new Date() },
+    }).populate('userId');
 
+    const seller = session?.userId;
+    if (!seller) return res.status(401).json({ success: false, message: 'Seller session expired' });
+    if ((seller.accountStatus || 'active') !== 'active') {
+      return res.status(403).json({ success: false, message: `Account is ${seller.accountStatus}` });
+    }
+    if (seller.coinSellerStatus !== 'approved' && seller.role !== 'coin_seller') {
+      return res.status(403).json({ success: false, message: `Coin seller request is ${seller.coinSellerStatus || 'not approved'}` });
+    }
 
+    req.coinSeller = seller;
+    session.lastUsedAt = new Date();
+    session.save().catch(() => {});
+    next();
+  } catch (error) {
+    return res.status(401).json({ success: false, message: error.message || 'Seller auth failed' });
+  }
+};
 
+app.post('/coin-seller/register', async (req, res) => {
+  try {
+    const name = String(req.body?.name || req.body?.fullName || '').trim();
+    const email = String(req.body?.email || '').trim().toLowerCase();
+    const password = String(req.body?.password || '');
+    const phoneNumber = String(req.body?.phoneNumber || '').trim();
+    const city = String(req.body?.city || '').trim();
+    const paymentMethod = String(req.body?.paymentMethod || '').trim();
+    const note = String(req.body?.note || '').trim();
 
+    if (!name || !email || password.length < 6 || !phoneNumber) {
+      return res.status(400).json({ success: false, message: 'Name, email, password and phone number are required' });
+    }
 
+    let user = await User.findOne({ email });
+    if (user?.coinSellerStatus === 'approved' || user?.coinSellerRegistration?.status === 'approved') {
+      return res.status(409).json({ success: false, message: 'This account is already an approved coin seller' });
+    }
+    if (user?.coinSellerStatus === 'pending' || user?.coinSellerRegistration?.status === 'pending') {
+      return res.status(409).json({ success: false, message: 'Your coin seller request is already pending' });
+    }
 
+    if (!user) {
+      user = new User({
+        name,
+        email,
+        password: await bcrypt.hash(password, 10),
+        glixId: await createUniqueUserPublicId(),
+      });
+    } else {
+      const passwordMatches = user.password ? await bcrypt.compare(password, user.password) : false;
+      if (user.password && !passwordMatches) {
+        return res.status(401).json({ success: false, message: 'This email already exists. Use the correct password to request seller access.' });
+      }
+      if (!user.password) user.password = await bcrypt.hash(password, 10);
+      user.name = user.name || name;
+      if (!user.glixId) user.glixId = await createUniqueUserPublicId();
+    }
 
+    user.coinSellerStatus = 'pending';
+    user.coinSellerRejectionReason = '';
+    user.coinSellerRegistration = {
+      ...(user.coinSellerRegistration?.toObject ? user.coinSellerRegistration.toObject() : user.coinSellerRegistration || {}),
+      fullName: name,
+      phoneNumber,
+      city,
+      paymentMethod,
+      note,
+      status: 'pending',
+      rejectionReason: '',
+      reviewedBy: null,
+      reviewedAt: null,
+      registeredAt: new Date(),
+    };
+    await user.save();
 
+    return res.status(201).json({ success: true, message: 'Coin seller request submitted. Wait for Super Admin approval.' });
+  } catch (error) {
+    return res.status(500).json({ success: false, message: error.message });
+  }
+});
 
+app.post('/coin-seller/login', async (req, res) => {
+  try {
+    const email = String(req.body?.email || '').trim().toLowerCase();
+    const password = String(req.body?.password || '');
+    if (!email || !password) return res.status(400).json({ success: false, message: 'Email and password are required' });
 
+    const user = await User.findOne({ email });
+    if (!user || !user.password) return res.status(401).json({ success: false, message: 'Invalid email or password' });
+    const ok = await bcrypt.compare(password, user.password);
+    if (!ok) return res.status(401).json({ success: false, message: 'Invalid email or password' });
+    if ((user.accountStatus || 'active') !== 'active') return res.status(403).json({ success: false, message: `Account is ${user.accountStatus}` });
+    if (user.coinSellerStatus !== 'approved' && user.role !== 'coin_seller') {
+      return res.status(403).json({ success: false, message: `Coin seller request is ${user.coinSellerStatus || 'not approved'}` });
+    }
 
+    user.lastLogin = new Date();
+    user.role = 'coin_seller';
+    user.coinSellerStatus = 'approved';
+    user.coinSellerRegistration.status = 'approved';
+    await user.save();
 
+    const token = await createOfficialSession(user._id);
+    return res.json({ success: true, token, seller: serializeSeller(user) });
+  } catch (error) {
+    return res.status(500).json({ success: false, message: error.message });
+  }
+});
 
+app.get('/coin-seller/me', requireCoinSeller, async (req, res) => {
+  try {
+    const seller = await User.findById(req.coinSeller._id).select(sellerProjection).lean();
+    return res.json({ success: true, seller });
+  } catch (error) {
+    return res.status(500).json({ success: false, message: error.message });
+  }
+});
 
+app.get('/coin-seller/transactions', requireCoinSeller, async (req, res) => {
+  try {
+    const transactions = await CoinSellerTransaction.find({ sellerId: req.coinSeller._id })
+      .populate('buyerId', 'name email glixId profilePic')
+      .sort({ createdAt: -1 })
+      .limit(100)
+      .lean();
+    return res.json({ success: true, transactions });
+  } catch (error) {
+    return res.status(500).json({ success: false, message: error.message });
+  }
+});
 
+app.post('/coin-seller/sell', requireCoinSeller, async (req, res) => {
+  try {
+    const glixId = String(req.body?.glixId || '').trim();
+    const coins = Math.floor(Number(req.body?.coins));
+    const paymentMethod = String(req.body?.paymentMethod || '').trim();
+    const note = String(req.body?.note || '').trim();
+    if (!glixId) return res.status(400).json({ success: false, message: 'Buyer Glix ID is required' });
+    if (!Number.isFinite(coins) || coins <= 0) return res.status(400).json({ success: false, message: 'Coins must be greater than zero' });
 
+    const seller = await User.findById(req.coinSeller._id);
+    if (!seller || seller.coinSellerStatus !== 'approved') return res.status(403).json({ success: false, message: 'Seller is not approved' });
+    if ((seller.sellerBalance || 0) < coins) return res.status(400).json({ success: false, message: 'Seller balance is too low' });
 
+    const buyer = await User.findOne({ glixId });
+    if (!buyer) return res.status(404).json({ success: false, message: 'Buyer not found by Glix ID' });
+    if (String(buyer._id) === String(seller._id)) return res.status(400).json({ success: false, message: 'Seller cannot sell coins to own account' });
 
+    seller.sellerBalance = (seller.sellerBalance || 0) - coins;
+    seller.sellerTotalSold = (seller.sellerTotalSold || 0) + coins;
+    buyer.chang = (buyer.chang || 0) + coins;
 
+    await Promise.all([seller.save(), buyer.save()]);
+    const transaction = await CoinSellerTransaction.create({
+      sellerId: seller._id,
+      buyerId: buyer._id,
+      buyerGlixId: buyer.glixId,
+      coins,
+      paymentMethod,
+      note,
+      sellerBalanceAfter: seller.sellerBalance,
+      buyerCoinsAfter: buyer.chang,
+    });
 
+    return res.json({
+      success: true,
+      transaction,
+      seller: serializeSeller(seller),
+      buyer: { id: buyer._id, name: buyer.name, glixId: buyer.glixId, chang: buyer.chang },
+    });
+  } catch (error) {
+    return res.status(500).json({ success: false, message: error.message });
+  }
+});
+
+app.get('/admin/coin-seller/requests', requireOfficial, async (req, res) => {
+  try {
+    const status = String(req.query.status || 'all');
+    const query = status === 'all'
+      ? { $or: [{ coinSellerStatus: { $ne: 'none' } }, { 'coinSellerRegistration.status': { $ne: 'none' } }] }
+      : { $or: [{ coinSellerStatus: status }, { 'coinSellerRegistration.status': status }] };
+    const requests = await User.find(query).select('-password -passwordResetOtpHash').sort({ 'coinSellerRegistration.registeredAt': -1, createdAt: -1 }).lean();
+    return res.json({ success: true, requests });
+  } catch (error) {
+    return res.status(500).json({ success: false, message: error.message });
+  }
+});
+
+app.patch('/admin/coin-seller/requests/:userId', requireOfficial, async (req, res) => {
+  try {
+    const status = ['approved', 'rejected', 'suspended'].includes(req.body?.status) ? req.body.status : null;
+    if (!status) return res.status(400).json({ success: false, message: 'Invalid coin seller status' });
+    const update = {
+      role: status === 'approved' ? 'coin_seller' : undefined,
+      coinSellerStatus: status,
+      coinSellerRejectionReason: status === 'rejected' ? String(req.body?.reason || '') : '',
+      'coinSellerRegistration.status': status,
+      'coinSellerRegistration.rejectionReason': status === 'rejected' ? String(req.body?.reason || '') : '',
+      'coinSellerRegistration.reviewedBy': req.officialUser._id,
+      'coinSellerRegistration.reviewedAt': new Date(),
+    };
+    Object.keys(update).forEach(key => update[key] === undefined && delete update[key]);
+    const user = await User.findByIdAndUpdate(req.params.userId, { $set: update }, { new: true });
+    if (!user) return res.status(404).json({ success: false, message: 'User not found' });
+    return res.json({ success: true, user: serializeOfficialUser(user) });
+  } catch (error) {
+    return res.status(500).json({ success: false, message: error.message });
+  }
+});
+
+app.get('/admin/coin-sellers', requireOfficial, async (req, res) => {
+  try {
+    const sellers = await User.find({ $or: [{ coinSellerStatus: { $in: ['approved', 'suspended'] } }, { role: 'coin_seller' }] })
+      .select('name email glixId role coinSellerStatus coinSellerRegistration sellerBalance sellerTotalSold createdAt')
+      .sort({ createdAt: -1 })
+      .lean();
+    return res.json({ success: true, sellers });
+  } catch (error) {
+    return res.status(500).json({ success: false, message: error.message });
+  }
+});
+
+app.patch('/admin/coin-sellers/:sellerId/balance', requireOfficial, async (req, res) => {
+  try {
+    const amount = Math.floor(Number(req.body?.amount));
+    const type = req.body?.type === 'deduct' ? 'deduct' : 'add';
+    if (!Number.isFinite(amount) || amount <= 0) return res.status(400).json({ success: false, message: 'Amount must be greater than zero' });
+    const seller = await User.findById(req.params.sellerId);
+    if (!seller) return res.status(404).json({ success: false, message: 'Seller not found' });
+    if (type === 'deduct' && (seller.sellerBalance || 0) < amount) return res.status(400).json({ success: false, message: 'Seller balance is too low' });
+    seller.sellerBalance = type === 'deduct' ? (seller.sellerBalance || 0) - amount : (seller.sellerBalance || 0) + amount;
+    await seller.save();
+    return res.json({ success: true, seller: serializeOfficialUser(seller) });
+  } catch (error) {
+    return res.status(500).json({ success: false, message: error.message });
+  }
+});
+
+app.get('/admin/monthly-commissions', requireOfficial, async (req, res) => {
+  try {
+    const query = {};
+    if (req.query.status && req.query.status !== 'all') query.status = req.query.status;
+    if (req.query.month) query.month = String(req.query.month).trim();
+    const commissions = await MonthlyCommission.find(query)
+      .populate('beneficiaryId', 'name email glixId agencyCode')
+      .populate('hostId', 'name email glixId')
+      .sort({ month: -1, createdAt: -1 })
+      .lean();
+    const totals = commissions.reduce((acc, row) => {
+      acc.sourceCoins += row.sourceCoins || 0;
+      acc.commissionAmount += row.commissionAmount || 0;
+      return acc;
+    }, { sourceCoins: 0, commissionAmount: 0 });
+    return res.json({ success: true, commissions, totals });
+  } catch (error) {
+    return res.status(500).json({ success: false, message: error.message });
+  }
+});
+
+const getFirebaseMessaging = () => {
+  try {
+    if (!getApps().length) initializeApp();
+    return getMessaging();
+  } catch (error) {
+    return null;
+  }
+};
+
+app.post('/admin/notifications/send', requireOfficial, async (req, res) => {
+  try {
+    const target = req.body?.target || 'all';
+    const title = String(req.body?.title || 'Glix Live');
+    const body = String(req.body?.body || '').trim();
+    if (!body) return res.status(400).json({ success: false, message: 'Notification body is required' });
+
+    const query = {};
+    if (target === 'hosts') query.hostStatus = 'approved';
+    if (target === 'selected') {
+      const ids = Array.isArray(req.body?.userIds) ? req.body.userIds : [];
+      const objectIds = ids.filter(id => mongoose.Types.ObjectId.isValid(id));
+      query.$or = [
+        { _id: { $in: objectIds } },
+        { glixId: { $in: ids } },
+        { email: { $in: ids.map(item => String(item).toLowerCase()) } },
+      ];
+    }
+
+    const users = await User.find(query).select('fcmTokens settings').lean();
+    const tokens = users.flatMap(user => (
+      (user.fcmTokens || [])
+        .map(item => item?.token)
+        .filter(Boolean)
+    ));
+
+    const messaging = getFirebaseMessaging();
+    if (!messaging || !tokens.length) {
+      return res.json({
+        success: true,
+        matchedUsers: users.length,
+        tokenCount: tokens.length,
+        successCount: 0,
+        failureCount: 0,
+        skippedUsers: !tokens.length ? users.length : 0,
+        skippedReasons: !tokens.length ? { no_fcm_token: users.length } : { firebase_not_configured: users.length },
+      });
+    }
+
+    let successCount = 0;
+    let failureCount = 0;
+    for (let i = 0; i < tokens.length; i += 500) {
+      const chunk = tokens.slice(i, i + 500);
+      const result = await messaging.sendEachForMulticast({ tokens: chunk, notification: { title, body }, data: { source: 'official_portal' } });
+      successCount += result.successCount || 0;
+      failureCount += result.failureCount || 0;
+    }
+
+    return res.json({ success: true, matchedUsers: users.length, tokenCount: tokens.length, successCount, failureCount, skippedUsers: 0, skippedReasons: {} });
+  } catch (error) {
+    return res.status(500).json({ success: false, message: error.message });
+  }
+});
+
+server.listen(PORT, () => {
+  console.log(`Server listening on port ${PORT}`);
+});
 
 
 
