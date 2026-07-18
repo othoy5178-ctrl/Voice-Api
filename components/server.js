@@ -26,6 +26,8 @@ import Withdrawal from "./Withdrawal.js";
 import MonthlyCommission from "./MonthlyCommission.js";
 import CoinSellerTransaction from "./CoinSellerTransaction.js";
 import GameCoinTransaction from "./GameCoinTransaction.js";
+import ProfileVisit from "./ProfileVisit.js";
+import cloudinary from "./utils/cloudinary.js";
 
 const { RtcTokenBuilder, RtcRole } = pkg;
 const app = express();
@@ -478,7 +480,20 @@ io.on('connection', (socket) => {
         }
       }
 
-      socket.emit('initialize_room_slots', completeLayoutMatrix);
+      if (isVideoRoom) {
+        socket.emit('initialize_room_slots', completeLayoutMatrix);
+      } else if (mongoose.Types.ObjectId.isValid(stringRoomId)) {
+        const audioRoomLayout = await AudioRoom.findById(stringRoomId).select('micSeatCount micLayoutType backgroundThemeId backgroundThemeUrl').lean();
+        socket.emit('initialize_room_slots', {
+          slots: completeLayoutMatrix,
+          micSeatCount: audioRoomLayout?.micSeatCount || 15,
+          micLayoutType: audioRoomLayout?.micLayoutType || 'chatroom',
+          backgroundThemeId: audioRoomLayout?.backgroundThemeId || null,
+          backgroundThemeUrl: audioRoomLayout?.backgroundThemeUrl || null,
+        });
+      } else {
+        socket.emit('initialize_room_slots', completeLayoutMatrix);
+      }
       await emitRoomStats(stringRoomId);
 
     } catch (err) {
@@ -587,6 +602,70 @@ io.on('connection', (socket) => {
     } catch (error) {
       console.log("Socket array persistence exception error:", error);
       socket.emit('error_notice', { message: 'Failed to synchronize layout seat state.' });
+    }
+  });
+
+  socket.on('update_audio_room_layout', async ({ roomId, requesterId, micSeatCount, micLayoutType, backgroundThemeId, backgroundThemeUrl }) => {
+    try {
+      const stringRoomId = roomId ? roomId.toString() : '';
+      if (!mongoose.Types.ObjectId.isValid(stringRoomId)) return;
+
+      const nextSeatCount = [5, 10, 15, 24].includes(Number(micSeatCount)) ? Number(micSeatCount) : 15;
+      const nextLayoutType = ['chatroom', 'dating', 'party', 'birthday'].includes(micLayoutType) ? micLayoutType : 'chatroom';
+      const nextBackgroundThemeId = backgroundThemeId ? String(backgroundThemeId) : null;
+      const nextBackgroundThemeUrl = backgroundThemeUrl ? String(backgroundThemeUrl) : null;
+
+      const audioRoom = await AudioRoom.findById(stringRoomId).populate('speakers.userId', 'name profilePic');
+      if (!audioRoom) {
+        socket.emit('error_notice', { message: 'Audio room not found.' });
+        return;
+      }
+
+      const canUpdateLayout = String(audioRoom.hostId || '') === String(requesterId || '') || String(audioRoom.hostId || '') === String(socket.userId || '');
+      if (!canUpdateLayout) {
+        socket.emit('error_notice', { message: 'Only the host can change the mic arrangement.' });
+        return;
+      }
+
+      const hasOccupiedOutsideLayout = (audioRoom.speakers || []).some(speaker => Number(speaker.slotIndex) >= nextSeatCount);
+      if (hasOccupiedOutsideLayout) {
+        socket.emit('error_notice', { message: 'Please clear higher mic slots before reducing seats.' });
+        return;
+      }
+
+      audioRoom.micSeatCount = nextSeatCount;
+      audioRoom.micLayoutType = nextLayoutType;
+      audioRoom.backgroundThemeId = nextBackgroundThemeId;
+      audioRoom.backgroundThemeUrl = nextBackgroundThemeUrl;
+      audioRoom.lastHeartbeatAt = new Date();
+      await audioRoom.save();
+
+      const completeLayoutMatrix = createCleanSlotsBlueprint();
+      (audioRoom.speakers || []).filter(speaker => speaker && speaker.userId).forEach(speaker => {
+        const index = Number(speaker.slotIndex);
+        if (index >= 0 && index < 25) {
+          completeLayoutMatrix[index] = {
+            ...completeLayoutMatrix[index],
+            uid: speaker.numericUid || null,
+            userId: speaker.userId?._id?.toString?.() || speaker.userId?.toString?.() || null,
+            username: speaker.userId?.name || 'Broadcaster',
+            avatar: speaker.userId?.profilePic || null,
+            frameUrl: speaker.frameUrl || null,
+            isMuted: speaker.isMuted || false,
+          };
+        }
+      });
+
+      io.to(stringRoomId).emit('room_layout_changed', {
+        slots: completeLayoutMatrix,
+        micSeatCount: audioRoom.micSeatCount,
+        micLayoutType: audioRoom.micLayoutType,
+        backgroundThemeId: audioRoom.backgroundThemeId || null,
+        backgroundThemeUrl: audioRoom.backgroundThemeUrl || null,
+      });
+    } catch (error) {
+      console.log('Update audio room layout error:', error);
+      socket.emit('error_notice', { message: 'Failed to update room layout.' });
     }
   });
 
@@ -1629,8 +1708,13 @@ app.post('/register', async (req, res) => {
       if (!user.glixId) {
         user = await ensureUserPublicId(user);
       }
+      user.lastLogin = new Date();
+      await user.save();
+      const token = await createOfficialSession(user._id);
       return res.status(200).json({
+        success: true,
         message: 'Login successful!',
+        token,
         user: { id: user._id, name: user.name, email: user.email, glixId: user.glixId }
       });
     }
@@ -1646,8 +1730,11 @@ app.post('/register', async (req, res) => {
       glixId: await createUniqueUserPublicId()
     });
     await newUser.save();
+    const token = await createOfficialSession(newUser._id);
     return res.status(201).json({
+      success: true,
       message: 'Registered!',
+      token,
       user: { id: newUser._id, name: newUser.name, email: newUser.email, glixId: newUser.glixId }
     });
   } catch (error) {
@@ -2055,7 +2142,7 @@ app.post('/rewards/claim', async (req, res) => {
   }
 });
 
-const PUBLIC_USER_FIELDS = 'name email profilePic glixId googleId createdAt lastLogin followersCount followingCount daimon chang frameUrl entryVideoUrl settings blacklistedUsers';
+const PUBLIC_USER_FIELDS = 'name email profilePic glixId googleId createdAt lastLogin followersCount followingCount daimon chang frameUrl entryVideoUrl settings blacklistedUsers gender birthday countryRegion voiceSignature signature albumPhotos role accountStatus hostStatus agencyStatus coinSellerStatus';
 
 const sanitizeUserSettings = (settings = {}) => {
   const allowedMessagesFrom = ['everyone', 'following', 'none'];
@@ -2138,6 +2225,106 @@ app.patch('/settings/:userId', async (req, res) => {
 
     if (!user) return res.status(404).json({ success: false, message: 'User not found' });
     return res.status(200).json({ success: true, settings: user.settings, user });
+  } catch (error) {
+    return res.status(500).json({ success: false, message: error.message });
+  }
+});
+
+
+const uploadUserImage = async (userId, image, label) => {
+  if (!image?.base64) return '';
+  const mimeType = image.type || 'image/jpeg';
+  const dataUri = String(image.base64).startsWith('data:')
+    ? image.base64
+    : `data:${mimeType};base64,${image.base64}`;
+  const result = await cloudinary.uploader.upload(dataUri, {
+    folder: `user-media/${userId}`,
+    public_id: `${label}-${Date.now()}`,
+    resource_type: 'image',
+  });
+  return result.secure_url || '';
+};
+
+app.post('/settings/:userId/profile-picture', async (req, res) => {
+  try {
+    const { userId } = req.params;
+    if (!mongoose.Types.ObjectId.isValid(userId)) return res.status(400).json({ success: false, message: 'Invalid user id' });
+    if (!req.body?.image?.base64) return res.status(400).json({ success: false, message: 'Profile image is required' });
+
+    const profilePic = await uploadUserImage(userId, req.body.image, 'profile-picture');
+    const user = await User.findByIdAndUpdate(userId, { $set: { profilePic } }, { new: true }).select(PUBLIC_USER_FIELDS);
+    if (!user) return res.status(404).json({ success: false, message: 'User not found' });
+    return res.status(200).json({ success: true, user });
+  } catch (error) {
+    return res.status(500).json({ success: false, message: error.message });
+  }
+});
+
+app.post('/settings/:userId/profile-name', async (req, res) => {
+  try {
+    const { userId } = req.params;
+    const name = String(req.body?.name || '').trim();
+    if (!mongoose.Types.ObjectId.isValid(userId)) return res.status(400).json({ success: false, message: 'Invalid user id' });
+    if (name.length < 2) return res.status(400).json({ success: false, message: 'Name must be at least 2 characters' });
+
+    const user = await User.findByIdAndUpdate(userId, { $set: { name } }, { new: true }).select(PUBLIC_USER_FIELDS);
+    if (!user) return res.status(404).json({ success: false, message: 'User not found' });
+    return res.status(200).json({ success: true, user });
+  } catch (error) {
+    return res.status(500).json({ success: false, message: error.message });
+  }
+});
+
+app.post('/settings/:userId/profile-info', async (req, res) => {
+  try {
+    const { userId } = req.params;
+    if (!mongoose.Types.ObjectId.isValid(userId)) return res.status(400).json({ success: false, message: 'Invalid user id' });
+
+    const update = {};
+    ['gender', 'birthday', 'countryRegion', 'voiceSignature', 'signature'].forEach((key) => {
+      if (Object.prototype.hasOwnProperty.call(req.body || {}, key)) {
+        update[key] = typeof req.body[key] === 'string' ? req.body[key].trim() : req.body[key];
+      }
+    });
+
+    const user = await User.findByIdAndUpdate(userId, { $set: update }, { new: true, runValidators: true }).select(PUBLIC_USER_FIELDS);
+    if (!user) return res.status(404).json({ success: false, message: 'User not found' });
+    return res.status(200).json({ success: true, user });
+  } catch (error) {
+    return res.status(500).json({ success: false, message: error.message });
+  }
+});
+
+app.post('/settings/:userId/album-photo', async (req, res) => {
+  try {
+    const { userId } = req.params;
+    if (!mongoose.Types.ObjectId.isValid(userId)) return res.status(400).json({ success: false, message: 'Invalid user id' });
+    if (!req.body?.image?.base64) return res.status(400).json({ success: false, message: 'Album image is required' });
+
+    const user = await User.findById(userId).select('albumPhotos');
+    if (!user) return res.status(404).json({ success: false, message: 'User not found' });
+    if ((user.albumPhotos || []).length >= 10) return res.status(400).json({ success: false, message: 'Album limit is 10 photos' });
+
+    const photoUrl = await uploadUserImage(userId, req.body.image, 'album-photo');
+    user.albumPhotos = [...(user.albumPhotos || []), photoUrl];
+    await user.save();
+    const updated = await User.findById(userId).select(PUBLIC_USER_FIELDS);
+    return res.status(201).json({ success: true, user: updated, photoUrl });
+  } catch (error) {
+    return res.status(500).json({ success: false, message: error.message });
+  }
+});
+
+app.delete('/settings/:userId/album-photo', async (req, res) => {
+  try {
+    const { userId } = req.params;
+    const photoUrl = String(req.body?.photoUrl || '').trim();
+    if (!mongoose.Types.ObjectId.isValid(userId)) return res.status(400).json({ success: false, message: 'Invalid user id' });
+    if (!photoUrl) return res.status(400).json({ success: false, message: 'Photo URL is required' });
+
+    const user = await User.findByIdAndUpdate(userId, { $pull: { albumPhotos: photoUrl } }, { new: true }).select(PUBLIC_USER_FIELDS);
+    if (!user) return res.status(404).json({ success: false, message: 'User not found' });
+    return res.status(200).json({ success: true, user });
   } catch (error) {
     return res.status(500).json({ success: false, message: error.message });
   }
@@ -2315,6 +2502,148 @@ app.get('/profile/:userId/fans', async (req, res) => {
   }
 });
 
+
+const serializeProfileListUser = (user, viewerFollowingIds = new Set(), extra = {}) => ({
+  id: user?._id?.toString?.() || user?.id?.toString?.() || '',
+  name: user?.name || 'User',
+  profilePic: user?.profilePic || '',
+  glixId: user?.glixId || '',
+  daimon: Number(user?.daimon || 0),
+  countryRegion: user?.countryRegion || '',
+  isFollowing: viewerFollowingIds.has(String(user?._id || user?.id || '')),
+  ...extra,
+});
+
+const getViewerFollowingIds = async (viewerId) => {
+  if (!mongoose.Types.ObjectId.isValid(viewerId)) return new Set();
+  const rows = await Follow.find({ followerId: viewerId }).select('followingId').lean();
+  return new Set(rows.map(row => String(row.followingId)));
+};
+
+app.post('/profile/:userId/visit', async (req, res) => {
+  try {
+    const { userId } = req.params;
+    const visitorId = String(req.body?.visitorId || '').trim();
+
+    if (!mongoose.Types.ObjectId.isValid(userId) || !mongoose.Types.ObjectId.isValid(visitorId)) {
+      return res.status(400).json({ success: false, message: 'Invalid profile visit request' });
+    }
+
+    if (String(userId) === String(visitorId)) {
+      return res.status(200).json({ success: true, skipped: true });
+    }
+
+    await ProfileVisit.findOneAndUpdate(
+      { profileUserId: userId, visitorId },
+      { $set: { visitedAt: new Date() }, $inc: { visitCount: 1 } },
+      { upsert: true, new: true, setDefaultsOnInsert: true }
+    );
+
+    return res.status(200).json({ success: true });
+  } catch (error) {
+    return res.status(500).json({ success: false, message: error.message });
+  }
+});
+
+app.get('/profile/:userId/visitors', async (req, res) => {
+  try {
+    const { userId } = req.params;
+    const limit = Math.min(Math.max(parseInt(req.query.limit, 10) || 30, 1), 100);
+    const viewerId = String(req.query.viewerId || '').trim();
+
+    if (!mongoose.Types.ObjectId.isValid(userId)) {
+      return res.status(400).json({ success: false, message: 'Invalid user id' });
+    }
+
+    const profileUser = await User.findById(userId).select('settings').lean();
+    if (!profileUser) return res.status(404).json({ success: false, message: 'User not found' });
+
+    const visible = profileUser.settings?.showProfileVisits !== false || String(viewerId) === String(userId);
+    if (!visible) {
+      return res.status(200).json({ success: true, visible: false, visitors: [], totalVisitors: 0 });
+    }
+
+    const [rows, totalVisitors, viewerFollowingIds] = await Promise.all([
+      ProfileVisit.find({ profileUserId: userId })
+        .populate('visitorId', 'name profilePic glixId daimon countryRegion')
+        .sort({ visitedAt: -1 })
+        .limit(limit)
+        .lean(),
+      ProfileVisit.countDocuments({ profileUserId: userId }),
+      getViewerFollowingIds(viewerId),
+    ]);
+
+    const visitors = rows
+      .filter(row => row.visitorId)
+      .map(row => serializeProfileListUser(row.visitorId, viewerFollowingIds, {
+        visitedAt: row.visitedAt,
+        visitCount: row.visitCount || 1,
+      }));
+
+    return res.status(200).json({ success: true, visible: true, visitors, totalVisitors });
+  } catch (error) {
+    return res.status(500).json({ success: false, message: error.message });
+  }
+});
+
+app.get('/profile/:userId/following', async (req, res) => {
+  try {
+    const { userId } = req.params;
+    const limit = Math.min(Math.max(parseInt(req.query.limit, 10) || 30, 1), 100);
+    const viewerId = String(req.query.viewerId || '').trim();
+
+    if (!mongoose.Types.ObjectId.isValid(userId)) {
+      return res.status(400).json({ success: false, message: 'Invalid user id' });
+    }
+
+    const [rows, viewerFollowingIds] = await Promise.all([
+      Follow.find({ followerId: userId })
+        .populate('followingId', 'name profilePic glixId daimon countryRegion')
+        .sort({ createdAt: -1 })
+        .limit(limit)
+        .lean(),
+      getViewerFollowingIds(viewerId),
+    ]);
+
+    const users = rows
+      .filter(row => row.followingId)
+      .map(row => serializeProfileListUser(row.followingId, viewerFollowingIds, { followedAt: row.createdAt }));
+
+    return res.status(200).json({ success: true, users });
+  } catch (error) {
+    return res.status(500).json({ success: false, message: error.message });
+  }
+});
+
+app.get('/profile/:userId/followers', async (req, res) => {
+  try {
+    const { userId } = req.params;
+    const limit = Math.min(Math.max(parseInt(req.query.limit, 10) || 30, 1), 100);
+    const viewerId = String(req.query.viewerId || '').trim();
+
+    if (!mongoose.Types.ObjectId.isValid(userId)) {
+      return res.status(400).json({ success: false, message: 'Invalid user id' });
+    }
+
+    const [rows, viewerFollowingIds] = await Promise.all([
+      Follow.find({ followingId: userId })
+        .populate('followerId', 'name profilePic glixId daimon countryRegion')
+        .sort({ createdAt: -1 })
+        .limit(limit)
+        .lean(),
+      getViewerFollowingIds(viewerId),
+    ]);
+
+    const users = rows
+      .filter(row => row.followerId)
+      .map(row => serializeProfileListUser(row.followerId, viewerFollowingIds, { followedAt: row.createdAt }));
+
+    return res.status(200).json({ success: true, users });
+  } catch (error) {
+    return res.status(500).json({ success: false, message: error.message });
+  }
+});
+
 app.get('/gift-gallery/:userId', async (req, res) => {
   try {
     const { userId } = req.params;
@@ -2422,6 +2751,30 @@ const createOfficialSession = async (userId) => {
   return token;
 };
 
+app.post('/auth/app-session', async (req, res) => {
+  try {
+    const userId = String(req.body?.userId || '').trim();
+    if (!mongoose.Types.ObjectId.isValid(userId)) {
+      return res.status(400).json({ success: false, message: 'Invalid user id' });
+    }
+
+    const user = await User.findById(userId).select(officialUserProjection);
+    if (!user) return res.status(404).json({ success: false, message: 'User not found' });
+    if ((user.accountStatus || 'active') !== 'active') {
+      return res.status(403).json({ success: false, message: `Your account is ${user.accountStatus}` });
+    }
+
+    user.lastLogin = new Date();
+    if (!user.glixId) user.glixId = await createUniqueUserPublicId();
+    await user.save();
+
+    const token = await createOfficialSession(user._id);
+    return res.json({ success: true, token, user: serializeOfficialUser(user) });
+  } catch (error) {
+    return res.status(500).json({ success: false, message: error.message });
+  }
+});
+
 const requireOfficial = async (req, res, next) => {
   try {
     const authHeader = req.headers.authorization || '';
@@ -2457,6 +2810,40 @@ const findUserByIdentifier = async (identifier) => {
   const or = [{ email: clean.toLowerCase() }, { glixId: clean }];
   if (mongoose.Types.ObjectId.isValid(clean)) or.push({ _id: clean });
   return User.findOne({ $or: or });
+};
+
+const getAuthenticatedAppUser = async (req) => {
+  const authHeader = req.headers.authorization || '';
+  const token = authHeader.startsWith('Bearer ') ? authHeader.slice(7).trim() : '';
+  if (!token) return null;
+
+  const session = await AuthSession.findOne({
+    tokenHash: hashToken(token),
+    expiresAt: { $gt: new Date() },
+  }).populate('userId');
+
+  const user = session?.userId || null;
+  if (user) {
+    session.lastUsedAt = new Date();
+    session.save().catch(() => {});
+  }
+  return user;
+};
+
+const uploadAgencyVerificationImage = async (userId, image, label) => {
+  if (!image?.base64) return '';
+  const mimeType = image.type || 'image/jpeg';
+  const dataUri = String(image.base64).startsWith('data:')
+    ? image.base64
+    : `data:${mimeType};base64,${image.base64}`;
+
+  const result = await cloudinary.uploader.upload(dataUri, {
+    folder: `agency-verification/${userId}`,
+    public_id: `${label}-${Date.now()}`,
+    resource_type: 'image',
+  });
+
+  return result.secure_url || '';
 };
 
 const getMonthRange = (monthValue) => {
@@ -2699,6 +3086,64 @@ app.post('/api/game/coin/update', handleQuantumCoinUpdate);
 app.post('/api/game/update-coin', handleQuantumCoinUpdate);
 app.post('/api/game/coin/supplement', handleQuantumCoinSupplement);
 app.post('/api/game/supplement-coin', handleQuantumCoinSupplement);
+
+
+app.get('/users/search', async (req, res) => {
+  try {
+    const query = String(req.query.q || '').trim();
+    if (query.length < 2) return res.json({ success: true, users: [] });
+    const escaped = query.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    const users = await User.find({
+      $or: [
+        { name: { $regex: escaped, $options: 'i' } },
+        { glixId: { $regex: escaped, $options: 'i' } },
+        { email: { $regex: escaped, $options: 'i' } },
+      ],
+    })
+      .select('name profilePic glixId daimon countryRegion')
+      .limit(20)
+      .lean();
+
+    return res.json({
+      success: true,
+      users: users.map(user => ({
+        id: user._id.toString(),
+        name: user.name || 'User',
+        profilePic: user.profilePic || '',
+        glixId: user.glixId || '',
+        daimon: user.daimon || 0,
+        countryRegion: user.countryRegion || '',
+      })),
+    });
+  } catch (error) {
+    return res.status(500).json({ success: false, message: error.message });
+  }
+});
+
+app.post('/users/fcm-token', async (req, res) => {
+  try {
+    const user = await getAuthenticatedAppUser(req);
+    const userId = String(req.body?.userId || user?._id || '').trim();
+    const token = String(req.body?.fcmToken || req.body?.token || '').trim();
+    const platform = ['android', 'ios', 'web'].includes(req.body?.platform) ? req.body.platform : 'unknown';
+
+    if (!mongoose.Types.ObjectId.isValid(userId)) return res.status(400).json({ success: false, message: 'Invalid user id' });
+    if (!token) return res.status(400).json({ success: false, message: 'FCM token is required' });
+
+    await User.updateOne(
+      { _id: userId, 'fcmTokens.token': token },
+      { $set: { 'fcmTokens.$.platform': platform, 'fcmTokens.$.updatedAt': new Date() } }
+    );
+    await User.updateOne(
+      { _id: userId, 'fcmTokens.token': { $ne: token } },
+      { $push: { fcmTokens: { token, platform, updatedAt: new Date() } } }
+    );
+
+    return res.json({ success: true });
+  } catch (error) {
+    return res.status(500).json({ success: false, message: error.message });
+  }
+});
 
 app.post('/login', async (req, res) => {
   try {
@@ -2984,6 +3429,135 @@ app.patch('/host/requests/:userId', requireOfficial, async (req, res) => {
   }
 });
 
+app.post('/agency/register', async (req, res) => {
+  try {
+    const user = await getAuthenticatedAppUser(req);
+    if (!user) return res.status(401).json({ success: false, message: 'Please login before agency registration.' });
+
+    if ((user.accountStatus || 'active') !== 'active') {
+      return res.status(403).json({ success: false, message: `Your account is ${user.accountStatus}.` });
+    }
+
+    if (user.agencyStatus === 'approved') {
+      return res.status(400).json({ success: false, message: 'Your agency account is already approved.' });
+    }
+
+    const agencyName = String(req.body?.agencyName || '').trim();
+    const ownerName = String(req.body?.ownerName || '').trim();
+    const requestedAgencyCode = String(req.body?.agencyCode || req.body?.requestedAgencyCode || '').trim().toUpperCase();
+    const phoneCountryCode = String(req.body?.phoneCountryCode || '').trim();
+    const phoneNumber = String(req.body?.phoneNumber || '').trim();
+    const city = String(req.body?.city || '').trim();
+    const expectedHosts = Math.max(0, Number(req.body?.expectedHosts) || 0);
+    const experience = String(req.body?.experience || '').trim();
+    const acceptedTerms = req.body?.acceptedTerms === true;
+    const verificationImages = req.body?.verificationImages || {};
+
+    if (!agencyName) return res.status(400).json({ success: false, message: 'Agency name is required.' });
+    if (!ownerName) return res.status(400).json({ success: false, message: 'Owner name is required.' });
+    if (!requestedAgencyCode) return res.status(400).json({ success: false, message: 'Agency code is required.' });
+    if (!phoneNumber) return res.status(400).json({ success: false, message: 'Phone number is required.' });
+    if (!city) return res.status(400).json({ success: false, message: 'City is required.' });
+    if (!acceptedTerms) return res.status(400).json({ success: false, message: 'Please accept agency terms.' });
+
+    const requiredPhotos = ['profilePhoto', 'idFront', 'idBack', 'selfiePhoto'];
+    const missingPhoto = requiredPhotos.find(key => !verificationImages?.[key]?.base64);
+    if (missingPhoto) return res.status(400).json({ success: false, message: `${missingPhoto} photo is required.` });
+
+    const [profilePhotoUrl, idFrontUrl, idBackUrl, selfiePhotoUrl] = await Promise.all([
+      uploadAgencyVerificationImage(user._id, verificationImages.profilePhoto, 'profile-photo'),
+      uploadAgencyVerificationImage(user._id, verificationImages.idFront, 'id-front'),
+      uploadAgencyVerificationImage(user._id, verificationImages.idBack, 'id-back'),
+      uploadAgencyVerificationImage(user._id, verificationImages.selfiePhoto, 'selfie-photo'),
+    ]);
+
+    user.agencyStatus = 'pending';
+    user.agencyRejectionReason = '';
+    user.agencyRegistration = {
+      agencyName,
+      ownerName,
+      requestedAgencyCode,
+      phoneCountryCode,
+      phoneNumber,
+      city,
+      expectedHosts,
+      experience,
+      profilePhotoUrl,
+      idFrontUrl,
+      idBackUrl,
+      selfiePhotoUrl,
+      status: 'pending',
+      rejectionReason: '',
+      reviewedBy: null,
+      reviewedAt: null,
+      acceptedTerms,
+      registeredAt: new Date(),
+    };
+
+    await user.save();
+    return res.status(201).json({ success: true, user: serializeOfficialUser(user) });
+  } catch (error) {
+    console.log('Agency registration error:', error);
+    return res.status(500).json({ success: false, message: error.message || 'Unable to register agency profile.' });
+  }
+});
+
+
+app.post('/host/register', async (req, res) => {
+  try {
+    const userId = String(req.body?.userId || '').trim();
+    if (!mongoose.Types.ObjectId.isValid(userId)) return res.status(400).json({ success: false, message: 'Invalid user id' });
+
+    const user = await User.findById(userId);
+    if (!user) return res.status(404).json({ success: false, message: 'User not found' });
+    if (user.hostStatus === 'approved') return res.status(400).json({ success: false, message: 'Your host account is already approved.' });
+
+    const fullName = String(req.body?.fullName || '').trim();
+    const gender = ['Male', 'Female', 'Other'].includes(req.body?.gender) ? req.body.gender : '';
+    const hostType = ['Video Live Host', 'Voice Live Host'].includes(req.body?.hostType) ? req.body.hostType : '';
+    const agencySelection = ['Official', 'Other Agency'].includes(req.body?.agencySelection) ? req.body.agencySelection : '';
+    const agencyCode = String(req.body?.agencyCode || '').trim().toUpperCase();
+    const phoneCountryCode = String(req.body?.phoneCountryCode || '').trim();
+    const phoneNumber = String(req.body?.phoneNumber || '').trim();
+    const acceptedTerms = req.body?.acceptedTerms === true;
+    const verificationImages = req.body?.verificationImages || {};
+
+    if (!fullName) return res.status(400).json({ success: false, message: 'Full name is required.' });
+    if (!phoneNumber) return res.status(400).json({ success: false, message: 'Phone number is required.' });
+    if (!acceptedTerms) return res.status(400).json({ success: false, message: 'Please accept host terms.' });
+    if (!verificationImages?.selfiePhoto?.base64) return res.status(400).json({ success: false, message: 'Selfie verification photo is required.' });
+
+    const selfiePhotoUrl = await uploadUserImage(userId, verificationImages.selfiePhoto, 'host-selfie');
+
+    user.hostStatus = 'pending';
+    user.hostRejectionReason = '';
+    user.hostRegistration = {
+      fullName,
+      gender,
+      hostType,
+      agencySelection,
+      agencyCode,
+      phoneCountryCode,
+      phoneNumber,
+      profilePhotoUrl: '',
+      idFrontUrl: '',
+      idBackUrl: '',
+      selfiePhotoUrl,
+      status: 'pending',
+      rejectionReason: '',
+      reviewedBy: null,
+      reviewedAt: null,
+      acceptedTerms,
+      registeredAt: new Date(),
+    };
+
+    await user.save();
+    return res.status(201).json({ success: true, user: serializeOfficialUser(user) });
+  } catch (error) {
+    return res.status(500).json({ success: false, message: error.message || 'Unable to register host profile.' });
+  }
+});
+
 app.get('/agency/requests', requireOfficial, async (req, res) => {
   try {
     const requests = await User.find({ agencyStatus: 'pending' }).select('-password -passwordResetOtpHash').sort({ 'agencyRegistration.registeredAt': -1, createdAt: -1 }).lean();
@@ -3058,6 +3632,83 @@ app.patch('/admin/access/requests/:userId', requireOfficial, async (req, res) =>
     return res.status(500).json({ success: false, message: error.message });
   }
 });
+
+const getWithdrawalSourceForUser = (user, requestedSource = '') => {
+  const source = String(requestedSource || '').trim();
+  if (['daimon', 'commissionBalance', 'revenueBalance'].includes(source)) return source;
+  if (user?.role === 'agency' || user?.agencyStatus === 'approved') return 'commissionBalance';
+  if (['admin', 'manager', 'super_admin'].includes(user?.role)) return 'revenueBalance';
+  return 'daimon';
+};
+
+app.post('/withdrawals', async (req, res) => {
+  try {
+    const authUser = await getAuthenticatedAppUser(req);
+    const userId = String(req.body?.userId || authUser?._id || '').trim();
+    if (!mongoose.Types.ObjectId.isValid(userId)) return res.status(400).json({ success: false, message: 'Invalid user id' });
+    if (authUser && String(authUser._id) !== String(userId)) return res.status(403).json({ success: false, message: 'Cannot submit withdrawal for another user' });
+
+    const amount = Math.floor(Number(req.body?.amount));
+    const method = String(req.body?.method || '').trim();
+    const accountTitle = String(req.body?.accountTitle || '').trim();
+    const accountNumber = String(req.body?.accountNumber || '').trim();
+    const note = String(req.body?.note || '').trim();
+
+    if (!Number.isFinite(amount) || amount < 1) return res.status(400).json({ success: false, message: 'Withdrawal amount must be greater than zero' });
+    if (!['Easypaisa', 'JazzCash', 'Bank'].includes(method)) return res.status(400).json({ success: false, message: 'Invalid withdrawal method' });
+    if (!accountTitle || !accountNumber) return res.status(400).json({ success: false, message: 'Account title and account number are required' });
+
+    const user = await User.findById(userId).select('role agencyStatus daimon commissionBalance revenueBalance');
+    if (!user) return res.status(404).json({ success: false, message: 'User not found' });
+
+    const source = getWithdrawalSourceForUser(user, req.body?.source);
+    const update = { $inc: { [source]: -amount } };
+    const query = { _id: userId, [source]: { $gte: amount } };
+    const updatedUser = await User.findOneAndUpdate(query, update, { new: true }).select('daimon commissionBalance revenueBalance');
+    if (!updatedUser) return res.status(400).json({ success: false, message: 'Insufficient withdrawable balance' });
+
+    const withdrawal = await Withdrawal.create({
+      userId,
+      amount,
+      source,
+      method,
+      accountTitle,
+      accountNumber,
+      note,
+      status: 'pending',
+    });
+
+    return res.status(201).json({
+      success: true,
+      withdrawal,
+      wallet: {
+        daimon: updatedUser.daimon || 0,
+        commissionBalance: updatedUser.commissionBalance || 0,
+        revenueBalance: updatedUser.revenueBalance || 0,
+      },
+    });
+  } catch (error) {
+    return res.status(500).json({ success: false, message: error.message });
+  }
+});
+
+app.get('/withdrawals/my/:userId', async (req, res) => {
+  try {
+    const authUser = await getAuthenticatedAppUser(req);
+    const { userId } = req.params;
+    if (!mongoose.Types.ObjectId.isValid(userId)) return res.status(400).json({ success: false, message: 'Invalid user id' });
+    if (authUser && String(authUser._id) !== String(userId)) return res.status(403).json({ success: false, message: 'Cannot view withdrawals for another user' });
+
+    const withdrawals = await Withdrawal.find({ userId })
+      .sort({ createdAt: -1 })
+      .limit(100)
+      .lean();
+    return res.json({ success: true, withdrawals });
+  } catch (error) {
+    return res.status(500).json({ success: false, message: error.message });
+  }
+});
+
 app.get('/admin/withdrawals', requireOfficial, async (req, res) => {
   try {
     const status = String(req.query.status || 'pending');
@@ -3115,6 +3766,31 @@ app.post('/admin/agencies', requireOfficial, async (req, res) => {
     agency.agencyRegistration.reviewedAt = new Date();
     await agency.save();
     return res.json({ success: true, agency: serializeOfficialUser(agency) });
+  } catch (error) {
+    return res.status(500).json({ success: false, message: error.message });
+  }
+});
+
+
+app.patch('/admin/agencies/:agencyId', requireOfficial, async (req, res) => {
+  try {
+    const agencyCode = String(req.body?.agencyCode || '').trim().toUpperCase();
+    if (!mongoose.Types.ObjectId.isValid(req.params.agencyId)) return res.status(400).json({ success: false, message: 'Invalid agency id' });
+    if (!agencyCode) return res.status(400).json({ success: false, message: 'Agency code is required' });
+
+    const agency = await User.findByIdAndUpdate(req.params.agencyId, { $set: { agencyCode, 'agencyRegistration.requestedAgencyCode': agencyCode } }, { new: true, runValidators: true });
+    if (!agency) return res.status(404).json({ success: false, message: 'Agency not found' });
+    return res.json({ success: true, agency: serializeOfficialUser(agency) });
+  } catch (error) {
+    return res.status(500).json({ success: false, message: error.message });
+  }
+});
+
+app.get('/admin/agencies/:agencyId/hosts', requireOfficial, async (req, res) => {
+  try {
+    if (!mongoose.Types.ObjectId.isValid(req.params.agencyId)) return res.status(400).json({ success: false, message: 'Invalid agency id' });
+    const hosts = await User.find({ agencyId: req.params.agencyId }).select('-password -passwordResetOtpHash').sort({ createdAt: -1 }).lean();
+    return res.json({ success: true, hosts });
   } catch (error) {
     return res.status(500).json({ success: false, message: error.message });
   }
@@ -3493,6 +4169,14 @@ app.post('/admin/notifications/send', requireOfficial, async (req, res) => {
   } catch (error) {
     return res.status(500).json({ success: false, message: error.message });
   }
+});
+
+
+app.use((req, res) => {
+  return res.status(404).json({
+    success: false,
+    message: `API route not found: ${req.method} ${req.originalUrl}`,
+  });
 });
 
 server.listen(PORT, () => {
