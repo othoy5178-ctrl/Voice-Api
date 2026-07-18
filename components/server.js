@@ -58,7 +58,94 @@ const io = new Server(server, {
 // Real-time globally synchronized active tracking matrix map (userId -> socket.id)
 const activeUsers = {};
 
-const LIVE_ROOM_STALE_MS = 90 * 1000;
+const roomPresence = {};
+
+const getStringRoomId = (roomId) => (roomId ? roomId.toString() : '');
+
+const buildRoomMemberPayload = (userId, fallback = {}) => ({
+  userId: userId?.toString?.() || String(userId || ''),
+  id: userId?.toString?.() || String(userId || ''),
+  socketId: fallback.socketId || null,
+  numericUid: fallback.numericUid ?? null,
+  name: fallback.name || fallback.username || 'User',
+  profilePic: fallback.profilePic || fallback.avatar || '',
+  glixId: fallback.glixId || '',
+  daimon: fallback.daimon || 0,
+  isVip: !!fallback.isVip,
+  vipExpiresAt: fallback.vipExpiresAt || null,
+  vipBadgeUrl: fallback.vipBadgeUrl || '',
+  role: fallback.role || 'audience',
+  joinedAt: fallback.joinedAt || Date.now(),
+  updatedAt: Date.now(),
+});
+
+const emitRoomMembers = (roomId) => {
+  const stringRoomId = getStringRoomId(roomId);
+  if (!stringRoomId) return;
+
+  const members = Object.values(roomPresence[stringRoomId] || {})
+    .sort((a, b) => (a.joinedAt || 0) - (b.joinedAt || 0));
+
+  io.to(stringRoomId).emit('room_members_updated', members);
+};
+
+const upsertRoomPresence = async ({ roomId, userId, socketId, name, profilePic, numericUid = null, role = 'audience' }) => {
+  const stringRoomId = getStringRoomId(roomId);
+  if (!stringRoomId || !userId) return;
+
+  const userKey = userId.toString();
+  if (!roomPresence[stringRoomId]) roomPresence[stringRoomId] = {};
+
+  const existing = roomPresence[stringRoomId][userKey] || {};
+  let dbUser = null;
+
+  if (mongoose.Types.ObjectId.isValid(userKey)) {
+    dbUser = await User.findById(userKey)
+      .select('name profilePic glixId daimon isVip vipExpiresAt vipBadgeUrl')
+      .lean();
+  }
+
+  roomPresence[stringRoomId][userKey] = buildRoomMemberPayload(userKey, {
+    ...existing,
+    socketId: socketId || existing.socketId || null,
+    numericUid: numericUid ?? existing.numericUid ?? null,
+    name: dbUser?.name || name || existing.name || 'User',
+    profilePic: dbUser?.profilePic || profilePic || existing.profilePic || '',
+    glixId: dbUser?.glixId || existing.glixId || '',
+    daimon: dbUser?.daimon ?? existing.daimon ?? 0,
+    isVip: dbUser?.isVip ?? existing.isVip ?? false,
+    vipExpiresAt: dbUser?.vipExpiresAt || existing.vipExpiresAt || null,
+    vipBadgeUrl: dbUser?.vipBadgeUrl || existing.vipBadgeUrl || '',
+    role: role || existing.role || 'audience',
+    joinedAt: existing.joinedAt || Date.now(),
+  });
+
+  emitRoomMembers(stringRoomId);
+};
+
+const removeRoomPresence = ({ roomId, userId, socketId }) => {
+  const stringRoomId = getStringRoomId(roomId);
+  if (!stringRoomId || !roomPresence[stringRoomId]) return;
+
+  const userKey = userId ? userId.toString() : null;
+  if (userKey && roomPresence[stringRoomId][userKey]) {
+    const memberSocketId = roomPresence[stringRoomId][userKey].socketId;
+    if (!socketId || !memberSocketId || memberSocketId === socketId) {
+      delete roomPresence[stringRoomId][userKey];
+    }
+  } else if (socketId) {
+    const matchingEntry = Object.entries(roomPresence[stringRoomId]).find(([, member]) => member.socketId === socketId);
+    if (matchingEntry) delete roomPresence[stringRoomId][matchingEntry[0]];
+  }
+
+  if (!Object.keys(roomPresence[stringRoomId]).length) {
+    delete roomPresence[stringRoomId];
+  }
+
+  emitRoomMembers(stringRoomId);
+};
+
+const LIVE_ROOM_STALE_MS = 5 * 60 * 1000;
 
 const getLiveRoomFreshCutoff = () => new Date(Date.now() - LIVE_ROOM_STALE_MS);
 
@@ -85,13 +172,16 @@ const closeStaleLiveRooms = async () => {
     { $set: { isLive: false, speakers: [], audience: [], endedAt: now } }
   );
 
-  await Room.deleteMany({
-    $or: [
-      { isLive: false },
-      { lastHeartbeatAt: { $lt: cutoff } },
-      { lastHeartbeatAt: { $exists: false }, createdAt: { $lt: cutoff } }
-    ]
-  });
+  await Room.updateMany(
+    {
+      isLive: true,
+      $or: [
+        { lastHeartbeatAt: { $lt: cutoff } },
+        { lastHeartbeatAt: { $exists: false }, createdAt: { $lt: cutoff } }
+      ]
+    },
+    { $set: { isLive: false, endedAt: now } }
+  );
 };
 
 const createCleanSlotsBlueprint = () => Array.from({ length: 25 }, (_, i) => ({
@@ -429,6 +519,15 @@ io.on('connection', (socket) => {
       socket.userId = userId;
       socket.userName = name;
 
+      await upsertRoomPresence({
+        roomId: stringRoomId,
+        userId,
+        socketId: socket.id,
+        name,
+        profilePic,
+        role: stringRoomId.startsWith('glix_') ? 'video' : 'audience'
+      });
+
       // Map connection instance to verify host mappings directly on requests
       if (userId) {
         activeUsers[userId.toString()] = socket.id;
@@ -586,7 +685,19 @@ io.on('connection', (socket) => {
         }
       }
 
-      io.to(stringRoomId).emit('slot_state_changed', {
+      if (profilePic !== null) {
+        await upsertRoomPresence({
+          roomId: stringRoomId,
+          userId,
+          socketId: activeUsers[userId?.toString?.()] || socket.id,
+          name,
+          profilePic,
+          numericUid: numericUid !== null && numericUid !== undefined ? parseInt(numericUid, 10) : null,
+          role: isVideoRoom ? (normalizedSlotIndex === 0 ? 'host' : 'cohost') : 'speaker'
+        });
+      }
+
+        io.to(stringRoomId).emit('slot_state_changed', {
         slotIndex: normalizedSlotIndex,
         user: {
           uid: numericUid ? parseInt(numericUid, 10) : null,
@@ -804,6 +915,15 @@ io.on('connection', (socket) => {
         if (!isApproved || !data.user) return;
         const acceptedUserId = data.user.userId || data.user._id || data.user.id || data.userId;
         if (!acceptedUserId) return;
+        await upsertRoomPresence({
+          roomId: stringRoomId,
+          userId: acceptedUserId,
+          socketId: activeUsers[String(acceptedUserId)] || null,
+          name: data.user.username || data.user.name,
+          profilePic: data.user.avatar || data.user.profilePic,
+          numericUid: data.user.uid ?? data.user.numericUid ?? null,
+          role: isVideoRoom ? 'cohost' : 'speaker'
+        });
 
         io.to(stringRoomId).emit('slot_state_changed', {
           slotIndex: acceptedSlotIndex,
@@ -869,7 +989,17 @@ io.on('connection', (socket) => {
       // UPDATE ALL CLIENTS
       // ===========================
 
-      io.to(stringRoomId).emit('slot_state_changed', {
+      await upsertRoomPresence({
+          roomId: stringRoomId,
+          userId: acceptedUserId,
+          socketId: activeUsers[String(acceptedUserId)] || null,
+          name: data.user.username || data.user.name,
+          profilePic: data.user.avatar || data.user.profilePic,
+          numericUid: data.user.uid ?? data.user.numericUid ?? null,
+          role: isVideoRoom ? 'cohost' : 'speaker'
+        });
+
+        io.to(stringRoomId).emit('slot_state_changed', {
         slotIndex: acceptedSlotIndex,
         user: {
           uid: data.user.uid,
@@ -1077,7 +1207,10 @@ io.on('connection', (socket) => {
   socket.on('disconnect', async () => {
     try {
       if (socket.userId) {
-        delete activeUsers[socket.userId.toString()];
+        const activeUserKey = socket.userId.toString();
+        if (activeUsers[activeUserKey] === socket.id) {
+          delete activeUsers[activeUserKey];
+        }
       } else {
         // Find key by value (the socket.id) to clean up if we didn't store userId on socket object
         for (const userId in activeUsers) {
@@ -1088,6 +1221,8 @@ io.on('connection', (socket) => {
       }
 
       if (!socket.roomId || !socket.userId) return;
+
+      removeRoomPresence({ roomId: socket.roomId, userId: socket.userId, socketId: socket.id });
 
       const roomId = socket.roomId.toString();
       const currentUserId = socket.userId.toString();
@@ -1299,14 +1434,16 @@ app.post('/create-video', async (req, res) => {
       {
         id: 1,
         locked: false,
+        userId: hostId,
         uid: parseInt(numericUid, 10),
         username: name || 'Main Host',
         avatar: profilePic || null,
         isMe: false,
-        isMuted: false
+        isMuted: false,
+        cameraOn: true
       },
-      { id: 2, locked: false, uid: null, username: 'Co-Host 1', avatar: null, isMe: false, isMuted: false },
-      { id: 3, locked: false, uid: null, username: 'Co-Host 2', avatar: null, isMe: false, isMuted: false },
+      { id: 2, locked: false, userId: null, uid: null, username: 'Co-Host 1', avatar: null, isMe: false, isMuted: false, cameraOn: false },
+      { id: 3, locked: false, userId: null, uid: null, username: 'Co-Host 2', avatar: null, isMe: false, isMuted: false, cameraOn: false },
     ];
 
     const newRoom = new Room({
@@ -1663,6 +1800,79 @@ app.get('/rooms/:roomId', async (req, res) => {
   }
 });
 
+app.get('/live-rooms', async (req, res) => {
+  try {
+    await closeStaleLiveRooms();
+    const freshCutoff = getLiveRoomFreshCutoff();
+
+    const [audioRooms, videoRooms] = await Promise.all([
+      AudioRoom.find({
+        isLive: true,
+        lastHeartbeatAt: { $gte: freshCutoff }
+      }).populate('hostId', 'name profilePic username glixId').sort({ createdAt: -1 }).lean(),
+      Room.find({
+        isLive: true,
+        lastHeartbeatAt: { $gte: freshCutoff }
+      }).sort({ createdAt: -1 }).lean()
+    ]);
+
+    const videoHostIds = [...new Set(
+      videoRooms
+        .map(room => room.hostId?.toString?.() || String(room.hostId || ''))
+        .filter(id => mongoose.Types.ObjectId.isValid(id))
+    )];
+
+    const videoHosts = videoHostIds.length
+      ? await User.find({ _id: { $in: videoHostIds } }).select('name profilePic username glixId').lean()
+      : [];
+    const videoHostMap = new Map(videoHosts.map(user => [user._id.toString(), user]));
+
+    const formattedAudioRooms = audioRooms.map(room => ({
+      id: room._id?.toString?.() || String(room._id),
+      _id: room._id?.toString?.() || String(room._id),
+      roomId: room._id?.toString?.() || String(room._id),
+      roomMode: 'audio',
+      title: room.title || 'Live Audio Room',
+      hostId: room.hostId?._id?.toString?.() || room.hostId?.toString?.() || '',
+      host: room.hostId || null,
+      speakerCount: Array.isArray(room.speakers) ? room.speakers.length : 0,
+      audienceCount: Array.isArray(room.audience) ? room.audience.length : 0,
+      createdAt: room.createdAt,
+      lastHeartbeatAt: room.lastHeartbeatAt,
+    }));
+
+    const formattedVideoRooms = videoRooms.map(room => {
+      const hostId = room.hostId?.toString?.() || String(room.hostId || '');
+      const host = videoHostMap.get(hostId) || null;
+      const slots = Array.isArray(room.slots) ? room.slots : [];
+      const speakerCount = slots.filter(slot => slot?.uid !== null && slot?.uid !== undefined).length;
+      const presenceCount = roomPresence[room.channelName] ? Object.keys(roomPresence[room.channelName]).length : 0;
+
+      return {
+        id: room._id?.toString?.() || String(room._id),
+        _id: room._id?.toString?.() || String(room._id),
+        roomId: room.channelName,
+        channelName: room.channelName,
+        roomMode: 'video',
+        title: room.title || 'Glix Live Room',
+        hostId,
+        host,
+        slots,
+        speakerCount,
+        audienceCount: Math.max(0, presenceCount - speakerCount),
+        createdAt: room.createdAt,
+        lastHeartbeatAt: room.lastHeartbeatAt,
+      };
+    });
+
+    const rooms = [...formattedAudioRooms, ...formattedVideoRooms]
+      .sort((a, b) => new Date(b.createdAt || 0) - new Date(a.createdAt || 0));
+
+    return res.status(200).json({ success: true, rooms });
+  } catch (error) {
+    return res.status(500).json({ success: false, error: error.message });
+  }
+});
 app.get('/video-rooms', async (req, res) => {
   try {
     await closeStaleLiveRooms();
@@ -3633,6 +3843,49 @@ app.patch('/admin/access/requests/:userId', requireOfficial, async (req, res) =>
   }
 });
 
+const WITHDRAWAL_DIAMOND_TO_PKR = Number(process.env.WITHDRAWAL_DIAMOND_TO_PKR || 0.027);
+const WITHDRAWAL_MIN_DIAMONDS = Math.floor(Number(process.env.WITHDRAWAL_MIN_DIAMONDS || 10000));
+const WITHDRAWAL_METHODS = [
+  { id: 'paypal', method: 'PayPal', country: 'All Countries', countryCode: 'global', title: 'PayPal', subtitle: 'Transfer to PayPal account', icon: 'card', feePercent: 5, feeFixedDiamonds: 0, arrivalText: '6 hours', payoutCurrency: 'USD', exchangeRate: Number(process.env.WITHDRAWAL_DIAMOND_TO_USD || 0.0001), fields: { accountNumber: 'PayPal Email', firstName: 'First name', lastName: 'Last name' } },
+  { id: 'usdt', method: 'USDT', country: 'All Countries', countryCode: 'global', title: 'USDT', subtitle: 'Cryptocurrency transfer', icon: 'crypto', feePercent: 1.5, feeFixedDiamonds: 0, arrivalText: '6 hours', payoutCurrency: 'USDT', exchangeRate: Number(process.env.WITHDRAWAL_DIAMOND_TO_USD || 0.0001), fields: { accountNumber: 'USDT Wallet Address', firstName: 'First name', lastName: 'Last name' } },
+  { id: 'binance', method: 'Binance', country: 'All Countries', countryCode: 'global', title: 'Binance', subtitle: 'Bank account transfer', icon: 'bank', feePercent: 1.5, feeFixedDiamonds: 0, arrivalText: '6 hours', payoutCurrency: 'USDT', exchangeRate: Number(process.env.WITHDRAWAL_DIAMOND_TO_USD || 0.0001), fields: { accountNumber: 'Binance ID / Email', firstName: 'First name', lastName: 'Last name' } },
+  { id: 'epay', method: 'EPAY Wallet', country: 'All Countries', countryCode: 'global', title: 'EPAY Wallet', subtitle: 'European bank transfer', icon: 'wallet', feePercent: 0, feeFixedDiamonds: 10000, arrivalText: '6 hours', payoutCurrency: 'EUR', exchangeRate: Number(process.env.WITHDRAWAL_DIAMOND_TO_EUR || 0.000092), fields: { accountNumber: 'EPAY Wallet Account', firstName: 'First name', lastName: 'Last name' } },
+  { id: 'jazzcash', method: 'JazzCash', country: 'Pakistan', countryCode: 'PK', title: 'JazzCash', subtitle: 'Transfer to JazzCash account', icon: 'wallet', feePercent: 1.7, feeFixedDiamonds: 0, arrivalText: '6 hours', payoutCurrency: 'PKR', exchangeRate: WITHDRAWAL_DIAMOND_TO_PKR, fields: { accountNumber: 'JazzCash Number', firstName: 'First name', lastName: 'Last name' } },
+  { id: 'easypaisa', method: 'EasyPaisa', country: 'Pakistan', countryCode: 'PK', title: 'EasyPaisa', subtitle: 'Bank account transfer', icon: 'bank', feePercent: 1.7, feeFixedDiamonds: 0, arrivalText: '6 hours', payoutCurrency: 'PKR', exchangeRate: WITHDRAWAL_DIAMOND_TO_PKR, fields: { accountNumber: 'EasyPaisa Number', firstName: 'First name', lastName: 'Last name' } },
+  { id: 'bank_pk', method: 'Bank Transfer', country: 'Pakistan', countryCode: 'PK', title: 'Bank Transfer', subtitle: 'Bank account transfer', icon: 'bank', feePercent: 1.7, feeFixedDiamonds: 0, arrivalText: '6 hours', payoutCurrency: 'PKR', exchangeRate: WITHDRAWAL_DIAMOND_TO_PKR, fields: { accountNumber: 'Bank Account / IBAN', firstName: 'First name', lastName: 'Last name' } },
+  { id: 'bkash', method: 'bKash', country: 'Bangladesh', countryCode: 'BD', title: 'bKash', subtitle: 'Transfer to bKash account', icon: 'wallet', feePercent: 1.7, feeFixedDiamonds: 0, arrivalText: '6 hours', payoutCurrency: 'BDT', exchangeRate: Number(process.env.WITHDRAWAL_DIAMOND_TO_BDT || 0.012), fields: { accountNumber: 'bKash Number', firstName: 'First name', lastName: 'Last name' } },
+  { id: 'nagad', method: 'Nagad', country: 'Bangladesh', countryCode: 'BD', title: 'Nagad', subtitle: 'Bank account transfer', icon: 'bank', feePercent: 1.7, feeFixedDiamonds: 0, arrivalText: '6 hours', payoutCurrency: 'BDT', exchangeRate: Number(process.env.WITHDRAWAL_DIAMOND_TO_BDT || 0.012), fields: { accountNumber: 'Nagad Number', firstName: 'First name', lastName: 'Last name' } },
+  { id: 'bank_bd', method: 'Bangladesh Bank Transfer', country: 'Bangladesh', countryCode: 'BD', title: 'Bank Transfer', subtitle: 'Bank account transfer', icon: 'bank', feePercent: 1.7, feeFixedDiamonds: 0, arrivalText: '6 hours', payoutCurrency: 'BDT', exchangeRate: Number(process.env.WITHDRAWAL_DIAMOND_TO_BDT || 0.012), fields: { accountNumber: 'Bank Account', firstName: 'First name', lastName: 'Last name' } },
+  { id: 'pix', method: 'PIX', country: 'Brazil', countryCode: 'BR', title: 'PIX', subtitle: 'Instant transfer via PIX', icon: 'wallet', feePercent: 1.7, feeFixedDiamonds: 0, arrivalText: '6 hours', payoutCurrency: 'BRL', exchangeRate: Number(process.env.WITHDRAWAL_DIAMOND_TO_BRL || 0.00055), fields: { accountNumber: 'PIX Key', firstName: 'First name', lastName: 'Last name' } },
+  { id: 'telebirr', method: 'telebirr', country: 'Ethiopia', countryCode: 'ET', title: 'telebirr', subtitle: 'Bank account transfer', icon: 'bank', feePercent: 1.7, feeFixedDiamonds: 0, arrivalText: '6 hours', payoutCurrency: 'ETB', exchangeRate: Number(process.env.WITHDRAWAL_DIAMOND_TO_ETB || 0.006), fields: { accountNumber: 'telebirr Number', firstName: 'First name', lastName: 'Last name' } },
+];
+
+const getWithdrawalMethodConfig = (method = '', country = '') => {
+  const cleanMethod = String(method || '').trim().toLowerCase();
+  const cleanCountry = String(country || '').trim().toLowerCase();
+  return WITHDRAWAL_METHODS.find(item => (
+    item.id.toLowerCase() === cleanMethod ||
+    (item.method.toLowerCase() === cleanMethod && (!cleanCountry || item.country.toLowerCase() === cleanCountry || item.countryCode.toLowerCase() === cleanCountry)) ||
+    (item.title.toLowerCase() === cleanMethod && (!cleanCountry || item.country.toLowerCase() === cleanCountry || item.countryCode.toLowerCase() === cleanCountry))
+  ));
+};
+
+const serializeWithdrawalConfig = () => ({
+  success: true,
+  minimumDiamonds: WITHDRAWAL_MIN_DIAMONDS,
+  defaultExchangeRate: WITHDRAWAL_DIAMOND_TO_PKR,
+  methods: WITHDRAWAL_METHODS,
+  rules: [
+    'Withdrawals are subject to verification to ensure platform security.',
+    'Coins purchased by yourself cannot be withdrawn.',
+    'Withdrawal methods are different. Please choose the appropriate one.',
+  ],
+});
+
+app.get('/withdrawals/config', async (req, res) => {
+  return res.json(serializeWithdrawalConfig());
+});
+
 const getWithdrawalSourceForUser = (user, requestedSource = '') => {
   const source = String(requestedSource || '').trim();
   if (['daimon', 'commissionBalance', 'revenueBalance'].includes(source)) return source;
@@ -3650,13 +3903,26 @@ app.post('/withdrawals', async (req, res) => {
 
     const amount = Math.floor(Number(req.body?.amount));
     const method = String(req.body?.method || '').trim();
+    const country = String(req.body?.country || '').trim();
     const accountTitle = String(req.body?.accountTitle || '').trim();
     const accountNumber = String(req.body?.accountNumber || '').trim();
     const note = String(req.body?.note || '').trim();
+    const firstName = String(req.body?.firstName || '').trim();
+    const lastName = String(req.body?.lastName || '').trim();
 
-    if (!Number.isFinite(amount) || amount < 1) return res.status(400).json({ success: false, message: 'Withdrawal amount must be greater than zero' });
-    if (!['Easypaisa', 'JazzCash', 'Bank'].includes(method)) return res.status(400).json({ success: false, message: 'Invalid withdrawal method' });
+    const methodConfig = getWithdrawalMethodConfig(method, country);
+    if (!Number.isFinite(amount) || amount < WITHDRAWAL_MIN_DIAMONDS) {
+      return res.status(400).json({ success: false, message: `Minimum withdrawal is ${WITHDRAWAL_MIN_DIAMONDS} diamonds` });
+    }
+    if (!methodConfig) return res.status(400).json({ success: false, message: 'Invalid withdrawal method' });
     if (!accountTitle || !accountNumber) return res.status(400).json({ success: false, message: 'Account title and account number are required' });
+
+    const feeAmount = Math.ceil((amount * Number(methodConfig.feePercent || 0)) / 100) + Math.floor(Number(methodConfig.feeFixedDiamonds || 0));
+    const netDiamonds = Math.max(0, amount - feeAmount);
+    const payoutAmount = Number((netDiamonds * Number(methodConfig.exchangeRate || 0)).toFixed(2));
+    const proofImageUrl = req.body?.proofImage?.base64
+      ? await uploadUserImage(userId, req.body.proofImage, 'withdrawal-proof')
+      : '';
 
     const user = await User.findById(userId).select('role agencyStatus daimon commissionBalance revenueBalance');
     if (!user) return res.status(404).json({ success: false, message: 'User not found' });
@@ -3671,10 +3937,18 @@ app.post('/withdrawals', async (req, res) => {
       userId,
       amount,
       source,
-      method,
+      method: methodConfig.method,
+      country: methodConfig.country,
       accountTitle,
       accountNumber,
-      note,
+      note: note || [firstName, lastName].filter(Boolean).join(' '),
+      payoutCurrency: methodConfig.payoutCurrency,
+      exchangeRate: methodConfig.exchangeRate,
+      feePercent: methodConfig.feePercent,
+      feeAmount,
+      payoutAmount,
+      arrivalText: methodConfig.arrivalText,
+      proofImageUrl,
       status: 'pending',
     });
 
@@ -3724,15 +3998,27 @@ app.patch('/admin/withdrawals/:withdrawalId', requireOfficial, async (req, res) 
   try {
     const status = ['approved', 'rejected'].includes(req.body?.status) ? req.body.status : null;
     if (!status) return res.status(400).json({ success: false, message: 'Invalid withdrawal status' });
-    const withdrawal = await Withdrawal.findByIdAndUpdate(req.params.withdrawalId, {
-      $set: {
-        status,
-        reviewerId: req.officialUser._id,
-        reviewNote: String(req.body?.reason || ''),
-        reviewedAt: new Date(),
-      }
-    }, { new: true }).populate('userId', 'name email glixId');
-    if (!withdrawal) return res.status(404).json({ success: false, message: 'Withdrawal not found' });
+
+    const existingWithdrawal = await Withdrawal.findById(req.params.withdrawalId);
+    if (!existingWithdrawal) return res.status(404).json({ success: false, message: 'Withdrawal not found' });
+    if (existingWithdrawal.status !== 'pending') {
+      return res.status(400).json({ success: false, message: 'This withdrawal has already been reviewed' });
+    }
+
+    existingWithdrawal.status = status;
+    existingWithdrawal.reviewerId = req.officialUser._id;
+    existingWithdrawal.reviewNote = String(req.body?.reviewNote || req.body?.reason || '');
+    existingWithdrawal.transactionRef = String(req.body?.transactionRef || '');
+    existingWithdrawal.reviewedAt = new Date();
+    await existingWithdrawal.save();
+
+    if (status === 'rejected') {
+      await User.findByIdAndUpdate(existingWithdrawal.userId, {
+        $inc: { [existingWithdrawal.source]: existingWithdrawal.amount }
+      });
+    }
+
+    const withdrawal = await Withdrawal.findById(existingWithdrawal._id).populate('userId', 'name email glixId');
     return res.json({ success: true, withdrawal });
   } catch (error) {
     return res.status(500).json({ success: false, message: error.message });
@@ -4182,6 +4468,14 @@ app.use((req, res) => {
 server.listen(PORT, () => {
   console.log(`Server listening on port ${PORT}`);
 });
+
+
+
+
+
+
+
+
 
 
 

@@ -19,8 +19,13 @@ const withdrawalSchema = new mongoose.Schema({
   },
   method: {
     type: String,
-    enum: ['Easypaisa', 'JazzCash', 'Bank'],
-    required: true
+    required: true,
+    trim: true
+  },
+  country: {
+    type: String,
+    trim: true,
+    default: ''
   },
   accountTitle: {
     type: String,
@@ -31,6 +36,37 @@ const withdrawalSchema = new mongoose.Schema({
     type: String,
     required: true,
     trim: true
+  },
+  payoutCurrency: {
+    type: String,
+    trim: true,
+    default: 'PKR'
+  },
+  exchangeRate: {
+    type: Number,
+    default: 0
+  },
+  feePercent: {
+    type: Number,
+    default: 0
+  },
+  feeAmount: {
+    type: Number,
+    default: 0
+  },
+  payoutAmount: {
+    type: Number,
+    default: 0
+  },
+  arrivalText: {
+    type: String,
+    trim: true,
+    default: ''
+  },
+  proofImageUrl: {
+    type: String,
+    trim: true,
+    default: ''
   },
   note: {
     type: String,
