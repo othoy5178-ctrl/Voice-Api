@@ -1960,8 +1960,12 @@ app.get('/rooms', async (req, res) => {
     }).populate('hostId', 'name profilePic username').sort({ createdAt: -1 });
     const formattedRooms = liveRooms.map(room => ({
       id: room._id,
+      _id: room._id,
+      roomId: room._id,
+      roomMode: 'audio',
       title: room.title,
       host: room.hostId,
+      hostId: room.hostId?._id || room.hostId,
       speakerCount: room.speakers.length,
       audienceCount: room.audience.length,
       createdAt: room.createdAt
