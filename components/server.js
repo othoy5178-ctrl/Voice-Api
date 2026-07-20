@@ -1604,6 +1604,43 @@ app.get('/gift-history/room/:roomId', async (req, res) => {
     });
   }
 });
+app.get('/gift-history/global', async (req, res) => {
+  try {
+    const period = req.query.period || 'all';
+    const match = {};
+
+    if (period === '24h') {
+      match.createdAt = { $gte: new Date(Date.now() - 24 * 60 * 60 * 1000) };
+    }
+
+    const [summary] = await GiftTransaction.aggregate([
+      { $match: match },
+      {
+        $group: {
+          _id: null,
+          totalCoins: { $sum: '$totalCost' },
+          totalGifts: { $sum: '$quantity' },
+          totalTransactions: { $sum: 1 }
+        }
+      }
+    ]);
+
+    return res.status(200).json({
+      success: true,
+      data: {
+        period,
+        totalCoins: summary?.totalCoins || 0,
+        totalGifts: summary?.totalGifts || 0,
+        totalTransactions: summary?.totalTransactions || 0,
+      }
+    });
+  } catch (error) {
+    return res.status(500).json({
+      success: false,
+      error: error.message
+    });
+  }
+});
 app.get('/gift-history/host/:hostId', async (req, res) => {
   try {
     const { hostId } = req.params;
