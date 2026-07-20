@@ -582,9 +582,11 @@ io.on('connection', (socket) => {
       if (isVideoRoom) {
         socket.emit('initialize_room_slots', completeLayoutMatrix);
       } else if (mongoose.Types.ObjectId.isValid(stringRoomId)) {
-        const audioRoomLayout = await AudioRoom.findById(stringRoomId).select('micSeatCount micLayoutType backgroundThemeId backgroundThemeUrl').lean();
+        const audioRoomLayout = await AudioRoom.findById(stringRoomId).select('micSeatCount micLayoutType backgroundThemeId backgroundThemeUrl lockedSlots').lean();
+        const storedLockedSlots = Array.isArray(audioRoomLayout?.lockedSlots) ? audioRoomLayout.lockedSlots : [3, 12, 19];
+        const lockedSlots = new Set(storedLockedSlots.map(Number));
         socket.emit('initialize_room_slots', {
-          slots: completeLayoutMatrix,
+          slots: completeLayoutMatrix.map((slot, index) => ({ ...slot, locked: lockedSlots.has(index) })),
           micSeatCount: audioRoomLayout?.micSeatCount || 15,
           micLayoutType: audioRoomLayout?.micLayoutType || 'chatroom',
           backgroundThemeId: audioRoomLayout?.backgroundThemeId || null,
@@ -601,13 +603,13 @@ io.on('connection', (socket) => {
   });
 
   // 2. EVENT: Request Slot Change
-  socket.on('request_slot_change', async ({ roomId, userId, name, profilePic, frameUrl, targetSlotIndex, numericUid, isMuted, cameraOn }) => {
+  socket.on('request_slot_change', async ({ roomId, userId, name, profilePic, frameUrl, targetSlotIndex, numericUid, isMuted, cameraOn, locked }) => {
     try {
 
       let finalFrameUrl = frameUrl;
 
       // Fetch from DB only if the client didn't send a frameUrl
-      if (!finalFrameUrl) {
+      if (!finalFrameUrl && userId && typeof locked !== 'boolean') {
         const dbUser = await User.findById(userId).select('frameUrl');
         finalFrameUrl = dbUser?.frameUrl || null;
       }
@@ -616,6 +618,43 @@ io.on('connection', (socket) => {
       const isVideoRoom = stringRoomId.startsWith('glix_');
       const normalizedSlotIndex = Number(targetSlotIndex);
       if (!Number.isInteger(normalizedSlotIndex) || normalizedSlotIndex < 0) return;
+
+      if (typeof locked === 'boolean') {
+        if (isVideoRoom) {
+          socket.emit('error_notice', { message: 'Video slots cannot be locked from this action.' });
+          return;
+        }
+
+        if (!mongoose.Types.ObjectId.isValid(stringRoomId)) return;
+        const audioRoom = await AudioRoom.findById(stringRoomId).select('hostId lockedSlots');
+        if (!audioRoom) {
+          socket.emit('error_notice', { message: 'Audio room not found.' });
+          return;
+        }
+
+        const canLockSlot = String(audioRoom.hostId || '') === String(userId || '') || String(audioRoom.hostId || '') === String(socket.userId || '');
+        if (!canLockSlot) {
+          socket.emit('error_notice', { message: 'Only the host can lock mic slots.' });
+          return;
+        }
+
+        const lockedSlots = new Set((audioRoom.lockedSlots || []).map(Number));
+        if (locked) {
+          lockedSlots.add(normalizedSlotIndex);
+        } else {
+          lockedSlots.delete(normalizedSlotIndex);
+        }
+        audioRoom.lockedSlots = Array.from(lockedSlots).filter(Number.isInteger).sort((a, b) => a - b);
+        audioRoom.lastHeartbeatAt = new Date();
+        await audioRoom.save();
+
+        io.to(stringRoomId).emit('slot_lock_changed', {
+          slotIndex: normalizedSlotIndex,
+          locked
+        });
+        return;
+      }
+
       const queryFilter = isVideoRoom ? { channelName: stringRoomId } : { _id: stringRoomId };
 
       if (isVideoRoom) {
@@ -767,8 +806,9 @@ io.on('connection', (socket) => {
         }
       });
 
+      const lockedSlots = new Set((audioRoom.lockedSlots || []).map(Number));
       io.to(stringRoomId).emit('room_layout_changed', {
-        slots: completeLayoutMatrix,
+        slots: completeLayoutMatrix.map((slot, index) => ({ ...slot, locked: lockedSlots.has(index) })),
         micSeatCount: audioRoom.micSeatCount,
         micLayoutType: audioRoom.micLayoutType,
         backgroundThemeId: audioRoom.backgroundThemeId || null,
@@ -792,13 +832,20 @@ io.on('connection', (socket) => {
     });
   });
 
-  socket.on('send_gift', async ({ roomId, senderName, hostId, gift, giftName, avatar, userId, quantity, coins }) => {
+  socket.on('send_gift', async ({ roomId, senderName, hostId, gift, giftName, avatar, userId, quantity, coins, receiverIds = [] }) => {
 
-    console.log('gift data:', userId, roomId, hostId, coins);
+    console.log('gift data:', userId, roomId, hostId, coins, receiverIds);
 
-    if (!hostId) {
-      console.error("Backend Error: Received null hostId!");
-      socket.emit('gift_error', { message: "Invalid host ID received." });
+    const fallbackReceiverId = hostId ? hostId.toString() : '';
+    const normalizedReceiverIds = [...new Set(
+      (Array.isArray(receiverIds) && receiverIds.length ? receiverIds : [fallbackReceiverId])
+        .map(id => id?.toString?.() || String(id || ''))
+        .filter(id => mongoose.Types.ObjectId.isValid(id))
+    )];
+
+    if (!normalizedReceiverIds.length) {
+      console.error('Backend Error: Received no valid gift receiver IDs.');
+      socket.emit('gift_error', { message: 'Invalid gift receiver received.' });
       return;
     }
 
@@ -806,15 +853,16 @@ io.on('connection', (socket) => {
     const giftQuantity = Number(quantity);
 
     if (!Number.isFinite(coinPrice) || !Number.isFinite(giftQuantity) || coinPrice <= 0 || giftQuantity <= 0) {
-      socket.emit('gift_error', { message: "Invalid gift cost received." });
+      socket.emit('gift_error', { message: 'Invalid gift cost received.' });
       return;
     }
 
-    const totalCost = coinPrice * giftQuantity;
+    const perReceiverCost = coinPrice * giftQuantity;
+    const totalCost = perReceiverCost * normalizedReceiverIds.length;
+    const stringRoomId = roomId ? roomId.toString() : '';
 
     const session = await mongoose.startSession();
     session.startTransaction();
-
 
     try {
       const sender = await User.findOneAndUpdate(
@@ -823,53 +871,59 @@ io.on('connection', (socket) => {
         { new: true, session }
       );
 
-      if (!sender) throw new Error("Insufficient coins");
+      if (!sender) throw new Error('Insufficient coins');
 
-      // 2. Add earned diamonds to Receiver (Host)
-      await User.findByIdAndUpdate(
-        hostId,
-        { $inc: { daimon: totalCost } },
+      const receiverUpdate = await User.updateMany(
+        { _id: { $in: normalizedReceiverIds.map(id => new mongoose.Types.ObjectId(id)) } },
+        { $inc: { daimon: perReceiverCost } },
         { session }
       );
 
-      await GiftTransaction.create([{
-        roomId: roomId?.toString(),
-        senderId: userId,
-        receiverId: hostId,
-        giftName,
-        giftImage: gift,
-        coinPrice,
-        quantity: giftQuantity,
-        totalCost
-      }], { session });
+      if ((receiverUpdate.matchedCount ?? 0) !== normalizedReceiverIds.length) {
+        throw new Error('One or more gift receivers were not found.');
+      }
 
+      await GiftTransaction.create(
+        normalizedReceiverIds.map(receiverId => ({
+          roomId: stringRoomId,
+          senderId: userId,
+          receiverId,
+          giftName,
+          giftImage: gift,
+          coinPrice,
+          quantity: giftQuantity,
+          totalCost: perReceiverCost
+        })),
+        { session }
+      );
 
       await session.commitTransaction();
-      await recordRewardActivity(userId, 'send_gift', { roomId: roomId?.toString(), totalCost });
+      await recordRewardActivity(userId, 'send_gift', { roomId: stringRoomId, totalCost, receiverIds: normalizedReceiverIds });
 
     } catch (error) {
       await session.abortTransaction();
-      // Emit error back to the sender only
       socket.emit('gift_error', { message: error.message });
       return;
     } finally {
       session.endSession();
     }
-    const stringRoomId = roomId ? roomId.toString() : '';
+
     io.to(stringRoomId).emit('receive_gift', {
       id: Date.now().toString() + Math.random().toString(),
       type: 'gift',
       sender: senderName,
-      gift: gift,
-      giftName: giftName,
-      avatar: avatar,
+      gift,
+      giftName,
+      avatar,
       quantity: giftQuantity,
+      coins: coinPrice,
       totalCost,
-      userId: userId
+      perReceiverCost,
+      receiverIds: normalizedReceiverIds,
+      userId
     });
     await emitRoomStats(stringRoomId);
   });
-
   // 5. EVENT: Audience Mic Requests (Correctly Un-nested now)
   socket.on('audience_join_request', (data) => {
     if (!data?.hostId || !data?.roomId) return;
@@ -1019,11 +1073,11 @@ io.on('connection', (socket) => {
   socket.on('register_user', (userId) => {
     if (userId) {
       socket.join(userId.toString());
-      console.log(`✅ SUCCESS: User ${userId} joined room: ${userId}`);
+      console.log(`SUCCESS: User ${userId} joined room: ${userId}`);
       // Send a confirmation back to the client to verify connection
       socket.emit('system_message', `Successfully joined room: ${userId}`);
     } else {
-      console.log("❌ ERROR: Attempted to join room with empty userId");
+      console.log("ERROR: Attempted to join room with empty userId");
     }
   });
 
@@ -1095,7 +1149,7 @@ io.on('connection', (socket) => {
   });
 
   socket.on('get_chat_list', async ({ userId }) => {
-    console.log("🔍 Server received request for chat list. UserID:", userId);
+    console.log("Server received request for chat list. UserID:", userId);
     try {
       const chatList = await DirectMessage.aggregate([
         { $match: { $or: [{ senderId: userId }, { receiverId: userId }] } },
@@ -1497,7 +1551,7 @@ app.get('/gift-history/room/:roomId', async (req, res) => {
       roomMatchValues.push(new mongoose.Types.ObjectId(roomId));
     }
 
-    const result = await GiftTransaction.aggregate([
+    const [roomSummary] = await GiftTransaction.aggregate([
       {
         $match: {
           roomId: { $in: roomMatchValues }
@@ -1505,20 +1559,41 @@ app.get('/gift-history/room/:roomId', async (req, res) => {
       },
       {
         $group: {
-          _id: "$roomId",
-          totalCoins: { $sum: "$totalCost" },
-          totalGifts: { $sum: "$quantity" },
+          _id: '$roomId',
+          totalCoins: { $sum: '$totalCost' },
+          totalGifts: { $sum: '$quantity' },
           totalTransactions: { $sum: 1 }
         }
       }
     ]);
 
+    const receiverRows = await GiftTransaction.aggregate([
+      {
+        $match: {
+          roomId: { $in: roomMatchValues },
+          receiverId: { $exists: true, $ne: null }
+        }
+      },
+      {
+        $group: {
+          _id: '$receiverId',
+          totalCoins: { $sum: '$totalCost' }
+        }
+      }
+    ]);
+
+    const receiverTotals = receiverRows.reduce((acc, row) => {
+      if (row?._id) acc[row._id.toString()] = row.totalCoins || 0;
+      return acc;
+    }, {});
+
     res.status(200).json({
       success: true,
-      data: result[0] || {
-        totalCoins: 0,
-        totalGifts: 0,
-        totalTransactions: 0
+      data: {
+        totalCoins: roomSummary?.totalCoins || 0,
+        totalGifts: roomSummary?.totalGifts || 0,
+        totalTransactions: roomSummary?.totalTransactions || 0,
+        receiverTotals
       }
     });
 
@@ -1529,7 +1604,6 @@ app.get('/gift-history/room/:roomId', async (req, res) => {
     });
   }
 });
-
 app.get('/gift-history/host/:hostId', async (req, res) => {
   try {
     const { hostId } = req.params;
@@ -1577,7 +1651,8 @@ app.post('/create', async (req, res) => {
       hostId,
       isLive: true,
       speakers: [{ userId: hostId, isMuted: false, slotIndex: 0, numericUid: sanitizedUid }],
-      audience: []
+      audience: [],
+      lockedSlots: [3, 12, 19]
     });
     await newRoom.save();
 
@@ -1641,34 +1716,24 @@ app.post('/join', async (req, res) => {
       if (!roomObj) return res.status(404).json({ error: "Audio room not found" });
       if (!roomObj.isLive) return res.status(400).json({ error: "This room has already ended" });
 
-      await AudioRoom.findByIdAndUpdate(stringRoomId, {
-        $pull: {
-          speakers: { userId }
-        },
-        $set: { lastHeartbeatAt: new Date() }
-      });
-
-      roomObj = await AudioRoom.findById(stringRoomId);
-
       const currentSpeakers = Array.isArray(roomObj.speakers) ? roomObj.speakers : [];
       const currentAudience = Array.isArray(roomObj.audience) ? roomObj.audience : [];
       const validSpeakers = currentSpeakers.filter(s => s && s.userId);
       const validAudience = currentAudience.filter(Boolean);
-      if (validSpeakers.length !== currentSpeakers.length || validAudience.length !== currentAudience.length) {
-        roomObj.speakers = validSpeakers;
-        roomObj.audience = validAudience;
-        await roomObj.save();
-      }
-
-      const isAlreadySpeaker = validSpeakers.some(s => String(s.userId) === String(userId));
-      const isAlreadyAudience = validAudience.some(id => String(id) === String(userId));
+      const existingSpeakerIndex = validSpeakers.findIndex(s => String(s.userId) === String(userId));
+      const isAlreadySpeaker = existingSpeakerIndex !== -1;
+      roomObj.speakers = validSpeakers;
+      roomObj.audience = validAudience.filter(id => String(id) !== String(userId));
+      roomObj.lastHeartbeatAt = new Date();
 
       if (isAlreadySpeaker) {
+        roomObj.speakers[existingSpeakerIndex].numericUid = sanitizedUid;
         userRole = RtcRole.PUBLISHER;
-      } else if (!isAlreadyAudience) {
+      } else {
         roomObj.audience.push(userId);
-        await roomObj.save();
       }
+
+      await roomObj.save();
     }
 
     if (!roomObj) return res.status(404).json({ error: "Room not found" });
@@ -4468,6 +4533,15 @@ app.use((req, res) => {
 server.listen(PORT, () => {
   console.log(`Server listening on port ${PORT}`);
 });
+
+
+
+
+
+
+
+
+
 
 
 

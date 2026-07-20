@@ -28,6 +28,7 @@ const audioRoomSchema = new mongoose.Schema({
   },
   backgroundThemeId: { type: String, default: null },
   backgroundThemeUrl: { type: String, default: null },
+  lockedSlots: [{ type: Number }],
 
   isLive: { type: Boolean, default: true },
   lastHeartbeatAt: { type: Date, default: Date.now },
@@ -38,3 +39,4 @@ const audioRoomSchema = new mongoose.Schema({
 const AudioRoom = mongoose.model('AudioRoom', audioRoomSchema);
 
 export default AudioRoom;
+
