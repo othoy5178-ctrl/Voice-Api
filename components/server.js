@@ -15,6 +15,7 @@ import Follow from './Follow.js';
 import GiftTransaction from './GiftTransation.js';
 import RewardActivity from './RewardActivity.js';
 import RewardClaim from './RewardClaim.js';
+import HostLiveRewardClaim from './HostLiveRewardClaim.js';
 import StoreItem from './StoreItem.js';
 import UserStoreItem from './UserStoreItem.js';
 import bcrypt from "bcryptjs";
@@ -59,8 +60,20 @@ const io = new Server(server, {
 const activeUsers = {};
 
 const roomPresence = {};
+const roomDisconnectTimers = new Map();
+const ROOM_RECONNECT_GRACE_MS = Number(process.env.ROOM_RECONNECT_GRACE_MS || 60000);
 
 const getStringRoomId = (roomId) => (roomId ? roomId.toString() : '');
+const getRoomDisconnectTimerKey = (roomId, userId) => `${getStringRoomId(roomId)}:${userId?.toString?.() || String(userId || '')}`;
+
+const clearRoomDisconnectTimer = (roomId, userId) => {
+  const timerKey = getRoomDisconnectTimerKey(roomId, userId);
+  const timer = roomDisconnectTimers.get(timerKey);
+  if (!timer) return false;
+  clearTimeout(timer);
+  roomDisconnectTimers.delete(timerKey);
+  return true;
+};
 
 const buildRoomMemberPayload = (userId, fallback = {}) => ({
   userId: userId?.toString?.() || String(userId || ''),
@@ -160,28 +173,40 @@ const getVideoRoomFilter = (roomId) => {
 const closeStaleLiveRooms = async () => {
   const cutoff = getLiveRoomFreshCutoff();
   const now = new Date();
+  const staleFilter = {
+    isLive: true,
+    $or: [
+      { lastHeartbeatAt: { $lt: cutoff } },
+      { lastHeartbeatAt: { $exists: false }, createdAt: { $lt: cutoff } }
+    ]
+  };
 
-  await AudioRoom.updateMany(
-    {
-      isLive: true,
-      $or: [
-        { lastHeartbeatAt: { $lt: cutoff } },
-        { lastHeartbeatAt: { $exists: false }, createdAt: { $lt: cutoff } }
-      ]
-    },
-    { $set: { isLive: false, speakers: [], audience: [], endedAt: now } }
-  );
+  const [staleAudioRooms, staleVideoRooms] = await Promise.all([
+    AudioRoom.find(staleFilter).select('_id hostId createdAt').lean(),
+    Room.find(staleFilter).select('_id channelName hostId createdAt').lean()
+  ]);
 
-  await Room.updateMany(
-    {
-      isLive: true,
-      $or: [
-        { lastHeartbeatAt: { $lt: cutoff } },
-        { lastHeartbeatAt: { $exists: false }, createdAt: { $lt: cutoff } }
-      ]
-    },
-    { $set: { isLive: false, endedAt: now } }
-  );
+  await Promise.all([
+    ...staleAudioRooms.map(room => recordHostLiveSessionActivity({
+      hostId: room.hostId,
+      roomId: room._id,
+      roomMode: 'audio',
+      startedAt: room.createdAt,
+      endedAt: now
+    })),
+    ...staleVideoRooms.map(room => recordHostLiveSessionActivity({
+      hostId: room.hostId,
+      roomId: room.channelName || room._id,
+      roomMode: 'video',
+      startedAt: room.createdAt,
+      endedAt: now
+    }))
+  ]);
+
+  await Promise.all([
+    AudioRoom.updateMany(staleFilter, { $set: { isLive: false, speakers: [], audience: [], endedAt: now } }),
+    Room.updateMany(staleFilter, { $set: { isLive: false, endedAt: now } })
+  ]);
 };
 
 const createCleanSlotsBlueprint = () => Array.from({ length: 25 }, (_, i) => ({
@@ -203,7 +228,151 @@ const DEFAULT_STORE_ITEMS = [
   { itemKey: 'lion_king_frame', name: 'Lion King', category: 'Profile', section: 'Avatar Frame', type: 'frame', price: 400, currency: 'chang', durationDays: 30, assetKey: 'special', equipValue: 'special', sortOrder: 6 },
   { itemKey: 'honor_star', name: 'Honor Star', category: 'Honor', section: 'Avatar Frame', type: 'badge', price: 250, currency: 'chang', durationDays: 15, assetKey: 'honor-star', sortOrder: 7 },
   { itemKey: 'popular_flower', name: 'Flower Aura', category: 'Popular', section: 'Avatar Frame', type: 'frame', price: 180, currency: 'chang', durationDays: 30, assetKey: 'flower', equipValue: 'flower', sortOrder: 8 },
-  { itemKey: 'star_entry_effect', name: 'Star Entry', category: 'Popular', section: 'New This Month', type: 'entryVideo', price: 300, currency: 'chang', durationDays: 30, assetKey: 'star', previewUrl: 'https://www.w3schools.com/html/mov_bbb.mp4', equipValue: 'https://www.w3schools.com/html/mov_bbb.mp4', sortOrder: 9 }
+  { itemKey: 'star_entry_effect', name: 'Star Entry', category: 'Popular', section: 'New This Month', type: 'entryVideo', price: 300, currency: 'chang', durationDays: 30, assetKey: 'star', previewUrl: 'https://www.w3schools.com/html/mov_bbb.mp4', equipValue: 'https://www.w3schools.com/html/mov_bbb.mp4', sortOrder: 9 },
+  { itemKey: 'cloud_frame_14_k1gmdn', name: 'Frame 14', category: 'Profile', section: 'Avatar Frame', type: 'frame', price: 29.99, currency: 'chang', durationDays: 30, imageUrl: 'https://res.cloudinary.com/dh99ihggv/image/upload/v1784627198/14_k1gmdn.png', equipValue: 'https://res.cloudinary.com/dh99ihggv/image/upload/v1784627198/14_k1gmdn.png', sortOrder: 100 },
+  { itemKey: 'cloud_frame_38_pntuoi', name: 'Frame 38', category: 'Profile', section: 'Avatar Frame', type: 'frame', price: 29.99, currency: 'chang', durationDays: 30, imageUrl: 'https://res.cloudinary.com/dh99ihggv/image/upload/v1784627195/38_pntuoi.png', equipValue: 'https://res.cloudinary.com/dh99ihggv/image/upload/v1784627195/38_pntuoi.png', sortOrder: 101 },
+  { itemKey: 'cloud_frame_47_qbtd4b', name: 'Frame 47', category: 'Profile', section: 'Avatar Frame', type: 'frame', price: 29.99, currency: 'chang', durationDays: 30, imageUrl: 'https://res.cloudinary.com/dh99ihggv/image/upload/v1784627193/47_qbtd4b.png', equipValue: 'https://res.cloudinary.com/dh99ihggv/image/upload/v1784627193/47_qbtd4b.png', sortOrder: 102 },
+  { itemKey: 'cloud_frame_32_zh3kmk', name: 'Frame 32', category: 'Profile', section: 'Avatar Frame', type: 'frame', price: 29.99, currency: 'chang', durationDays: 30, imageUrl: 'https://res.cloudinary.com/dh99ihggv/image/upload/v1784627190/32_zh3kmk.png', equipValue: 'https://res.cloudinary.com/dh99ihggv/image/upload/v1784627190/32_zh3kmk.png', sortOrder: 103 },
+  { itemKey: 'cloud_frame_33_visry2', name: 'Frame 33', category: 'Profile', section: 'Avatar Frame', type: 'frame', price: 29.99, currency: 'chang', durationDays: 30, imageUrl: 'https://res.cloudinary.com/dh99ihggv/image/upload/v1784627188/33_visry2.png', equipValue: 'https://res.cloudinary.com/dh99ihggv/image/upload/v1784627188/33_visry2.png', sortOrder: 104 },
+  { itemKey: 'cloud_frame_57_bbqxz0', name: 'Frame 57', category: 'Profile', section: 'Avatar Frame', type: 'frame', price: 29.99, currency: 'chang', durationDays: 30, imageUrl: 'https://res.cloudinary.com/dh99ihggv/image/upload/v1784627186/57_bbqxz0.png', equipValue: 'https://res.cloudinary.com/dh99ihggv/image/upload/v1784627186/57_bbqxz0.png', sortOrder: 105 },
+  { itemKey: 'cloud_frame_35_aovwsn', name: 'Frame 35', category: 'Profile', section: 'Avatar Frame', type: 'frame', price: 29.99, currency: 'chang', durationDays: 30, imageUrl: 'https://res.cloudinary.com/dh99ihggv/image/upload/v1784627183/35_aovwsn.png', equipValue: 'https://res.cloudinary.com/dh99ihggv/image/upload/v1784627183/35_aovwsn.png', sortOrder: 106 },
+  { itemKey: 'cloud_frame_49_g810qd', name: 'Frame 49', category: 'Profile', section: 'Avatar Frame', type: 'frame', price: 29.99, currency: 'chang', durationDays: 30, imageUrl: 'https://res.cloudinary.com/dh99ihggv/image/upload/v1784627181/49_g810qd.png', equipValue: 'https://res.cloudinary.com/dh99ihggv/image/upload/v1784627181/49_g810qd.png', sortOrder: 107 },
+  { itemKey: 'cloud_frame_23_uiuhvl', name: 'Frame 23', category: 'Profile', section: 'Avatar Frame', type: 'frame', price: 29.99, currency: 'chang', durationDays: 30, imageUrl: 'https://res.cloudinary.com/dh99ihggv/image/upload/v1784627179/23_uiuhvl.png', equipValue: 'https://res.cloudinary.com/dh99ihggv/image/upload/v1784627179/23_uiuhvl.png', sortOrder: 108 },
+  { itemKey: 'cloud_frame_7_drllix', name: 'Frame 7', category: 'Profile', section: 'Avatar Frame', type: 'frame', price: 29.99, currency: 'chang', durationDays: 30, imageUrl: 'https://res.cloudinary.com/dh99ihggv/image/upload/v1784627176/7_drllix.png', equipValue: 'https://res.cloudinary.com/dh99ihggv/image/upload/v1784627176/7_drllix.png', sortOrder: 109 },
+  { itemKey: 'cloud_frame_58_ys0ajn', name: 'Frame 58', category: 'Profile', section: 'Avatar Frame', type: 'frame', price: 29.99, currency: 'chang', durationDays: 30, imageUrl: 'https://res.cloudinary.com/dh99ihggv/image/upload/v1784627174/58_ys0ajn.png', equipValue: 'https://res.cloudinary.com/dh99ihggv/image/upload/v1784627174/58_ys0ajn.png', sortOrder: 110 },
+  { itemKey: 'cloud_frame_16_phjlxp', name: 'Frame 16', category: 'Profile', section: 'Avatar Frame', type: 'frame', price: 29.99, currency: 'chang', durationDays: 30, imageUrl: 'https://res.cloudinary.com/dh99ihggv/image/upload/v1784627172/16_phjlxp.png', equipValue: 'https://res.cloudinary.com/dh99ihggv/image/upload/v1784627172/16_phjlxp.png', sortOrder: 111 },
+  { itemKey: 'cloud_frame_44_h68nnq', name: 'Frame 44', category: 'Profile', section: 'Avatar Frame', type: 'frame', price: 29.99, currency: 'chang', durationDays: 30, imageUrl: 'https://res.cloudinary.com/dh99ihggv/image/upload/v1784627169/44_h68nnq.png', equipValue: 'https://res.cloudinary.com/dh99ihggv/image/upload/v1784627169/44_h68nnq.png', sortOrder: 112 },
+  { itemKey: 'cloud_frame_20_fwncwv', name: 'Frame 20', category: 'Profile', section: 'Avatar Frame', type: 'frame', price: 29.99, currency: 'chang', durationDays: 30, imageUrl: 'https://res.cloudinary.com/dh99ihggv/image/upload/v1784627168/20_fwncwv.png', equipValue: 'https://res.cloudinary.com/dh99ihggv/image/upload/v1784627168/20_fwncwv.png', sortOrder: 113 },
+  { itemKey: 'cloud_frame_65_usa7l3', name: 'Frame 65', category: 'Profile', section: 'Avatar Frame', type: 'frame', price: 29.99, currency: 'chang', durationDays: 30, imageUrl: 'https://res.cloudinary.com/dh99ihggv/image/upload/v1784627165/65_usa7l3.png', equipValue: 'https://res.cloudinary.com/dh99ihggv/image/upload/v1784627165/65_usa7l3.png', sortOrder: 114 },
+  { itemKey: 'cloud_frame_54_qyvwe9', name: 'Frame 54', category: 'Profile', section: 'Avatar Frame', type: 'frame', price: 29.99, currency: 'chang', durationDays: 30, imageUrl: 'https://res.cloudinary.com/dh99ihggv/image/upload/v1784627163/54_qyvwe9.png', equipValue: 'https://res.cloudinary.com/dh99ihggv/image/upload/v1784627163/54_qyvwe9.png', sortOrder: 115 },
+  { itemKey: 'cloud_frame_31_kebioh', name: 'Frame 31', category: 'Profile', section: 'Avatar Frame', type: 'frame', price: 29.99, currency: 'chang', durationDays: 30, imageUrl: 'https://res.cloudinary.com/dh99ihggv/image/upload/v1784627160/31_kebioh.png', equipValue: 'https://res.cloudinary.com/dh99ihggv/image/upload/v1784627160/31_kebioh.png', sortOrder: 116 },
+  { itemKey: 'cloud_frame_34_oivgv0', name: 'Frame 34', category: 'Profile', section: 'Avatar Frame', type: 'frame', price: 29.99, currency: 'chang', durationDays: 30, imageUrl: 'https://res.cloudinary.com/dh99ihggv/image/upload/v1784627158/34_oivgv0.png', equipValue: 'https://res.cloudinary.com/dh99ihggv/image/upload/v1784627158/34_oivgv0.png', sortOrder: 117 },
+  { itemKey: 'cloud_frame_24_gf1wdd', name: 'Frame 24', category: 'Profile', section: 'Avatar Frame', type: 'frame', price: 29.99, currency: 'chang', durationDays: 30, imageUrl: 'https://res.cloudinary.com/dh99ihggv/image/upload/v1784627156/24_gf1wdd.png', equipValue: 'https://res.cloudinary.com/dh99ihggv/image/upload/v1784627156/24_gf1wdd.png', sortOrder: 118 },
+  { itemKey: 'cloud_frame_9_jthu2n', name: 'Frame 9', category: 'Profile', section: 'Avatar Frame', type: 'frame', price: 29.99, currency: 'chang', durationDays: 30, imageUrl: 'https://res.cloudinary.com/dh99ihggv/image/upload/v1784627153/9_jthu2n.png', equipValue: 'https://res.cloudinary.com/dh99ihggv/image/upload/v1784627153/9_jthu2n.png', sortOrder: 119 },
+  { itemKey: 'cloud_frame_6_tauyyr', name: 'Frame 6', category: 'Profile', section: 'Avatar Frame', type: 'frame', price: 29.99, currency: 'chang', durationDays: 30, imageUrl: 'https://res.cloudinary.com/dh99ihggv/image/upload/v1784627151/6_tauyyr.png', equipValue: 'https://res.cloudinary.com/dh99ihggv/image/upload/v1784627151/6_tauyyr.png', sortOrder: 120 },
+  { itemKey: 'cloud_frame_4_bugdbb', name: 'Frame 4', category: 'Profile', section: 'Avatar Frame', type: 'frame', price: 29.99, currency: 'chang', durationDays: 30, imageUrl: 'https://res.cloudinary.com/dh99ihggv/image/upload/v1784627148/4_bugdbb.png', equipValue: 'https://res.cloudinary.com/dh99ihggv/image/upload/v1784627148/4_bugdbb.png', sortOrder: 121 },
+  { itemKey: 'cloud_frame_40_bwqyid', name: 'Frame 40', category: 'Profile', section: 'Avatar Frame', type: 'frame', price: 29.99, currency: 'chang', durationDays: 30, imageUrl: 'https://res.cloudinary.com/dh99ihggv/image/upload/v1784627146/40_bwqyid.png', equipValue: 'https://res.cloudinary.com/dh99ihggv/image/upload/v1784627146/40_bwqyid.png', sortOrder: 122 },
+  { itemKey: 'cloud_frame_48_eyhoe2', name: 'Frame 48', category: 'Profile', section: 'Avatar Frame', type: 'frame', price: 29.99, currency: 'chang', durationDays: 30, imageUrl: 'https://res.cloudinary.com/dh99ihggv/image/upload/v1784627143/48_eyhoe2.png', equipValue: 'https://res.cloudinary.com/dh99ihggv/image/upload/v1784627143/48_eyhoe2.png', sortOrder: 123 },
+  { itemKey: 'cloud_frame_37_tgx4nf', name: 'Frame 37', category: 'Profile', section: 'Avatar Frame', type: 'frame', price: 29.99, currency: 'chang', durationDays: 30, imageUrl: 'https://res.cloudinary.com/dh99ihggv/image/upload/v1784627141/37_tgx4nf.png', equipValue: 'https://res.cloudinary.com/dh99ihggv/image/upload/v1784627141/37_tgx4nf.png', sortOrder: 124 },
+  { itemKey: 'cloud_frame_41_ar50r1', name: 'Frame 41', category: 'Profile', section: 'Avatar Frame', type: 'frame', price: 29.99, currency: 'chang', durationDays: 30, imageUrl: 'https://res.cloudinary.com/dh99ihggv/image/upload/v1784627139/41_ar50r1.png', equipValue: 'https://res.cloudinary.com/dh99ihggv/image/upload/v1784627139/41_ar50r1.png', sortOrder: 125 },
+  { itemKey: 'cloud_frame_13_abmekr', name: 'Frame 13', category: 'Profile', section: 'Avatar Frame', type: 'frame', price: 29.99, currency: 'chang', durationDays: 30, imageUrl: 'https://res.cloudinary.com/dh99ihggv/image/upload/v1784627136/13_abmekr.png', equipValue: 'https://res.cloudinary.com/dh99ihggv/image/upload/v1784627136/13_abmekr.png', sortOrder: 126 },
+  { itemKey: 'cloud_frame_52_ezcqqv', name: 'Frame 52', category: 'Profile', section: 'Avatar Frame', type: 'frame', price: 29.99, currency: 'chang', durationDays: 30, imageUrl: 'https://res.cloudinary.com/dh99ihggv/image/upload/v1784627134/52_ezcqqv.png', equipValue: 'https://res.cloudinary.com/dh99ihggv/image/upload/v1784627134/52_ezcqqv.png', sortOrder: 127 },
+  { itemKey: 'cloud_frame_43_jhm00v', name: 'Frame 43', category: 'Profile', section: 'Avatar Frame', type: 'frame', price: 29.99, currency: 'chang', durationDays: 30, imageUrl: 'https://res.cloudinary.com/dh99ihggv/image/upload/v1784627132/43_jhm00v.png', equipValue: 'https://res.cloudinary.com/dh99ihggv/image/upload/v1784627132/43_jhm00v.png', sortOrder: 128 },
+  { itemKey: 'cloud_frame_36_ejk5w0', name: 'Frame 36', category: 'Profile', section: 'Avatar Frame', type: 'frame', price: 29.99, currency: 'chang', durationDays: 30, imageUrl: 'https://res.cloudinary.com/dh99ihggv/image/upload/v1784627129/36_ejk5w0.png', equipValue: 'https://res.cloudinary.com/dh99ihggv/image/upload/v1784627129/36_ejk5w0.png', sortOrder: 129 },
+  { itemKey: 'cloud_frame_45_pfojqu', name: 'Frame 45', category: 'Profile', section: 'Avatar Frame', type: 'frame', price: 29.99, currency: 'chang', durationDays: 30, imageUrl: 'https://res.cloudinary.com/dh99ihggv/image/upload/v1784627127/45_pfojqu.png', equipValue: 'https://res.cloudinary.com/dh99ihggv/image/upload/v1784627127/45_pfojqu.png', sortOrder: 130 },
+  { itemKey: 'cloud_frame_8_uxettd', name: 'Frame 8', category: 'Profile', section: 'Avatar Frame', type: 'frame', price: 29.99, currency: 'chang', durationDays: 30, imageUrl: 'https://res.cloudinary.com/dh99ihggv/image/upload/v1784627125/8_uxettd.png', equipValue: 'https://res.cloudinary.com/dh99ihggv/image/upload/v1784627125/8_uxettd.png', sortOrder: 131 },
+  { itemKey: 'cloud_frame_63_sz3ztd', name: 'Frame 63', category: 'Profile', section: 'Avatar Frame', type: 'frame', price: 29.99, currency: 'chang', durationDays: 30, imageUrl: 'https://res.cloudinary.com/dh99ihggv/image/upload/v1784627122/63_sz3ztd.png', equipValue: 'https://res.cloudinary.com/dh99ihggv/image/upload/v1784627122/63_sz3ztd.png', sortOrder: 132 },
+  { itemKey: 'cloud_frame_22_wbfpsi', name: 'Frame 22', category: 'Profile', section: 'Avatar Frame', type: 'frame', price: 29.99, currency: 'chang', durationDays: 30, imageUrl: 'https://res.cloudinary.com/dh99ihggv/image/upload/v1784627120/22_wbfpsi.png', equipValue: 'https://res.cloudinary.com/dh99ihggv/image/upload/v1784627120/22_wbfpsi.png', sortOrder: 133 },
+  { itemKey: 'cloud_frame_17_gqiw6z', name: 'Frame 17', category: 'Profile', section: 'Avatar Frame', type: 'frame', price: 29.99, currency: 'chang', durationDays: 30, imageUrl: 'https://res.cloudinary.com/dh99ihggv/image/upload/v1784627117/17_gqiw6z.png', equipValue: 'https://res.cloudinary.com/dh99ihggv/image/upload/v1784627117/17_gqiw6z.png', sortOrder: 134 },
+  { itemKey: 'cloud_frame_66_hmmpsp', name: 'Frame 66', category: 'Profile', section: 'Avatar Frame', type: 'frame', price: 29.99, currency: 'chang', durationDays: 30, imageUrl: 'https://res.cloudinary.com/dh99ihggv/image/upload/v1784627115/66_hmmpsp.png', equipValue: 'https://res.cloudinary.com/dh99ihggv/image/upload/v1784627115/66_hmmpsp.png', sortOrder: 135 },
+  { itemKey: 'cloud_frame_1_v1sv8x', name: 'Frame 1', category: 'Profile', section: 'Avatar Frame', type: 'frame', price: 29.99, currency: 'chang', durationDays: 30, imageUrl: 'https://res.cloudinary.com/dh99ihggv/image/upload/v1784627113/1_v1sv8x.png', equipValue: 'https://res.cloudinary.com/dh99ihggv/image/upload/v1784627113/1_v1sv8x.png', sortOrder: 136 },
+  { itemKey: 'cloud_frame_62_urwcf4', name: 'Frame 62', category: 'Profile', section: 'Avatar Frame', type: 'frame', price: 29.99, currency: 'chang', durationDays: 30, imageUrl: 'https://res.cloudinary.com/dh99ihggv/image/upload/v1784627110/62_urwcf4.png', equipValue: 'https://res.cloudinary.com/dh99ihggv/image/upload/v1784627110/62_urwcf4.png', sortOrder: 137 },
+  { itemKey: 'cloud_frame_46_ghipag', name: 'Frame 46', category: 'Profile', section: 'Avatar Frame', type: 'frame', price: 29.99, currency: 'chang', durationDays: 30, imageUrl: 'https://res.cloudinary.com/dh99ihggv/image/upload/v1784627108/46_ghipag.png', equipValue: 'https://res.cloudinary.com/dh99ihggv/image/upload/v1784627108/46_ghipag.png', sortOrder: 138 },
+  { itemKey: 'cloud_frame_51_ebhwbv', name: 'Frame 51', category: 'Profile', section: 'Avatar Frame', type: 'frame', price: 29.99, currency: 'chang', durationDays: 30, imageUrl: 'https://res.cloudinary.com/dh99ihggv/image/upload/v1784627106/51_ebhwbv.png', equipValue: 'https://res.cloudinary.com/dh99ihggv/image/upload/v1784627106/51_ebhwbv.png', sortOrder: 139 },
+  { itemKey: 'cloud_frame_10_f4wba6', name: 'Frame 10', category: 'Profile', section: 'Avatar Frame', type: 'frame', price: 29.99, currency: 'chang', durationDays: 30, imageUrl: 'https://res.cloudinary.com/dh99ihggv/image/upload/v1784627103/10_f4wba6.png', equipValue: 'https://res.cloudinary.com/dh99ihggv/image/upload/v1784627103/10_f4wba6.png', sortOrder: 140 },
+  { itemKey: 'cloud_frame_3_tgjc8u', name: 'Frame 3', category: 'Profile', section: 'Avatar Frame', type: 'frame', price: 29.99, currency: 'chang', durationDays: 30, imageUrl: 'https://res.cloudinary.com/dh99ihggv/image/upload/v1784627101/3_tgjc8u.png', equipValue: 'https://res.cloudinary.com/dh99ihggv/image/upload/v1784627101/3_tgjc8u.png', sortOrder: 141 },
+  { itemKey: 'cloud_frame_26_pvys8p', name: 'Frame 26', category: 'Profile', section: 'Avatar Frame', type: 'frame', price: 29.99, currency: 'chang', durationDays: 30, imageUrl: 'https://res.cloudinary.com/dh99ihggv/image/upload/v1784627098/26_pvys8p.png', equipValue: 'https://res.cloudinary.com/dh99ihggv/image/upload/v1784627098/26_pvys8p.png', sortOrder: 142 },
+  { itemKey: 'cloud_frame_5_xq2z8v', name: 'Frame 5', category: 'Profile', section: 'Avatar Frame', type: 'frame', price: 29.99, currency: 'chang', durationDays: 30, imageUrl: 'https://res.cloudinary.com/dh99ihggv/image/upload/v1784627096/5_xq2z8v.png', equipValue: 'https://res.cloudinary.com/dh99ihggv/image/upload/v1784627096/5_xq2z8v.png', sortOrder: 143 },
+  { itemKey: 'cloud_frame_42_xyzjem', name: 'Frame 42', category: 'Profile', section: 'Avatar Frame', type: 'frame', price: 29.99, currency: 'chang', durationDays: 30, imageUrl: 'https://res.cloudinary.com/dh99ihggv/image/upload/v1784627094/42_xyzjem.png', equipValue: 'https://res.cloudinary.com/dh99ihggv/image/upload/v1784627094/42_xyzjem.png', sortOrder: 144 },
+  { itemKey: 'cloud_frame_39_vypjvj', name: 'Frame 39', category: 'Profile', section: 'Avatar Frame', type: 'frame', price: 29.99, currency: 'chang', durationDays: 30, imageUrl: 'https://res.cloudinary.com/dh99ihggv/image/upload/v1784627092/39_vypjvj.png', equipValue: 'https://res.cloudinary.com/dh99ihggv/image/upload/v1784627092/39_vypjvj.png', sortOrder: 145 },
+  { itemKey: 'cloud_frame_12_urmvjq', name: 'Frame 12', category: 'Profile', section: 'Avatar Frame', type: 'frame', price: 29.99, currency: 'chang', durationDays: 30, imageUrl: 'https://res.cloudinary.com/dh99ihggv/image/upload/v1784627090/12_urmvjq.png', equipValue: 'https://res.cloudinary.com/dh99ihggv/image/upload/v1784627090/12_urmvjq.png', sortOrder: 146 },
+  { itemKey: 'cloud_frame_55_mltnjg', name: 'Frame 55', category: 'Profile', section: 'Avatar Frame', type: 'frame', price: 29.99, currency: 'chang', durationDays: 30, imageUrl: 'https://res.cloudinary.com/dh99ihggv/image/upload/v1784627087/55_mltnjg.png', equipValue: 'https://res.cloudinary.com/dh99ihggv/image/upload/v1784627087/55_mltnjg.png', sortOrder: 147 },
+  { itemKey: 'cloud_frame_56_vbqjiz', name: 'Frame 56', category: 'Profile', section: 'Avatar Frame', type: 'frame', price: 29.99, currency: 'chang', durationDays: 30, imageUrl: 'https://res.cloudinary.com/dh99ihggv/image/upload/v1784627085/56_vbqjiz.png', equipValue: 'https://res.cloudinary.com/dh99ihggv/image/upload/v1784627085/56_vbqjiz.png', sortOrder: 148 },
+  { itemKey: 'cloud_frame_11_hrjjum', name: 'Frame 11', category: 'Profile', section: 'Avatar Frame', type: 'frame', price: 29.99, currency: 'chang', durationDays: 30, imageUrl: 'https://res.cloudinary.com/dh99ihggv/image/upload/v1784627082/11_hrjjum.png', equipValue: 'https://res.cloudinary.com/dh99ihggv/image/upload/v1784627082/11_hrjjum.png', sortOrder: 149 },
+  { itemKey: 'cloud_frame_9_h2evxz', name: 'Frame 9', category: 'Profile', section: 'Avatar Frame', type: 'frame', price: 29.99, currency: 'chang', durationDays: 30, imageUrl: 'https://res.cloudinary.com/dh99ihggv/image/upload/v1784628310/9_h2evxz.gif', equipValue: 'https://res.cloudinary.com/dh99ihggv/image/upload/v1784628310/9_h2evxz.gif', sortOrder: 150 },
+  { itemKey: 'cloud_frame_12_vag6bt', name: 'Frame 12', category: 'Profile', section: 'Avatar Frame', type: 'frame', price: 29.99, currency: 'chang', durationDays: 30, imageUrl: 'https://res.cloudinary.com/dh99ihggv/image/upload/v1784628302/12_vag6bt.gif', equipValue: 'https://res.cloudinary.com/dh99ihggv/image/upload/v1784628302/12_vag6bt.gif', sortOrder: 151 },
+  { itemKey: 'cloud_frame_17_nukvoq', name: 'Frame 17', category: 'Profile', section: 'Avatar Frame', type: 'frame', price: 29.99, currency: 'chang', durationDays: 30, imageUrl: 'https://res.cloudinary.com/dh99ihggv/image/upload/v1784628298/17_nukvoq.gif', equipValue: 'https://res.cloudinary.com/dh99ihggv/image/upload/v1784628298/17_nukvoq.gif', sortOrder: 152 },
+  { itemKey: 'cloud_frame_13_rphrxk', name: 'Frame 13', category: 'Profile', section: 'Avatar Frame', type: 'frame', price: 29.99, currency: 'chang', durationDays: 30, imageUrl: 'https://res.cloudinary.com/dh99ihggv/image/upload/v1784628296/13_rphrxk.gif', equipValue: 'https://res.cloudinary.com/dh99ihggv/image/upload/v1784628296/13_rphrxk.gif', sortOrder: 153 },
+  { itemKey: 'cloud_frame_6_tvddud', name: 'Frame 6', category: 'Profile', section: 'Avatar Frame', type: 'frame', price: 29.99, currency: 'chang', durationDays: 30, imageUrl: 'https://res.cloudinary.com/dh99ihggv/image/upload/v1784628285/6_tvddud.gif', equipValue: 'https://res.cloudinary.com/dh99ihggv/image/upload/v1784628285/6_tvddud.gif', sortOrder: 154 },
+  { itemKey: 'cloud_frame_15_rlma2f', name: 'Frame 15', category: 'Profile', section: 'Avatar Frame', type: 'frame', price: 29.99, currency: 'chang', durationDays: 30, imageUrl: 'https://res.cloudinary.com/dh99ihggv/image/upload/v1784628283/15_rlma2f.gif', equipValue: 'https://res.cloudinary.com/dh99ihggv/image/upload/v1784628283/15_rlma2f.gif', sortOrder: 155 },
+  { itemKey: 'cloud_frame_18_dzx27i', name: 'Frame 18', category: 'Profile', section: 'Avatar Frame', type: 'frame', price: 29.99, currency: 'chang', durationDays: 30, imageUrl: 'https://res.cloudinary.com/dh99ihggv/image/upload/v1784628278/18_dzx27i.gif', equipValue: 'https://res.cloudinary.com/dh99ihggv/image/upload/v1784628278/18_dzx27i.gif', sortOrder: 156 },
+  { itemKey: 'cloud_frame_19_rybkoo', name: 'Frame 19', category: 'Profile', section: 'Avatar Frame', type: 'frame', price: 29.99, currency: 'chang', durationDays: 30, imageUrl: 'https://res.cloudinary.com/dh99ihggv/image/upload/v1784628275/19_rybkoo.gif', equipValue: 'https://res.cloudinary.com/dh99ihggv/image/upload/v1784628275/19_rybkoo.gif', sortOrder: 157 },
+  { itemKey: 'cloud_frame_16_mocxnk', name: 'Frame 16', category: 'Profile', section: 'Avatar Frame', type: 'frame', price: 29.99, currency: 'chang', durationDays: 30, imageUrl: 'https://res.cloudinary.com/dh99ihggv/image/upload/v1784628272/16_mocxnk.gif', equipValue: 'https://res.cloudinary.com/dh99ihggv/image/upload/v1784628272/16_mocxnk.gif', sortOrder: 158 },
+  { itemKey: 'cloud_frame_20_vd0egw', name: 'Frame 20', category: 'Profile', section: 'Avatar Frame', type: 'frame', price: 29.99, currency: 'chang', durationDays: 30, imageUrl: 'https://res.cloudinary.com/dh99ihggv/image/upload/v1784628271/20_vd0egw.gif', equipValue: 'https://res.cloudinary.com/dh99ihggv/image/upload/v1784628271/20_vd0egw.gif', sortOrder: 159 },
+  { itemKey: 'cloud_frame_26_umkve5', name: 'Frame 26', category: 'Profile', section: 'Avatar Frame', type: 'frame', price: 29.99, currency: 'chang', durationDays: 30, imageUrl: 'https://res.cloudinary.com/dh99ihggv/image/upload/v1784628267/26_umkve5.gif', equipValue: 'https://res.cloudinary.com/dh99ihggv/image/upload/v1784628267/26_umkve5.gif', sortOrder: 160 },
+  { itemKey: 'cloud_frame_14_q6pyqs', name: 'Frame 14', category: 'Profile', section: 'Avatar Frame', type: 'frame', price: 29.99, currency: 'chang', durationDays: 30, imageUrl: 'https://res.cloudinary.com/dh99ihggv/image/upload/v1784628265/14_q6pyqs.gif', equipValue: 'https://res.cloudinary.com/dh99ihggv/image/upload/v1784628265/14_q6pyqs.gif', sortOrder: 161 },
+  { itemKey: 'cloud_frame_29_esxjer', name: 'Frame 29', category: 'Profile', section: 'Avatar Frame', type: 'frame', price: 29.99, currency: 'chang', durationDays: 30, imageUrl: 'https://res.cloudinary.com/dh99ihggv/image/upload/v1784628259/29_esxjer.gif', equipValue: 'https://res.cloudinary.com/dh99ihggv/image/upload/v1784628259/29_esxjer.gif', sortOrder: 162 },
+  { itemKey: 'cloud_frame_22_onf3px', name: 'Frame 22', category: 'Profile', section: 'Avatar Frame', type: 'frame', price: 29.99, currency: 'chang', durationDays: 30, imageUrl: 'https://res.cloudinary.com/dh99ihggv/image/upload/v1784628255/22_onf3px.gif', equipValue: 'https://res.cloudinary.com/dh99ihggv/image/upload/v1784628255/22_onf3px.gif', sortOrder: 163 },
+  { itemKey: 'cloud_frame_24_rxgxej', name: 'Frame 24', category: 'Profile', section: 'Avatar Frame', type: 'frame', price: 29.99, currency: 'chang', durationDays: 30, imageUrl: 'https://res.cloudinary.com/dh99ihggv/image/upload/v1784628251/24_rxgxej.gif', equipValue: 'https://res.cloudinary.com/dh99ihggv/image/upload/v1784628251/24_rxgxej.gif', sortOrder: 164 },
+  { itemKey: 'cloud_frame_30_igwcaf', name: 'Frame 30', category: 'Profile', section: 'Avatar Frame', type: 'frame', price: 29.99, currency: 'chang', durationDays: 30, imageUrl: 'https://res.cloudinary.com/dh99ihggv/image/upload/v1784628249/30_igwcaf.gif', equipValue: 'https://res.cloudinary.com/dh99ihggv/image/upload/v1784628249/30_igwcaf.gif', sortOrder: 165 },
+  { itemKey: 'cloud_frame_25_duv6o3', name: 'Frame 25', category: 'Profile', section: 'Avatar Frame', type: 'frame', price: 29.99, currency: 'chang', durationDays: 30, imageUrl: 'https://res.cloudinary.com/dh99ihggv/image/upload/v1784628246/25_duv6o3.gif', equipValue: 'https://res.cloudinary.com/dh99ihggv/image/upload/v1784628246/25_duv6o3.gif', sortOrder: 166 },
+  { itemKey: 'cloud_frame_23_bodmmy', name: 'Frame 23', category: 'Profile', section: 'Avatar Frame', type: 'frame', price: 29.99, currency: 'chang', durationDays: 30, imageUrl: 'https://res.cloudinary.com/dh99ihggv/image/upload/v1784628243/23_bodmmy.gif', equipValue: 'https://res.cloudinary.com/dh99ihggv/image/upload/v1784628243/23_bodmmy.gif', sortOrder: 167 },
+  { itemKey: 'cloud_frame_21_tfjjq2', name: 'Frame 21', category: 'Profile', section: 'Avatar Frame', type: 'frame', price: 29.99, currency: 'chang', durationDays: 30, imageUrl: 'https://res.cloudinary.com/dh99ihggv/image/upload/v1784628241/21_tfjjq2.gif', equipValue: 'https://res.cloudinary.com/dh99ihggv/image/upload/v1784628241/21_tfjjq2.gif', sortOrder: 168 },
+  { itemKey: 'cloud_frame_28_hrh0lr', name: 'Frame 28', category: 'Profile', section: 'Avatar Frame', type: 'frame', price: 29.99, currency: 'chang', durationDays: 30, imageUrl: 'https://res.cloudinary.com/dh99ihggv/image/upload/v1784628238/28_hrh0lr.gif', equipValue: 'https://res.cloudinary.com/dh99ihggv/image/upload/v1784628238/28_hrh0lr.gif', sortOrder: 169 },
+  { itemKey: 'cloud_frame_38_yjlorr', name: 'Frame 38', category: 'Profile', section: 'Avatar Frame', type: 'frame', price: 29.99, currency: 'chang', durationDays: 30, imageUrl: 'https://res.cloudinary.com/dh99ihggv/image/upload/v1784628236/38_yjlorr.gif', equipValue: 'https://res.cloudinary.com/dh99ihggv/image/upload/v1784628236/38_yjlorr.gif', sortOrder: 170 },
+  { itemKey: 'cloud_frame_32_fnd3su', name: 'Frame 32', category: 'Profile', section: 'Avatar Frame', type: 'frame', price: 29.99, currency: 'chang', durationDays: 30, imageUrl: 'https://res.cloudinary.com/dh99ihggv/image/upload/v1784628233/32_fnd3su.gif', equipValue: 'https://res.cloudinary.com/dh99ihggv/image/upload/v1784628233/32_fnd3su.gif', sortOrder: 171 },
+  { itemKey: 'cloud_frame_36_izzfk0', name: 'Frame 36', category: 'Profile', section: 'Avatar Frame', type: 'frame', price: 29.99, currency: 'chang', durationDays: 30, imageUrl: 'https://res.cloudinary.com/dh99ihggv/image/upload/v1784628230/36_izzfk0.gif', equipValue: 'https://res.cloudinary.com/dh99ihggv/image/upload/v1784628230/36_izzfk0.gif', sortOrder: 172 },
+  { itemKey: 'cloud_frame_31_wyyda4', name: 'Frame 31', category: 'Profile', section: 'Avatar Frame', type: 'frame', price: 29.99, currency: 'chang', durationDays: 30, imageUrl: 'https://res.cloudinary.com/dh99ihggv/image/upload/v1784628194/31_wyyda4.gif', equipValue: 'https://res.cloudinary.com/dh99ihggv/image/upload/v1784628194/31_wyyda4.gif', sortOrder: 173 },
+  { itemKey: 'cloud_frame_39_ls1tup', name: 'Frame 39', category: 'Profile', section: 'Avatar Frame', type: 'frame', price: 29.99, currency: 'chang', durationDays: 30, imageUrl: 'https://res.cloudinary.com/dh99ihggv/image/upload/v1784628179/39_ls1tup.gif', equipValue: 'https://res.cloudinary.com/dh99ihggv/image/upload/v1784628179/39_ls1tup.gif', sortOrder: 174 },
+  { itemKey: 'cloud_frame_40_fcexaj', name: 'Frame 40', category: 'Profile', section: 'Avatar Frame', type: 'frame', price: 29.99, currency: 'chang', durationDays: 30, imageUrl: 'https://res.cloudinary.com/dh99ihggv/image/upload/v1784628176/40_fcexaj.gif', equipValue: 'https://res.cloudinary.com/dh99ihggv/image/upload/v1784628176/40_fcexaj.gif', sortOrder: 175 },
+  { itemKey: 'cloud_frame_35_si0buy', name: 'Frame 35', category: 'Profile', section: 'Avatar Frame', type: 'frame', price: 29.99, currency: 'chang', durationDays: 30, imageUrl: 'https://res.cloudinary.com/dh99ihggv/image/upload/v1784628174/35_si0buy.gif', equipValue: 'https://res.cloudinary.com/dh99ihggv/image/upload/v1784628174/35_si0buy.gif', sortOrder: 176 },
+  { itemKey: 'cloud_frame_34_yf6z9a', name: 'Frame 34', category: 'Profile', section: 'Avatar Frame', type: 'frame', price: 29.99, currency: 'chang', durationDays: 30, imageUrl: 'https://res.cloudinary.com/dh99ihggv/image/upload/v1784628171/34_yf6z9a.gif', equipValue: 'https://res.cloudinary.com/dh99ihggv/image/upload/v1784628171/34_yf6z9a.gif', sortOrder: 177 },
+  { itemKey: 'cloud_frame_37_tb0zcm', name: 'Frame 37', category: 'Profile', section: 'Avatar Frame', type: 'frame', price: 29.99, currency: 'chang', durationDays: 30, imageUrl: 'https://res.cloudinary.com/dh99ihggv/image/upload/v1784628168/37_tb0zcm.gif', equipValue: 'https://res.cloudinary.com/dh99ihggv/image/upload/v1784628168/37_tb0zcm.gif', sortOrder: 178 },
+  { itemKey: 'cloud_frame_44_ebbeb9', name: 'Frame 44', category: 'Profile', section: 'Avatar Frame', type: 'frame', price: 29.99, currency: 'chang', durationDays: 30, imageUrl: 'https://res.cloudinary.com/dh99ihggv/image/upload/v1784628164/44_ebbeb9.gif', equipValue: 'https://res.cloudinary.com/dh99ihggv/image/upload/v1784628164/44_ebbeb9.gif', sortOrder: 179 },
+  { itemKey: 'cloud_frame_41_v65wiv', name: 'Frame 41', category: 'Profile', section: 'Avatar Frame', type: 'frame', price: 29.99, currency: 'chang', durationDays: 30, imageUrl: 'https://res.cloudinary.com/dh99ihggv/image/upload/v1784628160/41_v65wiv.gif', equipValue: 'https://res.cloudinary.com/dh99ihggv/image/upload/v1784628160/41_v65wiv.gif', sortOrder: 180 },
+  { itemKey: 'cloud_frame_43_lmtxpm', name: 'Frame 43', category: 'Profile', section: 'Avatar Frame', type: 'frame', price: 29.99, currency: 'chang', durationDays: 30, imageUrl: 'https://res.cloudinary.com/dh99ihggv/image/upload/v1784628158/43_lmtxpm.gif', equipValue: 'https://res.cloudinary.com/dh99ihggv/image/upload/v1784628158/43_lmtxpm.gif', sortOrder: 181 },
+  { itemKey: 'cloud_frame_49_fa0qeh', name: 'Frame 49', category: 'Profile', section: 'Avatar Frame', type: 'frame', price: 29.99, currency: 'chang', durationDays: 30, imageUrl: 'https://res.cloudinary.com/dh99ihggv/image/upload/v1784628155/49_fa0qeh.gif', equipValue: 'https://res.cloudinary.com/dh99ihggv/image/upload/v1784628155/49_fa0qeh.gif', sortOrder: 182 },
+  { itemKey: 'cloud_frame_45_cayuhy', name: 'Frame 45', category: 'Profile', section: 'Avatar Frame', type: 'frame', price: 29.99, currency: 'chang', durationDays: 30, imageUrl: 'https://res.cloudinary.com/dh99ihggv/image/upload/v1784628152/45_cayuhy.gif', equipValue: 'https://res.cloudinary.com/dh99ihggv/image/upload/v1784628152/45_cayuhy.gif', sortOrder: 183 },
+  { itemKey: 'cloud_frame_42_r1ouqe', name: 'Frame 42', category: 'Profile', section: 'Avatar Frame', type: 'frame', price: 29.99, currency: 'chang', durationDays: 30, imageUrl: 'https://res.cloudinary.com/dh99ihggv/image/upload/v1784628147/42_r1ouqe.gif', equipValue: 'https://res.cloudinary.com/dh99ihggv/image/upload/v1784628147/42_r1ouqe.gif', sortOrder: 184 },
+  { itemKey: 'cloud_frame_48_d9uemy', name: 'Frame 48', category: 'Profile', section: 'Avatar Frame', type: 'frame', price: 29.99, currency: 'chang', durationDays: 30, imageUrl: 'https://res.cloudinary.com/dh99ihggv/image/upload/v1784628144/48_d9uemy.gif', equipValue: 'https://res.cloudinary.com/dh99ihggv/image/upload/v1784628144/48_d9uemy.gif', sortOrder: 185 },
+  { itemKey: 'cloud_frame_50_u40kel', name: 'Frame 50', category: 'Profile', section: 'Avatar Frame', type: 'frame', price: 29.99, currency: 'chang', durationDays: 30, imageUrl: 'https://res.cloudinary.com/dh99ihggv/image/upload/v1784628141/50_u40kel.gif', equipValue: 'https://res.cloudinary.com/dh99ihggv/image/upload/v1784628141/50_u40kel.gif', sortOrder: 186 },
+  { itemKey: 'cloud_frame_46_gdgjgo', name: 'Frame 46', category: 'Profile', section: 'Avatar Frame', type: 'frame', price: 29.99, currency: 'chang', durationDays: 30, imageUrl: 'https://res.cloudinary.com/dh99ihggv/image/upload/v1784628139/46_gdgjgo.gif', equipValue: 'https://res.cloudinary.com/dh99ihggv/image/upload/v1784628139/46_gdgjgo.gif', sortOrder: 187 },
+  { itemKey: 'cloud_frame_52_biifh8', name: 'Frame 52', category: 'Profile', section: 'Avatar Frame', type: 'frame', price: 29.99, currency: 'chang', durationDays: 30, imageUrl: 'https://res.cloudinary.com/dh99ihggv/image/upload/v1784628136/52_biifh8.gif', equipValue: 'https://res.cloudinary.com/dh99ihggv/image/upload/v1784628136/52_biifh8.gif', sortOrder: 188 },
+  { itemKey: 'cloud_frame_53_o5xfy9', name: 'Frame 53', category: 'Profile', section: 'Avatar Frame', type: 'frame', price: 29.99, currency: 'chang', durationDays: 30, imageUrl: 'https://res.cloudinary.com/dh99ihggv/image/upload/v1784628134/53_o5xfy9.gif', equipValue: 'https://res.cloudinary.com/dh99ihggv/image/upload/v1784628134/53_o5xfy9.gif', sortOrder: 189 },
+  { itemKey: 'cloud_frame_58_jtz5nz', name: 'Frame 58', category: 'Profile', section: 'Avatar Frame', type: 'frame', price: 29.99, currency: 'chang', durationDays: 30, imageUrl: 'https://res.cloudinary.com/dh99ihggv/image/upload/v1784628131/58_jtz5nz.gif', equipValue: 'https://res.cloudinary.com/dh99ihggv/image/upload/v1784628131/58_jtz5nz.gif', sortOrder: 190 },
+  { itemKey: 'cloud_frame_54_xvxxnl', name: 'Frame 54', category: 'Profile', section: 'Avatar Frame', type: 'frame', price: 29.99, currency: 'chang', durationDays: 30, imageUrl: 'https://res.cloudinary.com/dh99ihggv/image/upload/v1784628128/54_xvxxnl.gif', equipValue: 'https://res.cloudinary.com/dh99ihggv/image/upload/v1784628128/54_xvxxnl.gif', sortOrder: 191 },
+  { itemKey: 'cloud_frame_57_oa3jne', name: 'Frame 57', category: 'Profile', section: 'Avatar Frame', type: 'frame', price: 29.99, currency: 'chang', durationDays: 30, imageUrl: 'https://res.cloudinary.com/dh99ihggv/image/upload/v1784628126/57_oa3jne.gif', equipValue: 'https://res.cloudinary.com/dh99ihggv/image/upload/v1784628126/57_oa3jne.gif', sortOrder: 192 },
+  { itemKey: 'cloud_frame_51_cqjbyu', name: 'Frame 51', category: 'Profile', section: 'Avatar Frame', type: 'frame', price: 29.99, currency: 'chang', durationDays: 30, imageUrl: 'https://res.cloudinary.com/dh99ihggv/image/upload/v1784628123/51_cqjbyu.gif', equipValue: 'https://res.cloudinary.com/dh99ihggv/image/upload/v1784628123/51_cqjbyu.gif', sortOrder: 193 },
+  { itemKey: 'cloud_frame_56_czjl1m', name: 'Frame 56', category: 'Profile', section: 'Avatar Frame', type: 'frame', price: 29.99, currency: 'chang', durationDays: 30, imageUrl: 'https://res.cloudinary.com/dh99ihggv/image/upload/v1784628120/56_czjl1m.gif', equipValue: 'https://res.cloudinary.com/dh99ihggv/image/upload/v1784628120/56_czjl1m.gif', sortOrder: 194 },
+  { itemKey: 'cloud_frame_55_mdytd2', name: 'Frame 55', category: 'Profile', section: 'Avatar Frame', type: 'frame', price: 29.99, currency: 'chang', durationDays: 30, imageUrl: 'https://res.cloudinary.com/dh99ihggv/image/upload/v1784628118/55_mdytd2.gif', equipValue: 'https://res.cloudinary.com/dh99ihggv/image/upload/v1784628118/55_mdytd2.gif', sortOrder: 195 },
+  { itemKey: 'cloud_entry_8_os4dp2', name: 'Entry 8', category: 'Popular', section: 'New This Month', type: 'entryVideo', price: 99.99, currency: 'chang', durationDays: 30, imageUrl: 'https://res.cloudinary.com/dh99ihggv/video/upload/h_250,q_auto/v1784628813/8_os4dp2.jpg', previewUrl: 'https://res.cloudinary.com/dh99ihggv/video/upload/v1784628813/8_os4dp2.mp4', equipValue: 'https://res.cloudinary.com/dh99ihggv/video/upload/v1784628813/8_os4dp2.mp4', sortOrder: 200 },
+  { itemKey: 'cloud_entry_7_qis4xg', name: 'Entry 7', category: 'Popular', section: 'New This Month', type: 'entryVideo', price: 99.99, currency: 'chang', durationDays: 30, imageUrl: 'https://res.cloudinary.com/dh99ihggv/video/upload/h_250,q_auto/v1784628810/7_qis4xg.jpg', previewUrl: 'https://res.cloudinary.com/dh99ihggv/video/upload/v1784628810/7_qis4xg.mp4', equipValue: 'https://res.cloudinary.com/dh99ihggv/video/upload/v1784628810/7_qis4xg.mp4', sortOrder: 201 },
+  { itemKey: 'cloud_entry_4_sjysf9', name: 'Entry 4', category: 'Popular', section: 'New This Month', type: 'entryVideo', price: 99.99, currency: 'chang', durationDays: 30, imageUrl: 'https://res.cloudinary.com/dh99ihggv/video/upload/h_250,q_auto/v1784628807/4_sjysf9.jpg', previewUrl: 'https://res.cloudinary.com/dh99ihggv/video/upload/v1784628807/4_sjysf9.mp4', equipValue: 'https://res.cloudinary.com/dh99ihggv/video/upload/v1784628807/4_sjysf9.mp4', sortOrder: 202 },
+  { itemKey: 'cloud_entry_3_kuirjc', name: 'Entry 3', category: 'Popular', section: 'New This Month', type: 'entryVideo', price: 99.99, currency: 'chang', durationDays: 30, imageUrl: 'https://res.cloudinary.com/dh99ihggv/video/upload/h_250,q_auto/v1784628804/3_kuirjc.jpg', previewUrl: 'https://res.cloudinary.com/dh99ihggv/video/upload/v1784628804/3_kuirjc.mp4', equipValue: 'https://res.cloudinary.com/dh99ihggv/video/upload/v1784628804/3_kuirjc.mp4', sortOrder: 203 },
+  { itemKey: 'cloud_entry_9_nsjreq', name: 'Entry 9', category: 'Popular', section: 'New This Month', type: 'entryVideo', price: 99.99, currency: 'chang', durationDays: 30, imageUrl: 'https://res.cloudinary.com/dh99ihggv/video/upload/h_250,q_auto/v1784628802/9_nsjreq.jpg', previewUrl: 'https://res.cloudinary.com/dh99ihggv/video/upload/v1784628802/9_nsjreq.mp4', equipValue: 'https://res.cloudinary.com/dh99ihggv/video/upload/v1784628802/9_nsjreq.mp4', sortOrder: 204 },
+  { itemKey: 'cloud_entry_5_zkxwyt', name: 'Entry 5', category: 'Popular', section: 'New This Month', type: 'entryVideo', price: 99.99, currency: 'chang', durationDays: 30, imageUrl: 'https://res.cloudinary.com/dh99ihggv/video/upload/h_250,q_auto/v1784628798/5_zkxwyt.jpg', previewUrl: 'https://res.cloudinary.com/dh99ihggv/video/upload/v1784628798/5_zkxwyt.mp4', equipValue: 'https://res.cloudinary.com/dh99ihggv/video/upload/v1784628798/5_zkxwyt.mp4', sortOrder: 205 },
+  { itemKey: 'cloud_entry_10_go1g0k', name: 'Entry 10', category: 'Popular', section: 'New This Month', type: 'entryVideo', price: 99.99, currency: 'chang', durationDays: 30, imageUrl: 'https://res.cloudinary.com/dh99ihggv/video/upload/h_250,q_auto/v1784628795/10_go1g0k.jpg', previewUrl: 'https://res.cloudinary.com/dh99ihggv/video/upload/v1784628795/10_go1g0k.mp4', equipValue: 'https://res.cloudinary.com/dh99ihggv/video/upload/v1784628795/10_go1g0k.mp4', sortOrder: 206 },
+  { itemKey: 'cloud_entry_2_lm7ttu', name: 'Entry 2', category: 'Popular', section: 'New This Month', type: 'entryVideo', price: 99.99, currency: 'chang', durationDays: 30, imageUrl: 'https://res.cloudinary.com/dh99ihggv/video/upload/h_250,q_auto/v1784628793/2_lm7ttu.jpg', previewUrl: 'https://res.cloudinary.com/dh99ihggv/video/upload/v1784628793/2_lm7ttu.mp4', equipValue: 'https://res.cloudinary.com/dh99ihggv/video/upload/v1784628793/2_lm7ttu.mp4', sortOrder: 207 },
+  { itemKey: 'cloud_entry_6_ewzmzk', name: 'Entry 6', category: 'Popular', section: 'New This Month', type: 'entryVideo', price: 99.99, currency: 'chang', durationDays: 30, imageUrl: 'https://res.cloudinary.com/dh99ihggv/video/upload/h_250,q_auto/v1784628789/6_ewzmzk.jpg', previewUrl: 'https://res.cloudinary.com/dh99ihggv/video/upload/v1784628789/6_ewzmzk.mp4', equipValue: 'https://res.cloudinary.com/dh99ihggv/video/upload/v1784628789/6_ewzmzk.mp4', sortOrder: 208 },
+  { itemKey: 'cloud_entry_14_bshtzf', name: 'Entry 14', category: 'Popular', section: 'New This Month', type: 'entryVideo', price: 99.99, currency: 'chang', durationDays: 30, imageUrl: 'https://res.cloudinary.com/dh99ihggv/video/upload/h_250,q_auto/v1784628786/14_bshtzf.jpg', previewUrl: 'https://res.cloudinary.com/dh99ihggv/video/upload/v1784628786/14_bshtzf.mp4', equipValue: 'https://res.cloudinary.com/dh99ihggv/video/upload/v1784628786/14_bshtzf.mp4', sortOrder: 209 },
+  { itemKey: 'cloud_entry_12_tegcpr', name: 'Entry 12', category: 'Popular', section: 'New This Month', type: 'entryVideo', price: 99.99, currency: 'chang', durationDays: 30, imageUrl: 'https://res.cloudinary.com/dh99ihggv/video/upload/h_250,q_auto/v1784628783/12_tegcpr.jpg', previewUrl: 'https://res.cloudinary.com/dh99ihggv/video/upload/v1784628783/12_tegcpr.mp4', equipValue: 'https://res.cloudinary.com/dh99ihggv/video/upload/v1784628783/12_tegcpr.mp4', sortOrder: 210 },
+  { itemKey: 'cloud_entry_11_ruumbr', name: 'Entry 11', category: 'Popular', section: 'New This Month', type: 'entryVideo', price: 99.99, currency: 'chang', durationDays: 30, imageUrl: 'https://res.cloudinary.com/dh99ihggv/video/upload/h_250,q_auto/v1784628781/11_ruumbr.jpg', previewUrl: 'https://res.cloudinary.com/dh99ihggv/video/upload/v1784628781/11_ruumbr.mp4', equipValue: 'https://res.cloudinary.com/dh99ihggv/video/upload/v1784628781/11_ruumbr.mp4', sortOrder: 211 },
+  { itemKey: 'cloud_entry_13_xughgs', name: 'Entry 13', category: 'Popular', section: 'New This Month', type: 'entryVideo', price: 99.99, currency: 'chang', durationDays: 30, imageUrl: 'https://res.cloudinary.com/dh99ihggv/video/upload/h_250,q_auto/v1784628777/13_xughgs.jpg', previewUrl: 'https://res.cloudinary.com/dh99ihggv/video/upload/v1784628777/13_xughgs.mp4', equipValue: 'https://res.cloudinary.com/dh99ihggv/video/upload/v1784628777/13_xughgs.mp4', sortOrder: 212 },
+  { itemKey: 'cloud_entry_15_p7deus', name: 'Entry 15', category: 'Popular', section: 'New This Month', type: 'entryVideo', price: 99.99, currency: 'chang', durationDays: 30, imageUrl: 'https://res.cloudinary.com/dh99ihggv/video/upload/h_250,q_auto/v1784628774/15_p7deus.jpg', previewUrl: 'https://res.cloudinary.com/dh99ihggv/video/upload/v1784628774/15_p7deus.mp4', equipValue: 'https://res.cloudinary.com/dh99ihggv/video/upload/v1784628774/15_p7deus.mp4', sortOrder: 213 },
+  { itemKey: 'cloud_entry_20_byzqpf', name: 'Entry 20', category: 'Popular', section: 'New This Month', type: 'entryVideo', price: 99.99, currency: 'chang', durationDays: 30, imageUrl: 'https://res.cloudinary.com/dh99ihggv/video/upload/h_250,q_auto/v1784628771/20_byzqpf.jpg', previewUrl: 'https://res.cloudinary.com/dh99ihggv/video/upload/v1784628771/20_byzqpf.mp4', equipValue: 'https://res.cloudinary.com/dh99ihggv/video/upload/v1784628771/20_byzqpf.mp4', sortOrder: 214 },
+  { itemKey: 'cloud_entry_19_rxxu1l', name: 'Entry 19', category: 'Popular', section: 'New This Month', type: 'entryVideo', price: 99.99, currency: 'chang', durationDays: 30, imageUrl: 'https://res.cloudinary.com/dh99ihggv/video/upload/h_250,q_auto/v1784628769/19_rxxu1l.jpg', previewUrl: 'https://res.cloudinary.com/dh99ihggv/video/upload/v1784628769/19_rxxu1l.mp4', equipValue: 'https://res.cloudinary.com/dh99ihggv/video/upload/v1784628769/19_rxxu1l.mp4', sortOrder: 215 },
+  { itemKey: 'cloud_entry_17_eebwqe', name: 'Entry 17', category: 'Popular', section: 'New This Month', type: 'entryVideo', price: 99.99, currency: 'chang', durationDays: 30, imageUrl: 'https://res.cloudinary.com/dh99ihggv/video/upload/h_250,q_auto/v1784628766/17_eebwqe.jpg', previewUrl: 'https://res.cloudinary.com/dh99ihggv/video/upload/v1784628766/17_eebwqe.mp4', equipValue: 'https://res.cloudinary.com/dh99ihggv/video/upload/v1784628766/17_eebwqe.mp4', sortOrder: 216 },
+  { itemKey: 'cloud_entry_18_ohpphx', name: 'Entry 18', category: 'Popular', section: 'New This Month', type: 'entryVideo', price: 99.99, currency: 'chang', durationDays: 30, imageUrl: 'https://res.cloudinary.com/dh99ihggv/video/upload/h_250,q_auto/v1784628763/18_ohpphx.jpg', previewUrl: 'https://res.cloudinary.com/dh99ihggv/video/upload/v1784628763/18_ohpphx.mp4', equipValue: 'https://res.cloudinary.com/dh99ihggv/video/upload/v1784628763/18_ohpphx.mp4', sortOrder: 217 },
+  { itemKey: 'cloud_entry_16_z4apof', name: 'Entry 16', category: 'Popular', section: 'New This Month', type: 'entryVideo', price: 99.99, currency: 'chang', durationDays: 30, imageUrl: 'https://res.cloudinary.com/dh99ihggv/video/upload/h_250,q_auto/v1784628760/16_z4apof.jpg', previewUrl: 'https://res.cloudinary.com/dh99ihggv/video/upload/v1784628760/16_z4apof.mp4', equipValue: 'https://res.cloudinary.com/dh99ihggv/video/upload/v1784628760/16_z4apof.mp4', sortOrder: 218 },
+  { itemKey: 'cloud_entry_21_kbwsuu', name: 'Entry 21', category: 'Popular', section: 'New This Month', type: 'entryVideo', price: 99.99, currency: 'chang', durationDays: 30, imageUrl: 'https://res.cloudinary.com/dh99ihggv/video/upload/h_250,q_auto/v1784628757/21_kbwsuu.jpg', previewUrl: 'https://res.cloudinary.com/dh99ihggv/video/upload/v1784628757/21_kbwsuu.mp4', equipValue: 'https://res.cloudinary.com/dh99ihggv/video/upload/v1784628757/21_kbwsuu.mp4', sortOrder: 219 },
+  { itemKey: 'cloud_entry_25_ne8xig', name: 'Entry 25', category: 'Popular', section: 'New This Month', type: 'entryVideo', price: 99.99, currency: 'chang', durationDays: 30, imageUrl: 'https://res.cloudinary.com/dh99ihggv/video/upload/h_250,q_auto/v1784628754/25_ne8xig.jpg', previewUrl: 'https://res.cloudinary.com/dh99ihggv/video/upload/v1784628754/25_ne8xig.mp4', equipValue: 'https://res.cloudinary.com/dh99ihggv/video/upload/v1784628754/25_ne8xig.mp4', sortOrder: 220 },
+  { itemKey: 'cloud_entry_22_duzzmz', name: 'Entry 22', category: 'Popular', section: 'New This Month', type: 'entryVideo', price: 99.99, currency: 'chang', durationDays: 30, imageUrl: 'https://res.cloudinary.com/dh99ihggv/video/upload/h_250,q_auto/v1784628751/22_duzzmz.jpg', previewUrl: 'https://res.cloudinary.com/dh99ihggv/video/upload/v1784628751/22_duzzmz.mp4', equipValue: 'https://res.cloudinary.com/dh99ihggv/video/upload/v1784628751/22_duzzmz.mp4', sortOrder: 221 },
+  { itemKey: 'cloud_entry_24_lzgj9n', name: 'Entry 24', category: 'Popular', section: 'New This Month', type: 'entryVideo', price: 99.99, currency: 'chang', durationDays: 30, imageUrl: 'https://res.cloudinary.com/dh99ihggv/video/upload/h_250,q_auto/v1784628748/24_lzgj9n.jpg', previewUrl: 'https://res.cloudinary.com/dh99ihggv/video/upload/v1784628748/24_lzgj9n.mp4', equipValue: 'https://res.cloudinary.com/dh99ihggv/video/upload/v1784628748/24_lzgj9n.mp4', sortOrder: 222 },
+  { itemKey: 'cloud_entry_23_u9xnu1', name: 'Entry 23', category: 'Popular', section: 'New This Month', type: 'entryVideo', price: 99.99, currency: 'chang', durationDays: 30, imageUrl: 'https://res.cloudinary.com/dh99ihggv/video/upload/h_250,q_auto/v1784628745/23_u9xnu1.jpg', previewUrl: 'https://res.cloudinary.com/dh99ihggv/video/upload/v1784628745/23_u9xnu1.mp4', equipValue: 'https://res.cloudinary.com/dh99ihggv/video/upload/v1784628745/23_u9xnu1.mp4', sortOrder: 223 },
+  { itemKey: 'cloud_entry_26_lp6zp8', name: 'Entry 26', category: 'Popular', section: 'New This Month', type: 'entryVideo', price: 99.99, currency: 'chang', durationDays: 30, imageUrl: 'https://res.cloudinary.com/dh99ihggv/video/upload/h_250,q_auto/v1784628742/26_lp6zp8.jpg', previewUrl: 'https://res.cloudinary.com/dh99ihggv/video/upload/v1784628742/26_lp6zp8.mp4', equipValue: 'https://res.cloudinary.com/dh99ihggv/video/upload/v1784628742/26_lp6zp8.mp4', sortOrder: 224 },
+  { itemKey: 'cloud_entry_27_xuvmuk', name: 'Entry 27', category: 'Popular', section: 'New This Month', type: 'entryVideo', price: 99.99, currency: 'chang', durationDays: 30, imageUrl: 'https://res.cloudinary.com/dh99ihggv/video/upload/h_250,q_auto/v1784628740/27_xuvmuk.jpg', previewUrl: 'https://res.cloudinary.com/dh99ihggv/video/upload/v1784628740/27_xuvmuk.mp4', equipValue: 'https://res.cloudinary.com/dh99ihggv/video/upload/v1784628740/27_xuvmuk.mp4', sortOrder: 225 },
+  { itemKey: 'cloud_entry_29_hfktut', name: 'Entry 29', category: 'Popular', section: 'New This Month', type: 'entryVideo', price: 99.99, currency: 'chang', durationDays: 30, imageUrl: 'https://res.cloudinary.com/dh99ihggv/video/upload/h_250,q_auto/v1784628737/29_hfktut.jpg', previewUrl: 'https://res.cloudinary.com/dh99ihggv/video/upload/v1784628737/29_hfktut.mp4', equipValue: 'https://res.cloudinary.com/dh99ihggv/video/upload/v1784628737/29_hfktut.mp4', sortOrder: 226 },
+  { itemKey: 'cloud_entry_30_yabjdq', name: 'Entry 30', category: 'Popular', section: 'New This Month', type: 'entryVideo', price: 99.99, currency: 'chang', durationDays: 30, imageUrl: 'https://res.cloudinary.com/dh99ihggv/video/upload/h_250,q_auto/v1784628733/30_yabjdq.jpg', previewUrl: 'https://res.cloudinary.com/dh99ihggv/video/upload/v1784628733/30_yabjdq.mp4', equipValue: 'https://res.cloudinary.com/dh99ihggv/video/upload/v1784628733/30_yabjdq.mp4', sortOrder: 227 },
+  { itemKey: 'cloud_entry_31_c6kipl', name: 'Entry 31', category: 'Popular', section: 'New This Month', type: 'entryVideo', price: 99.99, currency: 'chang', durationDays: 30, imageUrl: 'https://res.cloudinary.com/dh99ihggv/video/upload/h_250,q_auto/v1784628731/31_c6kipl.jpg', previewUrl: 'https://res.cloudinary.com/dh99ihggv/video/upload/v1784628731/31_c6kipl.mp4', equipValue: 'https://res.cloudinary.com/dh99ihggv/video/upload/v1784628731/31_c6kipl.mp4', sortOrder: 228 },
+  { itemKey: 'cloud_entry_32_f8s3hd', name: 'Entry 32', category: 'Popular', section: 'New This Month', type: 'entryVideo', price: 99.99, currency: 'chang', durationDays: 30, imageUrl: 'https://res.cloudinary.com/dh99ihggv/video/upload/h_250,q_auto/v1784628728/32_f8s3hd.jpg', previewUrl: 'https://res.cloudinary.com/dh99ihggv/video/upload/v1784628728/32_f8s3hd.mp4', equipValue: 'https://res.cloudinary.com/dh99ihggv/video/upload/v1784628728/32_f8s3hd.mp4', sortOrder: 229 },
+  { itemKey: 'cloud_entry_33_bee8pw', name: 'Entry 33', category: 'Popular', section: 'New This Month', type: 'entryVideo', price: 99.99, currency: 'chang', durationDays: 30, imageUrl: 'https://res.cloudinary.com/dh99ihggv/video/upload/h_250,q_auto/v1784628726/33_bee8pw.jpg', previewUrl: 'https://res.cloudinary.com/dh99ihggv/video/upload/v1784628726/33_bee8pw.mp4', equipValue: 'https://res.cloudinary.com/dh99ihggv/video/upload/v1784628726/33_bee8pw.mp4', sortOrder: 230 },
+  { itemKey: 'cloud_entry_38_tsvnqs', name: 'Entry 38', category: 'Popular', section: 'New This Month', type: 'entryVideo', price: 99.99, currency: 'chang', durationDays: 30, imageUrl: 'https://res.cloudinary.com/dh99ihggv/video/upload/h_250,q_auto/v1784628722/38_tsvnqs.jpg', previewUrl: 'https://res.cloudinary.com/dh99ihggv/video/upload/v1784628722/38_tsvnqs.mp4', equipValue: 'https://res.cloudinary.com/dh99ihggv/video/upload/v1784628722/38_tsvnqs.mp4', sortOrder: 231 },
+  { itemKey: 'cloud_entry_35_uwyjvo', name: 'Entry 35', category: 'Popular', section: 'New This Month', type: 'entryVideo', price: 99.99, currency: 'chang', durationDays: 30, imageUrl: 'https://res.cloudinary.com/dh99ihggv/video/upload/h_250,q_auto/v1784628720/35_uwyjvo.jpg', previewUrl: 'https://res.cloudinary.com/dh99ihggv/video/upload/v1784628720/35_uwyjvo.mp4', equipValue: 'https://res.cloudinary.com/dh99ihggv/video/upload/v1784628720/35_uwyjvo.mp4', sortOrder: 232 },
+  { itemKey: 'cloud_entry_34_gkcmgl', name: 'Entry 34', category: 'Popular', section: 'New This Month', type: 'entryVideo', price: 99.99, currency: 'chang', durationDays: 30, imageUrl: 'https://res.cloudinary.com/dh99ihggv/video/upload/h_250,q_auto/v1784628717/34_gkcmgl.jpg', previewUrl: 'https://res.cloudinary.com/dh99ihggv/video/upload/v1784628717/34_gkcmgl.mp4', equipValue: 'https://res.cloudinary.com/dh99ihggv/video/upload/v1784628717/34_gkcmgl.mp4', sortOrder: 233 },
+  { itemKey: 'cloud_entry_37_gwhje6', name: 'Entry 37', category: 'Popular', section: 'New This Month', type: 'entryVideo', price: 99.99, currency: 'chang', durationDays: 30, imageUrl: 'https://res.cloudinary.com/dh99ihggv/video/upload/h_250,q_auto/v1784628713/37_gwhje6.jpg', previewUrl: 'https://res.cloudinary.com/dh99ihggv/video/upload/v1784628713/37_gwhje6.mp4', equipValue: 'https://res.cloudinary.com/dh99ihggv/video/upload/v1784628713/37_gwhje6.mp4', sortOrder: 234 },
+  { itemKey: 'cloud_entry_36_rlkbxr', name: 'Entry 36', category: 'Popular', section: 'New This Month', type: 'entryVideo', price: 99.99, currency: 'chang', durationDays: 30, imageUrl: 'https://res.cloudinary.com/dh99ihggv/video/upload/h_250,q_auto/v1784628711/36_rlkbxr.jpg', previewUrl: 'https://res.cloudinary.com/dh99ihggv/video/upload/v1784628711/36_rlkbxr.mp4', equipValue: 'https://res.cloudinary.com/dh99ihggv/video/upload/v1784628711/36_rlkbxr.mp4', sortOrder: 235 },
+  { itemKey: 'cloud_entry_43_gg6duk', name: 'Entry 43', category: 'Popular', section: 'New This Month', type: 'entryVideo', price: 99.99, currency: 'chang', durationDays: 30, imageUrl: 'https://res.cloudinary.com/dh99ihggv/video/upload/h_250,q_auto/v1784628707/43_gg6duk.jpg', previewUrl: 'https://res.cloudinary.com/dh99ihggv/video/upload/v1784628707/43_gg6duk.mp4', equipValue: 'https://res.cloudinary.com/dh99ihggv/video/upload/v1784628707/43_gg6duk.mp4', sortOrder: 236 },
+  { itemKey: 'cloud_entry_41_inqp5q', name: 'Entry 41', category: 'Popular', section: 'New This Month', type: 'entryVideo', price: 99.99, currency: 'chang', durationDays: 30, imageUrl: 'https://res.cloudinary.com/dh99ihggv/video/upload/h_250,q_auto/v1784628705/41_inqp5q.jpg', previewUrl: 'https://res.cloudinary.com/dh99ihggv/video/upload/v1784628705/41_inqp5q.mp4', equipValue: 'https://res.cloudinary.com/dh99ihggv/video/upload/v1784628705/41_inqp5q.mp4', sortOrder: 237 },
+  { itemKey: 'cloud_entry_40_yjgir5', name: 'Entry 40', category: 'Popular', section: 'New This Month', type: 'entryVideo', price: 99.99, currency: 'chang', durationDays: 30, imageUrl: 'https://res.cloudinary.com/dh99ihggv/video/upload/h_250,q_auto/v1784628702/40_yjgir5.jpg', previewUrl: 'https://res.cloudinary.com/dh99ihggv/video/upload/v1784628702/40_yjgir5.mp4', equipValue: 'https://res.cloudinary.com/dh99ihggv/video/upload/v1784628702/40_yjgir5.mp4', sortOrder: 238 },
+  { itemKey: 'cloud_entry_39_e9fl8v', name: 'Entry 39', category: 'Popular', section: 'New This Month', type: 'entryVideo', price: 99.99, currency: 'chang', durationDays: 30, imageUrl: 'https://res.cloudinary.com/dh99ihggv/video/upload/h_250,q_auto/v1784628699/39_e9fl8v.jpg', previewUrl: 'https://res.cloudinary.com/dh99ihggv/video/upload/v1784628699/39_e9fl8v.mp4', equipValue: 'https://res.cloudinary.com/dh99ihggv/video/upload/v1784628699/39_e9fl8v.mp4', sortOrder: 239 },
+  { itemKey: 'cloud_entry_42_y4pnu2', name: 'Entry 42', category: 'Popular', section: 'New This Month', type: 'entryVideo', price: 99.99, currency: 'chang', durationDays: 30, imageUrl: 'https://res.cloudinary.com/dh99ihggv/video/upload/h_250,q_auto/v1784628696/42_y4pnu2.jpg', previewUrl: 'https://res.cloudinary.com/dh99ihggv/video/upload/v1784628696/42_y4pnu2.mp4', equipValue: 'https://res.cloudinary.com/dh99ihggv/video/upload/v1784628696/42_y4pnu2.mp4', sortOrder: 240 },
+  { itemKey: 'cloud_entry_46_v6sr3g', name: 'Entry 46', category: 'Popular', section: 'New This Month', type: 'entryVideo', price: 99.99, currency: 'chang', durationDays: 30, imageUrl: 'https://res.cloudinary.com/dh99ihggv/video/upload/h_250,q_auto/v1784628693/46_v6sr3g.jpg', previewUrl: 'https://res.cloudinary.com/dh99ihggv/video/upload/v1784628693/46_v6sr3g.mp4', equipValue: 'https://res.cloudinary.com/dh99ihggv/video/upload/v1784628693/46_v6sr3g.mp4', sortOrder: 241 },
+  { itemKey: 'cloud_entry_44_tj7ctv', name: 'Entry 44', category: 'Popular', section: 'New This Month', type: 'entryVideo', price: 99.99, currency: 'chang', durationDays: 30, imageUrl: 'https://res.cloudinary.com/dh99ihggv/video/upload/h_250,q_auto/v1784628690/44_tj7ctv.jpg', previewUrl: 'https://res.cloudinary.com/dh99ihggv/video/upload/v1784628690/44_tj7ctv.mp4', equipValue: 'https://res.cloudinary.com/dh99ihggv/video/upload/v1784628690/44_tj7ctv.mp4', sortOrder: 242 },
+  { itemKey: 'cloud_entry_47_jbzd6i', name: 'Entry 47', category: 'Popular', section: 'New This Month', type: 'entryVideo', price: 99.99, currency: 'chang', durationDays: 30, imageUrl: 'https://res.cloudinary.com/dh99ihggv/video/upload/h_250,q_auto/v1784628687/47_jbzd6i.jpg', previewUrl: 'https://res.cloudinary.com/dh99ihggv/video/upload/v1784628687/47_jbzd6i.mp4', equipValue: 'https://res.cloudinary.com/dh99ihggv/video/upload/v1784628687/47_jbzd6i.mp4', sortOrder: 243 },
+  { itemKey: 'cloud_entry_45_tdy5p0', name: 'Entry 45', category: 'Popular', section: 'New This Month', type: 'entryVideo', price: 99.99, currency: 'chang', durationDays: 30, imageUrl: 'https://res.cloudinary.com/dh99ihggv/video/upload/h_250,q_auto/v1784628685/45_tdy5p0.jpg', previewUrl: 'https://res.cloudinary.com/dh99ihggv/video/upload/v1784628685/45_tdy5p0.mp4', equipValue: 'https://res.cloudinary.com/dh99ihggv/video/upload/v1784628685/45_tdy5p0.mp4', sortOrder: 244 },
+  { itemKey: 'cloud_entry_51_fp1jq4', name: 'Entry 51', category: 'Popular', section: 'New This Month', type: 'entryVideo', price: 99.99, currency: 'chang', durationDays: 30, imageUrl: 'https://res.cloudinary.com/dh99ihggv/video/upload/h_250,q_auto/v1784628682/51_fp1jq4.jpg', previewUrl: 'https://res.cloudinary.com/dh99ihggv/video/upload/v1784628682/51_fp1jq4.mp4', equipValue: 'https://res.cloudinary.com/dh99ihggv/video/upload/v1784628682/51_fp1jq4.mp4', sortOrder: 245 },
+  { itemKey: 'cloud_entry_50_e4ryit', name: 'Entry 50', category: 'Popular', section: 'New This Month', type: 'entryVideo', price: 99.99, currency: 'chang', durationDays: 30, imageUrl: 'https://res.cloudinary.com/dh99ihggv/video/upload/h_250,q_auto/v1784628678/50_e4ryit.jpg', previewUrl: 'https://res.cloudinary.com/dh99ihggv/video/upload/v1784628678/50_e4ryit.mp4', equipValue: 'https://res.cloudinary.com/dh99ihggv/video/upload/v1784628678/50_e4ryit.mp4', sortOrder: 246 },
+  { itemKey: 'cloud_entry_49_kskvcy', name: 'Entry 49', category: 'Popular', section: 'New This Month', type: 'entryVideo', price: 99.99, currency: 'chang', durationDays: 30, imageUrl: 'https://res.cloudinary.com/dh99ihggv/video/upload/h_250,q_auto/v1784628676/49_kskvcy.jpg', previewUrl: 'https://res.cloudinary.com/dh99ihggv/video/upload/v1784628676/49_kskvcy.mp4', equipValue: 'https://res.cloudinary.com/dh99ihggv/video/upload/v1784628676/49_kskvcy.mp4', sortOrder: 247 }
 ];
 
 const ensureDefaultStoreItems = async () => {
@@ -348,6 +517,17 @@ const REWARD_TASKS = [
     rewardType: 'daimon',
     activityTypes: ['follow_user'],
     action: 'go_profile'
+  },
+  {
+    key: 'new_host_live_hour',
+    category: 'Host',
+    title: 'New host live bonus',
+    description: 'Stream for 60 minutes as a new host to claim 5,000 coins. Available twice per day for your first 7 host days.',
+    target: 60,
+    amount: 5000,
+    rewardType: 'chang',
+    activityTypes: ['host_live_session'],
+    action: 'start_live'
   }
 ];
 
@@ -359,6 +539,11 @@ const getRewardDayRange = (date = new Date()) => {
   return { start, end, dayKey: start.toISOString().slice(0, 10) };
 };
 const DAILY_CHECK_IN_COOLDOWN_MS = 24 * 60 * 60 * 1000;
+const NEW_HOST_LIVE_REWARD_KEY = 'new_host_live_hour';
+const NEW_HOST_LIVE_REWARD_DAYS = 7;
+const NEW_HOST_LIVE_REWARD_MINUTES = 60;
+const NEW_HOST_LIVE_REWARD_DAILY_LIMIT = 2;
+const NEW_HOST_LIVE_REWARD_AMOUNT = 5000;
 
 const getDailyCheckInAvailability = async (userId, now = new Date()) => {
   const lastClaim = await RewardClaim.findOne({ userId, taskKey: 'daily_check_in' })
@@ -394,13 +579,155 @@ const recordRewardActivity = async (userId, type, metadata = {}) => {
   }
 };
 
+const recordHostLiveSessionActivity = async ({ hostId, roomId, roomMode, startedAt, endedAt = new Date() }) => {
+  try {
+    if (!mongoose.Types.ObjectId.isValid(hostId) || !roomId || !startedAt) return;
+
+    const startDate = new Date(startedAt);
+    const endDate = new Date(endedAt);
+    const durationMinutes = Math.max(0, Math.floor((endDate.getTime() - startDate.getTime()) / 60000));
+    if (durationMinutes <= 0) return;
+
+    const existing = await RewardActivity.findOne({
+      userId: hostId,
+      type: 'host_live_session',
+      'metadata.roomId': roomId.toString()
+    }).select('_id');
+
+    if (existing) return;
+
+    await RewardActivity.create({
+      userId: hostId,
+      type: 'host_live_session',
+      metadata: {
+        roomId: roomId.toString(),
+        roomMode,
+        startedAt: startDate,
+        endedAt: endDate,
+        durationMinutes
+      },
+      createdAt: endDate
+    });
+  } catch (error) {
+    console.warn(`Host live reward session skipped: ${error.message}`);
+  }
+};
+
 const getRewardProgress = async (userId, task, start, end) => {
   if (task.key === 'daily_check_in') return 1;
+  if (task.key === NEW_HOST_LIVE_REWARD_KEY) return 0;
   return RewardActivity.countDocuments({
     userId,
     type: { $in: task.activityTypes },
     createdAt: { $gte: start, $lt: end }
   });
+};
+
+const getNewHostRewardEligibility = (user, now = new Date()) => {
+  const hostApproved =
+    user?.hostStatus === 'approved' ||
+    user?.hostRegistration?.status === 'approved' ||
+    user?.role === 'host' ||
+    user?.role === 'super_admin';
+
+  const hostStartAt = user?.hostRegistration?.reviewedAt ||
+    user?.hostRegistration?.registeredAt ||
+    user?.createdAt ||
+    null;
+
+  if (!hostApproved || !hostStartAt) {
+    return {
+      eligible: false,
+      hostApproved,
+      hostStartAt,
+      expiresAt: null,
+      daysLeft: 0,
+      reason: hostApproved ? 'Host start date missing' : 'Only approved hosts can claim this reward'
+    };
+  }
+
+  const startDate = new Date(hostStartAt);
+  const expiresAt = new Date(startDate.getTime() + (NEW_HOST_LIVE_REWARD_DAYS * 24 * 60 * 60 * 1000));
+  const eligible = now < expiresAt;
+  const daysLeft = eligible ? Math.max(1, Math.ceil((expiresAt.getTime() - now.getTime()) / (24 * 60 * 60 * 1000))) : 0;
+
+  return {
+    eligible,
+    hostApproved,
+    hostStartAt: startDate,
+    expiresAt,
+    daysLeft,
+    reason: eligible ? '' : 'New host live bonus has expired'
+  };
+};
+
+const getActiveHostedMinutesToday = async (userId, start, now = new Date()) => {
+  const [audioRooms, videoRooms] = await Promise.all([
+    AudioRoom.find({ hostId: userId, isLive: true, createdAt: { $lt: now } }).select('createdAt').lean(),
+    Room.find({ hostId: userId.toString(), isLive: true, createdAt: { $lt: now } }).select('createdAt').lean()
+  ]);
+
+  return [...audioRooms, ...videoRooms].reduce((total, room) => {
+    const liveStart = new Date(Math.max(new Date(room.createdAt).getTime(), start.getTime()));
+    const minutes = Math.max(0, Math.floor((now.getTime() - liveStart.getTime()) / 60000));
+    return total + minutes;
+  }, 0);
+};
+
+const getNewHostLiveRewardStatus = async (user, start, end, dayKey, now = new Date()) => {
+  const task = REWARD_TASKS.find(item => item.key === NEW_HOST_LIVE_REWARD_KEY);
+  const eligibility = getNewHostRewardEligibility(user, now);
+  const userObjectId = new mongoose.Types.ObjectId(user._id);
+
+  const [sessionAgg, activeMinutes, claimsToday] = await Promise.all([
+    RewardActivity.aggregate([
+      {
+        $match: {
+          userId: userObjectId,
+          type: 'host_live_session',
+          createdAt: { $gte: start, $lt: end }
+        }
+      },
+      {
+        $group: {
+          _id: null,
+          totalMinutes: { $sum: { $ifNull: ['$metadata.durationMinutes', 0] } }
+        }
+      }
+    ]),
+    getActiveHostedMinutesToday(user._id, start, now),
+    HostLiveRewardClaim.countDocuments({ hostId: user._id, dayKey })
+  ]);
+
+  const recordedMinutes = Math.floor(sessionAgg?.[0]?.totalMinutes || 0);
+  const totalMinutesToday = recordedMinutes + activeMinutes;
+  const completedHourBlocks = Math.floor(totalMinutesToday / NEW_HOST_LIVE_REWARD_MINUTES);
+  const cappedCompletedBlocks = Math.min(completedHourBlocks, NEW_HOST_LIVE_REWARD_DAILY_LIMIT);
+  const availableClaims = Math.max(0, cappedCompletedBlocks - claimsToday);
+  const dailyLimitReached = claimsToday >= NEW_HOST_LIVE_REWARD_DAILY_LIMIT;
+  const canClaim = eligibility.eligible && availableClaims > 0 && !dailyLimitReached;
+  const nextProgress = canClaim
+    ? NEW_HOST_LIVE_REWARD_MINUTES
+    : dailyLimitReached
+      ? NEW_HOST_LIVE_REWARD_MINUTES
+      : Math.min(totalMinutesToday % NEW_HOST_LIVE_REWARD_MINUTES, NEW_HOST_LIVE_REWARD_MINUTES);
+
+  return {
+    ...task,
+    progress: nextProgress,
+    totalMinutesToday,
+    completedHourBlocks,
+    claimsToday,
+    maxClaimsPerDay: NEW_HOST_LIVE_REWARD_DAILY_LIMIT,
+    claimed: dailyLimitReached,
+    canClaim,
+    daysLeft: eligibility.daysLeft,
+    expiresAt: eligibility.expiresAt?.toISOString?.() || null,
+    eligible: eligibility.eligible,
+    description: eligibility.eligible
+      ? `Stream 60 minutes to claim 5,000 coins. You can claim ${NEW_HOST_LIVE_REWARD_DAILY_LIMIT} times per day.`
+      : eligibility.reason
+  };
 };
 
 const buildRewardDashboard = async (userId) => {
@@ -410,7 +737,7 @@ const buildRewardDashboard = async (userId) => {
     throw error;
   }
 
-  const user = await User.findById(userId).select('daimon chang name glixId');
+  const user = await User.findById(userId).select('daimon chang name glixId role createdAt hostStatus hostRegistration');
   if (!user) {
     const error = new Error('User not found');
     error.statusCode = 404;
@@ -433,7 +760,10 @@ const buildRewardDashboard = async (userId) => {
     return acc;
   }, { daimon: 0, chang: 0 });
 
+  const newHostLiveRewardStatus = await getNewHostLiveRewardStatus(user, start, end, dayKey, now);
   const tasks = await Promise.all(REWARD_TASKS.map(async task => {
+    if (task.key === NEW_HOST_LIVE_REWARD_KEY) return newHostLiveRewardStatus;
+
     const rawProgress = await getRewardProgress(userId, task, start, end);
     const progress = Math.min(rawProgress, task.target);
     const isDailyCheckIn = task.key === 'daily_check_in';
@@ -518,6 +848,13 @@ io.on('connection', (socket) => {
       socket.roomId = stringRoomId;
       socket.userId = userId;
       socket.userName = name;
+
+      if (clearRoomDisconnectTimer(stringRoomId, userId)) {
+        io.to(stringRoomId).emit('host_reconnected', {
+          userId,
+          message: `${name || 'Host'} reconnected.`
+        });
+      }
 
       await upsertRoomPresence({
         roomId: stringRoomId,
@@ -829,6 +1166,32 @@ io.on('connection', (socket) => {
       sender: senderName,
       text: text,
       userId: userId
+    });
+  });
+
+  socket.on('send_expressive_emoji', (payload = {}) => {
+    const stringRoomId = payload.roomId ? payload.roomId.toString() : '';
+    const emoji = String(payload.emoji || payload.text || '').trim();
+    if (!stringRoomId || !emoji) return;
+
+    const incomingSlotIndex = payload.targetSlotIndex ?? payload.slotIndex ?? null;
+    const targetSlotIndex = Number.isInteger(incomingSlotIndex)
+      ? incomingSlotIndex
+      : Number.isFinite(Number(incomingSlotIndex))
+        ? Number(incomingSlotIndex)
+        : null;
+
+    io.to(stringRoomId).emit('receive_expressive_emoji', {
+      ...payload,
+      id: payload.id || `expressive-${Date.now()}-${Math.random().toString(36).slice(2)}`,
+      type: 'expressive_emoji',
+      roomId: stringRoomId,
+      emoji,
+      text: emoji,
+      targetSlotIndex,
+      numericUid: payload.numericUid ?? payload.uid ?? null,
+      userId: payload.userId || null,
+      senderName: payload.senderName || payload.sender || 'User'
     });
   });
 
@@ -1257,6 +1620,35 @@ io.on('connection', (socket) => {
     }
   });
 
+  socket.on('room_app_background', ({ roomId, userId, roomMode }) => {
+    const stringRoomId = roomId ? roomId.toString() : '';
+    if (!stringRoomId || !userId) return;
+
+    socket.roomId = stringRoomId;
+    socket.userId = userId;
+
+    io.to(stringRoomId).emit('room_user_backgrounded', {
+      userId,
+      roomMode: roomMode || (stringRoomId.startsWith('glix_') ? 'video' : 'audio'),
+    });
+  });
+
+  socket.on('room_app_foreground', ({ roomId, userId, roomMode }) => {
+    const stringRoomId = roomId ? roomId.toString() : '';
+    if (!stringRoomId || !userId) return;
+
+    socket.roomId = stringRoomId;
+    socket.userId = userId;
+
+    if (clearRoomDisconnectTimer(stringRoomId, userId)) {
+      io.to(stringRoomId).emit('host_reconnected', {
+        userId,
+        roomMode: roomMode || (stringRoomId.startsWith('glix_') ? 'video' : 'audio'),
+        message: 'Host reconnected.'
+      });
+    }
+  });
+
   // 7. EVENT: Safe Disconnect Handler
   socket.on('disconnect', async () => {
     try {
@@ -1276,8 +1668,6 @@ io.on('connection', (socket) => {
 
       if (!socket.roomId || !socket.userId) return;
 
-      removeRoomPresence({ roomId: socket.roomId, userId: socket.userId, socketId: socket.id });
-
       const roomId = socket.roomId.toString();
       const currentUserId = socket.userId.toString();
 
@@ -1289,19 +1679,101 @@ io.on('connection', (socket) => {
           videoRoomDoc.hostId &&
           videoRoomDoc.hostId.toString() === currentUserId
         ) {
-          io.to(roomId).emit('room_closing', {
-            message: 'Host disconnected. Room closed.'
+          io.to(roomId).emit('host_reconnecting', {
+            userId: currentUserId,
+            message: 'Host connection lost. Waiting for reconnect...'
           });
 
-          await Room.deleteOne({ channelName: roomId });
-          console.log(`Video room closed because host disconnected: ${roomId}`);
-        } else {
-          await emitRoomStats(roomId);
+          const timerKey = getRoomDisconnectTimerKey(roomId, currentUserId);
+          if (roomDisconnectTimers.has(timerKey)) clearTimeout(roomDisconnectTimers.get(timerKey));
+
+          const timer = setTimeout(async () => {
+            try {
+              roomDisconnectTimers.delete(timerKey);
+              removeRoomPresence({ roomId, userId: currentUserId, socketId: socket.id });
+
+              const latestRoom = await Room.findOne({ channelName: roomId });
+              if (!latestRoom || latestRoom.hostId?.toString() !== currentUserId) return;
+
+              io.to(roomId).emit('room_closing', {
+                message: 'Host disconnected. Room closed.'
+              });
+
+              await recordHostLiveSessionActivity({
+                hostId: latestRoom.hostId,
+                roomId,
+                roomMode: 'video',
+                startedAt: latestRoom.createdAt,
+                endedAt: new Date()
+              });
+              await Room.deleteOne({ channelName: roomId });
+              console.log(`Video room closed after reconnect grace expired: ${roomId}`);
+            } catch (error) {
+              console.log('Video room delayed disconnect cleanup error:', error);
+            }
+          }, ROOM_RECONNECT_GRACE_MS);
+
+          roomDisconnectTimers.set(timerKey, timer);
+          return;
         }
+
+        removeRoomPresence({ roomId, userId: currentUserId, socketId: socket.id });
+        await emitRoomStats(roomId);
         return;
       }
 
       const room = await AudioRoom.findById(roomId);
+
+      if (
+        room &&
+        room.hostId &&
+        room.hostId.toString() === currentUserId
+      ) {
+        io.to(roomId).emit('host_reconnecting', {
+          userId: currentUserId,
+          message: 'Host connection lost. Waiting for reconnect...'
+        });
+
+        const timerKey = getRoomDisconnectTimerKey(roomId, currentUserId);
+        if (roomDisconnectTimers.has(timerKey)) clearTimeout(roomDisconnectTimers.get(timerKey));
+
+        const timer = setTimeout(async () => {
+          try {
+            roomDisconnectTimers.delete(timerKey);
+            removeRoomPresence({ roomId, userId: currentUserId, socketId: socket.id });
+
+            const latestRoom = await AudioRoom.findById(roomId);
+            if (!latestRoom || latestRoom.hostId?.toString() !== currentUserId) return;
+
+            latestRoom.isLive = false;
+            latestRoom.speakers = [];
+            latestRoom.audience = [];
+            latestRoom.endedAt = new Date();
+
+            await recordHostLiveSessionActivity({
+              hostId: latestRoom.hostId,
+              roomId,
+              roomMode: 'audio',
+              startedAt: latestRoom.createdAt,
+              endedAt: latestRoom.endedAt
+            });
+            await latestRoom.save();
+
+            io.to(roomId).emit('audio_room_ended', {
+              message: 'Host disconnected. Room closed.'
+            });
+
+            console.log(`Audio room closed after reconnect grace expired: ${roomId}`);
+          } catch (error) {
+            console.log('Audio room delayed disconnect cleanup error:', error);
+          }
+        }, ROOM_RECONNECT_GRACE_MS);
+
+        roomDisconnectTimers.set(timerKey, timer);
+        return;
+      }
+
+      removeRoomPresence({ roomId, userId: currentUserId, socketId: socket.id });
 
       const speaker = room?.speakers?.find(
         s => String(s.userId) === currentUserId
@@ -1336,25 +1808,6 @@ io.on('connection', (socket) => {
         return;
       }
 
-      const audioRoomDoc = await AudioRoom.findById(roomId);
-
-      if (
-        audioRoomDoc &&
-        audioRoomDoc.hostId &&
-        audioRoomDoc.hostId.toString() === currentUserId
-      ) {
-        audioRoomDoc.isLive = false;
-        audioRoomDoc.speakers = [];
-        audioRoomDoc.audience = [];
-
-        await audioRoomDoc.save();
-
-        io.to(roomId).emit('audio_room_ended', {
-          message: 'Host disconnected. Room closed.'
-        });
-
-        console.log(`Audio room closed because host disconnected: ${roomId}`);
-      }
     } catch (err) {
       console.log('Critical Error logged inside disconnect pipeline:', err);
     }
@@ -1855,6 +2308,13 @@ app.post('/rooms/end', async (req, res) => {
         }
 
         io.to(videoRoom.channelName).emit('room_closing', { message: 'The host has ended the video live stream.' });
+        await recordHostLiveSessionActivity({
+          hostId: videoRoom.hostId,
+          roomId: videoRoom.channelName,
+          roomMode: 'video',
+          startedAt: videoRoom.createdAt,
+          endedAt: new Date()
+        });
         await Room.deleteOne({ _id: videoRoom._id });
         await new Promise(resolve => setTimeout(resolve, 500));
         return res.status(200).json({ success: true, message: "Room closed cleanly." });
@@ -1873,6 +2333,13 @@ app.post('/rooms/end', async (req, res) => {
     room.speakers = [];
     room.audience = [];
     room.endedAt = new Date();
+    await recordHostLiveSessionActivity({
+      hostId: room.hostId,
+      roomId: room._id,
+      roomMode: 'audio',
+      startedAt: room.createdAt,
+      endedAt: room.endedAt
+    });
     await room.save();
 
     io.to(stringRoomId).emit('audio_room_ended', {
@@ -1882,6 +2349,117 @@ app.post('/rooms/end', async (req, res) => {
     return res.status(200).json({ success: true, message: "Room closed cleanly." });
   } catch (error) {
     return res.status(500).json({ error: error.message });
+  }
+});
+
+const resolveRoomForDeepLink = async (roomId) => {
+  const stringRoomId = String(roomId || '').trim();
+  if (!stringRoomId) return null;
+
+  const videoFilter = getVideoRoomFilter(stringRoomId);
+  if (videoFilter) {
+    const videoRoom = await Room.findOne(videoFilter).lean();
+    if (videoRoom) {
+      return {
+        roomId: videoRoom.channelName,
+        canonicalRoomId: videoRoom.channelName,
+        dbRoomId: videoRoom._id?.toString?.() || String(videoRoom._id || ''),
+        roomType: 'video',
+        roomMode: 'video',
+        routeName: 'VideoRoom',
+        isLive: !!videoRoom.isLive,
+        title: videoRoom.title || 'Glix Video Live',
+        hostId: videoRoom.hostId?.toString?.() || String(videoRoom.hostId || ''),
+        createdAt: videoRoom.createdAt,
+        lastHeartbeatAt: videoRoom.lastHeartbeatAt
+      };
+    }
+  }
+
+  if (!mongoose.Types.ObjectId.isValid(stringRoomId)) return null;
+
+  const audioRoom = await AudioRoom.findById(stringRoomId).select('_id hostId title isLive createdAt lastHeartbeatAt').lean();
+  if (!audioRoom) return null;
+
+  return {
+    roomId: audioRoom._id?.toString?.() || String(audioRoom._id),
+    canonicalRoomId: audioRoom._id?.toString?.() || String(audioRoom._id),
+    dbRoomId: audioRoom._id?.toString?.() || String(audioRoom._id),
+    roomType: 'audio',
+    roomMode: 'audio',
+    routeName: 'VoiceRoom',
+    isLive: !!audioRoom.isLive,
+    title: audioRoom.title || 'Live Audio Room',
+    hostId: audioRoom.hostId?.toString?.() || String(audioRoom.hostId || ''),
+    createdAt: audioRoom.createdAt,
+    lastHeartbeatAt: audioRoom.lastHeartbeatAt
+  };
+};
+
+const escapeHtml = (value = '') => String(value)
+  .replace(/&/g, '&amp;')
+  .replace(/</g, '&lt;')
+  .replace(/>/g, '&gt;')
+  .replace(/"/g, '&quot;')
+  .replace(/'/g, '&#039;');
+
+app.get('/rooms/resolve/:roomId', async (req, res) => {
+  try {
+    await closeStaleLiveRooms();
+    const room = await resolveRoomForDeepLink(req.params.roomId);
+    if (!room) return res.status(404).json({ success: false, message: 'Room not found' });
+    return res.status(200).json({ success: true, ...room });
+  } catch (error) {
+    return res.status(500).json({ success: false, message: error.message });
+  }
+});
+
+app.get(['/room/:roomId', '/r/:roomId'], async (req, res) => {
+  try {
+    await closeStaleLiveRooms();
+    const room = await resolveRoomForDeepLink(req.params.roomId);
+    const roomId = encodeURIComponent(req.params.roomId || '');
+    const appLink = `glix://room/${roomId}`;
+    const officialPortalUrl = process.env.OFFICIAL_PORTAL_URL || '';
+    const officialRoomUrl = officialPortalUrl ? `${officialPortalUrl.replace(/\/$/, '')}/rooms/${roomId}` : '';
+    const isLive = !!room?.isLive;
+    const title = escapeHtml(room?.title || 'Glix Live Room');
+    const roomLabel = room?.roomMode === 'video' ? 'Video room' : 'Voice room';
+    const displayRoomId = escapeHtml(req.params.roomId || '');
+
+    return res
+      .status(room ? 200 : 404)
+      .type('html')
+      .send(`<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>${title}</title>
+  <style>
+    body{margin:0;font-family:Arial,sans-serif;background:#071012;color:#fff;display:flex;min-height:100vh;align-items:center;justify-content:center;padding:24px}
+    main{max-width:420px;width:100%;background:#101b1f;border:1px solid #203238;border-radius:18px;padding:24px;text-align:center}
+    h1{font-size:24px;margin:0 0 8px}
+    p{color:#b8c7cc;line-height:1.45}
+    a{display:block;text-decoration:none;border-radius:14px;padding:13px 16px;margin-top:12px;font-weight:800}
+    .primary{background:#0f766e;color:#fff}
+    .secondary{background:#1f2937;color:#fff}
+    .muted{font-size:12px;color:#7f9299;margin-top:16px}
+  </style>
+</head>
+<body>
+  <main>
+    <h1>${title}</h1>
+    <p>${room ? `${roomLabel} ${isLive ? 'is live now.' : 'has ended.'}` : 'This room link is no longer available.'}</p>
+    ${isLive ? `<a class="primary" href="${appLink}">Open in Glix Live</a>` : ''}
+    ${officialRoomUrl ? `<a class="secondary" href="${officialRoomUrl}">Open in Official Portal</a>` : ''}
+    <p class="muted">Room ID: ${displayRoomId}</p>
+  </main>
+  ${isLive ? `<script>setTimeout(function(){ window.location.href = "${appLink}"; }, 350);</script>` : ''}
+</body>
+</html>`);
+  } catch (error) {
+    return res.status(500).json({ success: false, message: error.message });
   }
 });
 
@@ -2396,6 +2974,70 @@ app.post('/rewards/claim', async (req, res) => {
 
     const now = new Date();
     const { start, end, dayKey } = getRewardDayRange(now);
+
+    if (task.key === NEW_HOST_LIVE_REWARD_KEY) {
+      const user = await User.findById(userId).select('role createdAt hostStatus hostRegistration');
+      if (!user) return res.status(404).json({ success: false, message: 'User not found' });
+
+      const rewardStatus = await getNewHostLiveRewardStatus(user, start, end, dayKey, now);
+      if (!rewardStatus.canClaim) {
+        return res.status(400).json({
+          success: false,
+          message: rewardStatus.eligible
+            ? rewardStatus.claimsToday >= rewardStatus.maxClaimsPerDay
+              ? 'Daily host live bonus limit reached'
+              : 'Stream at least 60 minutes to claim this reward'
+            : rewardStatus.description,
+          hostLiveReward: rewardStatus
+        });
+      }
+
+      const claimedHourBlock = rewardStatus.claimsToday + 1;
+      const claimKey = `${userId}:${task.key}:${dayKey}:${claimedHourBlock}`;
+      const session = await mongoose.startSession();
+      session.startTransaction();
+
+      try {
+        await HostLiveRewardClaim.create([{
+          hostId: userId,
+          dayKey,
+          claimKey,
+          claimedHourBlock,
+          amount: NEW_HOST_LIVE_REWARD_AMOUNT
+        }], { session });
+
+        await RewardClaim.create([{
+          userId,
+          taskKey: task.key,
+          claimKey,
+          rewardType: task.rewardType,
+          amount: NEW_HOST_LIVE_REWARD_AMOUNT
+        }], { session });
+
+        await User.findByIdAndUpdate(
+          userId,
+          { $inc: { chang: NEW_HOST_LIVE_REWARD_AMOUNT } },
+          { session }
+        );
+
+        await session.commitTransaction();
+      } catch (error) {
+        await session.abortTransaction();
+        if (error.code === 11000) {
+          return res.status(400).json({ success: false, message: 'Host live bonus already claimed for this hour block' });
+        }
+        throw error;
+      } finally {
+        session.endSession();
+      }
+
+      const dashboard = await buildRewardDashboard(userId);
+      return res.status(200).json({
+        ...dashboard,
+        message: `Claimed ${NEW_HOST_LIVE_REWARD_AMOUNT} coins`
+      });
+    }
+
     const progress = await getRewardProgress(userId, task, start, end);
     if (progress < task.target) {
       return res.status(400).json({ success: false, message: 'Task is not complete yet' });
@@ -2769,6 +3411,7 @@ app.delete('/settings/:userId/account', async (req, res) => {
       DirectMessage.deleteMany({ $or: [{ senderId: userId }, { receiverId: userId }] }, { session }),
       RewardActivity.deleteMany({ userId }, { session }),
       RewardClaim.deleteMany({ userId }, { session }),
+      HostLiveRewardClaim.deleteMany({ hostId: userId }, { session }),
       UserStoreItem.deleteMany({ userId }, { session }),
       AudioRoom.deleteMany({ hostId: userId }, { session }),
       Room.deleteMany({ hostId: userId }, { session })
@@ -3145,6 +3788,17 @@ const getAuthenticatedAppUser = async (req) => {
   }
   return user;
 };
+
+app.get('/admin/rooms/resolve/:roomId', requireOfficial, async (req, res) => {
+  try {
+    await closeStaleLiveRooms();
+    const room = await resolveRoomForDeepLink(req.params.roomId);
+    if (!room) return res.status(404).json({ success: false, message: 'Room not found' });
+    return res.status(200).json({ success: true, ...room });
+  } catch (error) {
+    return res.status(500).json({ success: false, message: error.message });
+  }
+});
 
 const uploadAgencyVerificationImage = async (userId, image, label) => {
   if (!image?.base64) return '';
