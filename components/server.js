@@ -28,6 +28,7 @@ import MonthlyCommission from "./MonthlyCommission.js";
 import CoinSellerTransaction from "./CoinSellerTransaction.js";
 import GameCoinTransaction from "./GameCoinTransaction.js";
 import ProfileVisit from "./ProfileVisit.js";
+import RoomMusicTrack from "./RoomMusicTrack.js";
 import cloudinary from "./utils/cloudinary.js";
 
 const { RtcTokenBuilder, RtcRole } = pkg;
@@ -60,6 +61,7 @@ const io = new Server(server, {
 const activeUsers = {};
 
 const roomPresence = {};
+const roomControllers = {};
 const roomDisconnectTimers = new Map();
 const ROOM_RECONNECT_GRACE_MS = Number(process.env.ROOM_RECONNECT_GRACE_MS || 60000);
 
@@ -212,6 +214,7 @@ const closeStaleLiveRooms = async () => {
 const createCleanSlotsBlueprint = () => Array.from({ length: 25 }, (_, i) => ({
   id: i + 1,
   locked: i === 3 || i === 12 || i === 19,
+  userId: null,
   uid: null,
   username: `${i + 1}`,
   avatar: null,
@@ -904,6 +907,7 @@ io.on('connection', (socket) => {
               if (index >= 0 && index < 25) {
                 completeLayoutMatrix[index] = {
                   ...completeLayoutMatrix[index],
+                  userId: speaker.userId?._id?.toString?.() || speaker.userId?.toString?.() || null,
                   uid: speaker.numericUid || null,
                   username: speaker.userId?.name || "Broadcaster",
                   avatar: speaker.userId?.profilePic || null,
@@ -1015,6 +1019,7 @@ io.on('connection', (socket) => {
 
         const updateData = profilePic === null
           ? {
+            "slots.$.userId": null,
             "slots.$.uid": null,
             "slots.$.username": normalizedSlotIndex === 0 ? 'Main Host' : `Co-Host ${normalizedSlotIndex + 1}`,
             "slots.$.avatar": null,
@@ -1023,6 +1028,7 @@ io.on('connection', (socket) => {
             "slots.$.cameraOn": normalizedSlotIndex === 0
           }
           : {
+            "slots.$.userId": userId || null,
             "slots.$.uid": parseInt(numericUid, 10),
             "slots.$.username": name,
             "slots.$.avatar": profilePic,
@@ -1091,6 +1097,300 @@ io.on('connection', (socket) => {
       socket.emit('error_notice', { message: 'Failed to synchronize layout seat state.' });
     }
   });
+
+  const isRequesterRoomHost = async (roomId, requesterId) => {
+    const stringRoomId = roomId ? roomId.toString() : '';
+    const actorId = requesterId || socket.userId;
+    if (!stringRoomId || !actorId) return { allowed: false, stringRoomId, isVideoRoom: false, room: null };
+
+    const isVideoRoom = stringRoomId.startsWith('glix_');
+    const room = isVideoRoom
+      ? await Room.findOne({ channelName: stringRoomId })
+      : mongoose.Types.ObjectId.isValid(stringRoomId)
+        ? await AudioRoom.findById(stringRoomId)
+        : null;
+
+    const controller = roomControllers[stringRoomId] || null;
+    const actorIsHost = !!room && String(room.hostId || '') === String(actorId || '');
+    const actorIsController = !!controller && (
+      (controller.userId && String(controller.userId) === String(actorId || '')) ||
+      (controller.uid !== null && controller.uid !== undefined && String(controller.uid) === String(socket.numericUid || ''))
+    );
+    console.log('[RoomAdmin][Backend][permission-check]', {
+      roomId: stringRoomId,
+      requesterId,
+      socketUserId: socket.userId || null,
+      actorId,
+      isVideoRoom,
+      roomFound: !!room,
+      roomHostId: room?.hostId?.toString?.() || room?.hostId || null,
+      controller,
+      actorIsHost,
+      actorIsController,
+      allowed: !!room && (actorIsHost || actorIsController),
+    });
+
+    return {
+      allowed: !!room && (actorIsHost || actorIsController),
+      isHost: actorIsHost,
+      isController: actorIsController,
+      stringRoomId,
+      isVideoRoom,
+      room
+    };
+  };
+
+  const handleAssignRoomAdmin = async (payload = {}, mode = 'audio') => {
+    try {
+      console.log('[RoomAdmin][Backend][assign-received]', { mode, payload });
+      const { allowed, stringRoomId, room } = await isRequesterRoomHost(payload.roomId, payload.requesterId);
+      if (!allowed) {
+        console.log('[RoomAdmin][Backend][assign-rejected]', {
+          reason: 'permission_denied',
+          mode,
+          roomId: payload.roomId,
+          requesterId: payload.requesterId,
+        });
+        socket.emit('error_notice', { message: 'Only the host or room admin can make a room admin.' });
+        return;
+      }
+
+      const targetSlotIndex = Number(payload.targetSlotIndex);
+      const targetUid = payload.targetUid ?? payload.uid ?? null;
+      let targetUserId = payload.targetUserId || null;
+      if (!targetUserId && Number.isInteger(targetSlotIndex)) {
+        if (stringRoomId.startsWith('glix_')) {
+          const slot = Array.isArray(room.slots)
+            ? room.slots.find(item => Number(item?.id) === targetSlotIndex + 1)
+            : null;
+          targetUserId = slot?.userId || null;
+        } else {
+          const speaker = Array.isArray(room.speakers)
+            ? room.speakers.find(item => (
+              Number(item?.slotIndex) === targetSlotIndex ||
+              (targetUid !== null && targetUid !== undefined && String(item?.numericUid || '') === String(targetUid))
+            ))
+            : null;
+          targetUserId = speaker?.userId || null;
+        }
+      }
+      targetUserId = targetUserId?.toString?.() || targetUserId;
+      console.log('[RoomAdmin][Backend][assign-resolved]', {
+        mode,
+        roomId: stringRoomId,
+        targetSlotIndex,
+        targetUid,
+        targetUserId,
+        roomSpeakers: Array.isArray(room?.speakers) ? room.speakers.map(item => ({
+          userId: item?.userId?.toString?.() || item?.userId || null,
+          slotIndex: item?.slotIndex,
+          numericUid: item?.numericUid,
+        })) : undefined,
+        roomSlots: Array.isArray(room?.slots) ? room.slots.map(item => ({
+          id: item?.id,
+          userId: item?.userId?.toString?.() || item?.userId || null,
+          uid: item?.uid,
+          username: item?.username,
+        })) : undefined,
+      });
+      if (!targetUserId || !Number.isInteger(targetSlotIndex) || targetUid === null || targetUid === undefined) {
+        console.log('[RoomAdmin][Backend][assign-rejected]', {
+          reason: 'missing_target',
+          mode,
+          roomId: stringRoomId,
+          targetSlotIndex,
+          targetUid,
+          targetUserId,
+        });
+        socket.emit('error_notice', { message: 'Selected user is not available on this slot.' });
+        return;
+      }
+
+      const controller = {
+        userId: targetUserId.toString(),
+        uid: targetUid,
+        targetSlotIndex,
+      };
+      roomControllers[stringRoomId] = controller;
+      console.log('[RoomAdmin][Backend][assign-broadcast]', {
+        mode,
+        roomId: stringRoomId,
+        controller,
+        event: mode === 'video' ? 'video_room_admin_assigned' : 'audio_room_host_assigned',
+      });
+
+      io.to(stringRoomId).emit(mode === 'video' ? 'video_room_admin_assigned' : 'audio_room_host_assigned', {
+        controller,
+        roomId: stringRoomId,
+        hostId: room.hostId,
+        message: 'Room admin assigned.'
+      });
+    } catch (error) {
+      console.log('Assign room admin error:', error);
+      socket.emit('error_notice', { message: 'Unable to assign room admin.' });
+    }
+  };
+
+  const handleRemoveSlotUser = async (payload = {}, mode = 'audio') => {
+    try {
+      console.log('[RoomAdmin][Backend][remove-received]', { mode, payload });
+      const { allowed, stringRoomId, isVideoRoom, room } = await isRequesterRoomHost(payload.roomId, payload.requesterId);
+      if (!allowed) {
+        console.log('[RoomAdmin][Backend][remove-rejected]', {
+          reason: 'permission_denied',
+          mode,
+          roomId: payload.roomId,
+          requesterId: payload.requesterId,
+        });
+        socket.emit('error_notice', { message: 'Only the host or room admin can remove a slot user.' });
+        return;
+      }
+
+      const targetSlotIndex = Number(payload.targetSlotIndex);
+      const targetUid = payload.targetUid ?? payload.uid ?? null;
+      let targetUserId = payload.targetUserId || null;
+      if (!targetUserId && Number.isInteger(targetSlotIndex)) {
+        if (isVideoRoom) {
+          const slot = Array.isArray(room.slots)
+            ? room.slots.find(item => Number(item?.id) === targetSlotIndex + 1)
+            : null;
+          targetUserId = slot?.userId || null;
+        } else {
+          const speaker = Array.isArray(room.speakers)
+            ? room.speakers.find(item => (
+              Number(item?.slotIndex) === targetSlotIndex ||
+              (targetUid !== null && targetUid !== undefined && String(item?.numericUid || '') === String(targetUid))
+            ))
+            : null;
+          targetUserId = speaker?.userId || null;
+        }
+      }
+      targetUserId = targetUserId?.toString?.() || targetUserId;
+      console.log('[RoomAdmin][Backend][remove-resolved]', {
+        mode,
+        roomId: stringRoomId,
+        isVideoRoom,
+        targetSlotIndex,
+        targetUid,
+        targetUserId,
+        roomHostId: room?.hostId?.toString?.() || room?.hostId || null,
+        roomSpeakers: Array.isArray(room?.speakers) ? room.speakers.map(item => ({
+          userId: item?.userId?.toString?.() || item?.userId || null,
+          slotIndex: item?.slotIndex,
+          numericUid: item?.numericUid,
+        })) : undefined,
+        roomSlots: Array.isArray(room?.slots) ? room.slots.map(item => ({
+          id: item?.id,
+          userId: item?.userId?.toString?.() || item?.userId || null,
+          uid: item?.uid,
+          username: item?.username,
+        })) : undefined,
+      });
+      if (!Number.isInteger(targetSlotIndex) || targetSlotIndex < 0) {
+        console.log('[RoomAdmin][Backend][remove-rejected]', {
+          reason: 'invalid_slot',
+          mode,
+          roomId: stringRoomId,
+          targetSlotIndex,
+        });
+        socket.emit('error_notice', { message: 'Invalid slot selected.' });
+        return;
+      }
+
+      if (String(targetUserId || '') === String(room.hostId || '')) {
+        console.log('[RoomAdmin][Backend][remove-rejected]', {
+          reason: 'target_is_host',
+          mode,
+          roomId: stringRoomId,
+          targetUserId,
+          hostId: room.hostId?.toString?.() || room.hostId,
+        });
+        socket.emit('error_notice', { message: 'The main host cannot be removed from here.' });
+        return;
+      }
+
+      if (isVideoRoom) {
+        if (targetSlotIndex <= 0 || targetSlotIndex > 2) {
+          console.log('[RoomAdmin][Backend][remove-rejected]', {
+            reason: 'invalid_video_slot',
+            mode,
+            roomId: stringRoomId,
+            targetSlotIndex,
+          });
+          socket.emit('error_notice', { message: 'Only co-host slots can be removed.' });
+          return;
+        }
+
+        await Room.findOneAndUpdate(
+          { channelName: stringRoomId, 'slots.id': targetSlotIndex + 1 },
+          {
+            $set: {
+              'slots.$.userId': null,
+              'slots.$.uid': null,
+              'slots.$.username': `Co-Host ${targetSlotIndex + 1}`,
+              'slots.$.avatar': null,
+              'slots.$.frameUrl': null,
+              'slots.$.isMuted': false,
+              'slots.$.cameraOn': false
+            }
+          }
+        );
+      } else {
+        await AudioRoom.findByIdAndUpdate(stringRoomId, {
+          $pull: { speakers: { slotIndex: targetSlotIndex } },
+          $set: { lastHeartbeatAt: new Date() }
+        });
+      }
+
+      io.to(stringRoomId).emit('slot_state_changed', {
+        slotIndex: targetSlotIndex,
+        user: {
+          uid: null,
+          userId: null,
+          username: isVideoRoom ? `Co-Host ${targetSlotIndex + 1}` : `${targetSlotIndex + 1}`,
+          avatar: null,
+          frameUrl: null,
+          isMuted: false,
+          cameraOn: false
+        }
+      });
+
+      const removalPayload = {
+        roomId: stringRoomId,
+        targetUserId,
+        targetUid,
+        targetSlotIndex,
+        kickFromRoom: true,
+        message: 'The host removed you from the room.'
+      };
+      console.log('[RoomAdmin][Backend][remove-broadcast]', {
+        mode,
+        roomId: stringRoomId,
+        event: isVideoRoom || mode === 'video' ? 'video_mic_user_removed' : 'audio_mic_user_removed',
+        removalPayload,
+      });
+
+      const currentController = roomControllers[stringRoomId];
+      if (currentController && (
+        (targetUserId && String(currentController.userId || '') === String(targetUserId || '')) ||
+        (targetUid !== null && targetUid !== undefined && String(currentController.uid || '') === String(targetUid))
+      )) {
+        delete roomControllers[stringRoomId];
+      }
+
+      io.to(stringRoomId).emit(isVideoRoom || mode === 'video' ? 'video_mic_user_removed' : 'audio_mic_user_removed', removalPayload);
+      io.to(stringRoomId).emit('mic_user_removed', removalPayload);
+      console.log(removalPayload);
+    } catch (error) {
+      console.log('Remove slot user error:', error);
+      socket.emit('error_notice', { message: 'Unable to remove this slot user.' });
+    }
+  };
+
+  socket.on('assign_audio_room_host', payload => handleAssignRoomAdmin(payload, 'audio'));
+  socket.on('assign_video_room_admin', payload => handleAssignRoomAdmin(payload, 'video'));
+  socket.on('remove_audio_mic_user', payload => handleRemoveSlotUser(payload, 'audio'));
+  socket.on('remove_video_mic_user', payload => handleRemoveSlotUser(payload, 'video'));
 
   socket.on('update_audio_room_layout', async ({ roomId, requesterId, micSeatCount, micLayoutType, backgroundThemeId, backgroundThemeUrl }) => {
     try {
@@ -5212,6 +5512,165 @@ app.post('/admin/notifications/send', requireOfficial, async (req, res) => {
     }
 
     return res.json({ success: true, matchedUsers: users.length, tokenCount: tokens.length, successCount, failureCount, skippedUsers: 0, skippedReasons: {} });
+  } catch (error) {
+    return res.status(500).json({ success: false, message: error.message });
+  }
+});
+
+const serializeRoomMusicTrack = (track) => ({
+  id: track._id?.toString?.() || String(track._id || ''),
+  _id: track._id?.toString?.() || String(track._id || ''),
+  title: track.title || 'Untitled track',
+  name: track.title || 'Untitled track',
+  artist: track.artist || '',
+  type: track.type || 'song',
+  url: track.url || '',
+  path: track.url || '',
+  coverUrl: track.coverUrl || '',
+  durationMs: track.durationMs || 0,
+  isShared: track.isShared !== false,
+  isActive: track.isActive !== false,
+  sortOrder: track.sortOrder || 0,
+  createdAt: track.createdAt,
+  updatedAt: track.updatedAt,
+});
+
+const uploadRoomMusicAsset = async (dataUri, folder, resourceType = 'auto') => {
+  const cleanDataUri = typeof dataUri === 'string' ? dataUri.trim() : '';
+  if (!cleanDataUri) return '';
+
+  const result = await cloudinary.uploader.upload(cleanDataUri, {
+    folder,
+    resource_type: resourceType,
+  });
+
+  return result.secure_url || result.url || '';
+};
+
+app.get('/room-music/tracks', async (req, res) => {
+  try {
+    const type = String(req.query?.type || '').trim();
+    const query = { isActive: true, isShared: true };
+    if (['song', 'effect', 'sound_byte'].includes(type)) query.type = type;
+
+    const tracks = await RoomMusicTrack.find(query)
+      .sort({ sortOrder: 1, createdAt: -1 })
+      .lean();
+
+    return res.json({
+      success: true,
+      data: tracks.map(serializeRoomMusicTrack),
+    });
+  } catch (error) {
+    return res.status(500).json({ success: false, message: error.message });
+  }
+});
+
+app.get('/admin/room-music/tracks', requireOfficial, async (req, res) => {
+  try {
+    const includeInactive = req.query?.includeInactive === 'true';
+    const query = includeInactive ? {} : { isActive: true };
+    const tracks = await RoomMusicTrack.find(query)
+      .sort({ sortOrder: 1, createdAt: -1 })
+      .lean();
+
+    return res.json({
+      success: true,
+      data: tracks.map(serializeRoomMusicTrack),
+    });
+  } catch (error) {
+    return res.status(500).json({ success: false, message: error.message });
+  }
+});
+
+app.post('/admin/room-music/tracks', requireOfficial, async (req, res) => {
+  try {
+    const title = String(req.body?.title || req.body?.name || '').trim();
+    const type = String(req.body?.type || 'song').trim();
+    const allowedTypes = ['song', 'effect', 'sound_byte'];
+    if (!title) return res.status(400).json({ success: false, message: 'Track title is required' });
+    if (!allowedTypes.includes(type)) return res.status(400).json({ success: false, message: 'Invalid track type' });
+
+    const uploadedAudioUrl = req.body?.audioData
+      ? await uploadRoomMusicAsset(req.body.audioData, 'room-music/audio', 'video')
+      : '';
+    const uploadedCoverUrl = req.body?.coverData
+      ? await uploadRoomMusicAsset(req.body.coverData, 'room-music/covers', 'image')
+      : '';
+    const url = uploadedAudioUrl || String(req.body?.url || req.body?.audioUrl || '').trim();
+    if (!url) return res.status(400).json({ success: false, message: 'Track audio URL or audioData is required' });
+
+    const track = await RoomMusicTrack.create({
+      title,
+      artist: String(req.body?.artist || '').trim(),
+      type,
+      url,
+      coverUrl: uploadedCoverUrl || String(req.body?.coverUrl || '').trim(),
+      durationMs: Number(req.body?.durationMs || 0),
+      sortOrder: Number(req.body?.sortOrder || 0),
+      uploadedBy: req.officialUser?._id || null,
+      isShared: req.body?.isShared !== false,
+      isActive: req.body?.isActive !== false,
+    });
+
+    return res.status(201).json({ success: true, data: serializeRoomMusicTrack(track) });
+  } catch (error) {
+    return res.status(500).json({ success: false, message: error.message });
+  }
+});
+
+app.patch('/admin/room-music/tracks/:trackId', requireOfficial, async (req, res) => {
+  try {
+    const { trackId } = req.params;
+    if (!mongoose.Types.ObjectId.isValid(trackId)) {
+      return res.status(400).json({ success: false, message: 'Invalid track id' });
+    }
+
+    const updates = {};
+    if (req.body?.title !== undefined || req.body?.name !== undefined) {
+      updates.title = String(req.body.title || req.body.name || '').trim();
+      if (!updates.title) return res.status(400).json({ success: false, message: 'Track title is required' });
+    }
+    if (req.body?.artist !== undefined) updates.artist = String(req.body.artist || '').trim();
+    if (req.body?.type !== undefined) {
+      const type = String(req.body.type || '').trim();
+      if (!['song', 'effect', 'sound_byte'].includes(type)) {
+        return res.status(400).json({ success: false, message: 'Invalid track type' });
+      }
+      updates.type = type;
+    }
+    if (req.body?.audioData) updates.url = await uploadRoomMusicAsset(req.body.audioData, 'room-music/audio', 'video');
+    if (req.body?.url !== undefined || req.body?.audioUrl !== undefined) {
+      updates.url = String(req.body.url || req.body.audioUrl || '').trim();
+      if (!updates.url) return res.status(400).json({ success: false, message: 'Track audio URL is required' });
+    }
+    if (req.body?.coverData) updates.coverUrl = await uploadRoomMusicAsset(req.body.coverData, 'room-music/covers', 'image');
+    if (req.body?.coverUrl !== undefined) updates.coverUrl = String(req.body.coverUrl || '').trim();
+    if (req.body?.durationMs !== undefined) updates.durationMs = Number(req.body.durationMs || 0);
+    if (req.body?.sortOrder !== undefined) updates.sortOrder = Number(req.body.sortOrder || 0);
+    if (req.body?.isShared !== undefined) updates.isShared = !!req.body.isShared;
+    if (req.body?.isActive !== undefined) updates.isActive = !!req.body.isActive;
+
+    const track = await RoomMusicTrack.findByIdAndUpdate(trackId, updates, { new: true });
+    if (!track) return res.status(404).json({ success: false, message: 'Track not found' });
+
+    return res.json({ success: true, data: serializeRoomMusicTrack(track) });
+  } catch (error) {
+    return res.status(500).json({ success: false, message: error.message });
+  }
+});
+
+app.delete('/admin/room-music/tracks/:trackId', requireOfficial, async (req, res) => {
+  try {
+    const { trackId } = req.params;
+    if (!mongoose.Types.ObjectId.isValid(trackId)) {
+      return res.status(400).json({ success: false, message: 'Invalid track id' });
+    }
+
+    const track = await RoomMusicTrack.findByIdAndUpdate(trackId, { isActive: false }, { new: true });
+    if (!track) return res.status(404).json({ success: false, message: 'Track not found' });
+
+    return res.json({ success: true, data: serializeRoomMusicTrack(track) });
   } catch (error) {
     return res.status(500).json({ success: false, message: error.message });
   }
