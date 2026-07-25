@@ -79,6 +79,14 @@ const withdrawalSchema = new mongoose.Schema({
     default: 'pending',
     index: true
   },
+  balanceDeducted: {
+    type: Boolean,
+    default: false
+  },
+  deductedAt: {
+    type: Date,
+    default: null
+  },
   reviewerId: {
     type: mongoose.Schema.Types.ObjectId,
     ref: 'User',

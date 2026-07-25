@@ -13,6 +13,20 @@ const GiftTransactionSchema = new mongoose.Schema({
     required: true,
     index: true
   },
+  senderName: {
+    type: String,
+    trim: true,
+    default: ''
+  },
+  senderAvatar: {
+    type: String,
+    default: ''
+  },
+  senderGlixId: {
+    type: String,
+    trim: true,
+    default: ''
+  },
 
   receiverId: {
     type: mongoose.Schema.Types.ObjectId,
@@ -20,13 +34,63 @@ const GiftTransactionSchema = new mongoose.Schema({
     required: true,
     index: true
   },
+  receiverName: {
+    type: String,
+    trim: true,
+    default: ''
+  },
+  receiverAvatar: {
+    type: String,
+    default: ''
+  },
+  receiverGlixId: {
+    type: String,
+    trim: true,
+    default: ''
+  },
+  receiverIds: [{
+    type: mongoose.Schema.Types.ObjectId,
+    ref: "User"
+  }],
+  receiverCount: {
+    type: Number,
+    default: 1
+  },
 
   giftName: String,
   giftImage: String,
+  giftThumbnail: {
+    type: String,
+    default: ''
+  },
 
   coinPrice: Number,
   quantity: Number,
+  perReceiverCost: Number,
   totalCost: Number,
+  batchTotalCost: Number,
+  roomMode: {
+    type: String,
+    enum: ['audio', 'video', 'unknown'],
+    default: 'unknown',
+    index: true
+  },
+  status: {
+    type: String,
+    enum: ['completed', 'failed', 'refunded'],
+    default: 'completed',
+    index: true
+  },
+  audit: {
+    senderBalanceAfter: { type: Number, default: 0 },
+    receiverBalanceAfter: { type: Number, default: 0 },
+    clientSenderName: { type: String, trim: true, default: '' },
+    roomHostId: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: "User",
+      default: null
+    }
+  },
 
   createdAt: {
     type: Date,
@@ -34,5 +98,9 @@ const GiftTransactionSchema = new mongoose.Schema({
     index: true
   }
 });
+
+GiftTransactionSchema.index({ senderId: 1, createdAt: -1 });
+GiftTransactionSchema.index({ receiverId: 1, createdAt: -1 });
+GiftTransactionSchema.index({ roomId: 1, createdAt: -1 });
 
 export default mongoose.model("GiftTransaction", GiftTransactionSchema);

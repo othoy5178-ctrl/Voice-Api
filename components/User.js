@@ -143,6 +143,10 @@ const userSchema = new mongoose.Schema({
   followingCount: { type: Number, default: 0 },
   daimon: { type: Number, default: 0 },
   chang: { type: Number, default: 0 },
+  isVip: { type: Boolean, default: false, index: true },
+  vipExpiresAt: { type: Date, default: null, index: true },
+  vipBadgeUrl: { type: String, default: '' },
+  vipItemKey: { type: String, default: '' },
   role: {
     type: String,
     enum: ['user', 'host', 'agency', 'manager', 'admin', 'coin_seller', 'super_admin'],
@@ -159,7 +163,7 @@ const userSchema = new mongoose.Schema({
     type: String,
     trim: true,
     uppercase: true,
-    sparse: true,
+    default: '',
     index: true
   },
   managerPermissions: {
@@ -302,6 +306,16 @@ const userSchema = new mongoose.Schema({
     registeredAt: { type: Date, default: null }
   },
 });
+
+userSchema.index(
+  { agencyCode: 1 },
+  {
+    unique: true,
+    partialFilterExpression: {
+      agencyCode: { $type: 'string', $ne: '' },
+    },
+  }
+);
 
 // Changed model name to 'User' to follow standard naming conventions
 const User = mongoose.model('User', userSchema);

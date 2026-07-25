@@ -29,6 +29,7 @@ import CoinSellerTransaction from "./CoinSellerTransaction.js";
 import GameCoinTransaction from "./GameCoinTransaction.js";
 import ProfileVisit from "./ProfileVisit.js";
 import RoomMusicTrack from "./RoomMusicTrack.js";
+import DiamondExchange from "./DiamondExchange.js";
 import cloudinary from "./utils/cloudinary.js";
 
 const { RtcTokenBuilder, RtcRole } = pkg;
@@ -189,13 +190,6 @@ const closeStaleLiveRooms = async () => {
   ]);
 
   await Promise.all([
-    ...staleAudioRooms.map(room => recordHostLiveSessionActivity({
-      hostId: room.hostId,
-      roomId: room._id,
-      roomMode: 'audio',
-      startedAt: room.createdAt,
-      endedAt: now
-    })),
     ...staleVideoRooms.map(room => recordHostLiveSessionActivity({
       hostId: room.hostId,
       roomId: room.channelName || room._id,
@@ -232,6 +226,18 @@ const DEFAULT_STORE_ITEMS = [
   { itemKey: 'honor_star', name: 'Honor Star', category: 'Honor', section: 'Avatar Frame', type: 'badge', price: 250, currency: 'chang', durationDays: 15, assetKey: 'honor-star', sortOrder: 7 },
   { itemKey: 'popular_flower', name: 'Flower Aura', category: 'Popular', section: 'Avatar Frame', type: 'frame', price: 180, currency: 'chang', durationDays: 30, assetKey: 'flower', equipValue: 'flower', sortOrder: 8 },
   { itemKey: 'star_entry_effect', name: 'Star Entry', category: 'Popular', section: 'New This Month', type: 'entryVideo', price: 300, currency: 'chang', durationDays: 30, assetKey: 'star', previewUrl: 'https://www.w3schools.com/html/mov_bbb.mp4', equipValue: 'https://www.w3schools.com/html/mov_bbb.mp4', sortOrder: 9 },
+  { itemKey: 'svip_1', name: 'SVIP 1', category: 'VIP', section: 'SVIP', type: 'vip', price: 200000, currency: 'chang', durationDays: 30, isVipItem: true, imageUrl: 'https://res.cloudinary.com/dh99ihggv/image/upload/v1784108929/35_utcpg1.gif', badgeUrl: 'https://res.cloudinary.com/dh99ihggv/image/upload/v1784108929/35_utcpg1.gif', equipValue: 'https://res.cloudinary.com/dh99ihggv/image/upload/v1784741464/done_eqmjjk.gif', frameUrl: 'https://res.cloudinary.com/dh99ihggv/image/upload/v1784741464/done_eqmjjk.gif', entryImageUrl: 'https://res.cloudinary.com/dh99ihggv/video/upload/h_250,q_auto/v1784628813/8_os4dp2.jpg', entryVideoUrl: 'https://res.cloudinary.com/dh99ihggv/video/upload/v1784628813/8_os4dp2.mp4', sortOrder: 10 },
+  { itemKey: 'svip_2', name: 'SVIP 2', category: 'VIP', section: 'SVIP', type: 'vip', price: 500000, currency: 'chang', durationDays: 30, isVipItem: true, imageUrl: 'https://res.cloudinary.com/dh99ihggv/image/upload/v1784108950/10_mmjbai.gif', badgeUrl: 'https://res.cloudinary.com/dh99ihggv/image/upload/v1784108950/10_mmjbai.gif', equipValue: 'https://res.cloudinary.com/dh99ihggv/image/upload/v1784741466/done_3_b9domq.gif', frameUrl: 'https://res.cloudinary.com/dh99ihggv/image/upload/v1784741466/done_3_b9domq.gif', entryImageUrl: 'https://res.cloudinary.com/dh99ihggv/video/upload/h_250,q_auto/v1784628810/7_qis4xg.jpg', entryVideoUrl: 'https://res.cloudinary.com/dh99ihggv/video/upload/v1784628810/7_qis4xg.mp4', sortOrder: 11 },
+  { itemKey: 'svip_3', name: 'SVIP 3', category: 'VIP', section: 'SVIP', type: 'vip', price: 12000000, currency: 'chang', durationDays: 30, isVipItem: true, imageUrl: 'https://res.cloudinary.com/dh99ihggv/image/upload/v1784108934/28_tmosll.gif', badgeUrl: 'https://res.cloudinary.com/dh99ihggv/image/upload/v1784108934/28_tmosll.gif', equipValue: 'https://res.cloudinary.com/dh99ihggv/image/upload/v1784741462/done_2_piyvt0.gif', frameUrl: 'https://res.cloudinary.com/dh99ihggv/image/upload/v1784741462/done_2_piyvt0.gif', entryImageUrl: 'https://res.cloudinary.com/dh99ihggv/video/upload/h_250,q_auto/v1784628807/4_sjysf9.jpg', entryVideoUrl: 'https://res.cloudinary.com/dh99ihggv/video/upload/v1784628807/4_sjysf9.mp4', sortOrder: 12 },
+  { itemKey: 'svip_4', name: 'SVIP 4', category: 'VIP', section: 'SVIP', type: 'vip', price: 30000000, currency: 'chang', durationDays: 30, isVipItem: true, imageUrl: 'https://res.cloudinary.com/dh99ihggv/image/upload/v1784108946/6_ssrx8b.gif', badgeUrl: 'https://res.cloudinary.com/dh99ihggv/image/upload/v1784108946/6_ssrx8b.gif', equipValue: 'https://res.cloudinary.com/dh99ihggv/image/upload/v1784741462/done_4_p2jcp2.gif', frameUrl: 'https://res.cloudinary.com/dh99ihggv/image/upload/v1784741462/done_4_p2jcp2.gif', entryImageUrl: 'https://res.cloudinary.com/dh99ihggv/video/upload/h_250,q_auto/v1784628804/3_kuirjc.jpg', entryVideoUrl: 'https://res.cloudinary.com/dh99ihggv/video/upload/v1784628804/3_kuirjc.mp4', sortOrder: 13 },
+  { itemKey: 'svip_5', name: 'SVIP 5', category: 'VIP', section: 'SVIP', type: 'vip', price: 62000000, currency: 'chang', durationDays: 30, isVipItem: true, imageUrl: 'https://res.cloudinary.com/dh99ihggv/image/upload/v1784108939/29_xfhzbc.gif', badgeUrl: 'https://res.cloudinary.com/dh99ihggv/image/upload/v1784108939/29_xfhzbc.gif', equipValue: 'https://res.cloudinary.com/dh99ihggv/image/upload/v1784741466/done_5_omnirb.gif', frameUrl: 'https://res.cloudinary.com/dh99ihggv/image/upload/v1784741466/done_5_omnirb.gif', entryImageUrl: 'https://res.cloudinary.com/dh99ihggv/video/upload/h_250,q_auto/v1784628802/9_nsjreq.jpg', entryVideoUrl: 'https://res.cloudinary.com/dh99ihggv/video/upload/v1784628802/9_nsjreq.mp4', sortOrder: 14 },
+  { itemKey: 'svip_6', name: 'SVIP 6', category: 'VIP', section: 'SVIP', type: 'vip', price: 128000000, currency: 'chang', durationDays: 30, isVipItem: true, imageUrl: 'https://res.cloudinary.com/dh99ihggv/image/upload/v1784108936/21_ulfv20.gif', badgeUrl: 'https://res.cloudinary.com/dh99ihggv/image/upload/v1784108936/21_ulfv20.gif', equipValue: 'https://res.cloudinary.com/dh99ihggv/image/upload/v1784741460/done_6_bvgbgd.gif', frameUrl: 'https://res.cloudinary.com/dh99ihggv/image/upload/v1784741460/done_6_bvgbgd.gif', entryImageUrl: 'https://res.cloudinary.com/dh99ihggv/video/upload/h_250,q_auto/v1784628798/5_zkxwyt.jpg', entryVideoUrl: 'https://res.cloudinary.com/dh99ihggv/video/upload/v1784628798/5_zkxwyt.mp4', sortOrder: 15 },
+  { itemKey: 'svip_7', name: 'SVIP 7', category: 'VIP', section: 'SVIP', type: 'vip', price: 250000000, currency: 'chang', durationDays: 30, isVipItem: true, imageUrl: 'https://res.cloudinary.com/dh99ihggv/image/upload/v1784108924/41_ql13et.gif', badgeUrl: 'https://res.cloudinary.com/dh99ihggv/image/upload/v1784108924/41_ql13et.gif', equipValue: 'https://res.cloudinary.com/dh99ihggv/image/upload/v1784741457/done_7_rtyzfj.gif', frameUrl: 'https://res.cloudinary.com/dh99ihggv/image/upload/v1784741457/done_7_rtyzfj.gif', entryImageUrl: 'https://res.cloudinary.com/dh99ihggv/video/upload/h_250,q_auto/v1784628795/10_go1g0k.jpg', entryVideoUrl: 'https://res.cloudinary.com/dh99ihggv/video/upload/v1784628795/10_go1g0k.mp4', sortOrder: 16 },
+  { itemKey: 'svip_8', name: 'SVIP 8', category: 'VIP', section: 'SVIP', type: 'vip', price: 6000000000, currency: 'chang', durationDays: 30, isVipItem: true, imageUrl: 'https://res.cloudinary.com/dh99ihggv/image/upload/v1784108923/43_wodtmf.gif', badgeUrl: 'https://res.cloudinary.com/dh99ihggv/image/upload/v1784108923/43_wodtmf.gif', equipValue: 'https://res.cloudinary.com/dh99ihggv/image/upload/v1784741459/done_8_pefnco.gif', frameUrl: 'https://res.cloudinary.com/dh99ihggv/image/upload/v1784741459/done_8_pefnco.gif', entryImageUrl: 'https://res.cloudinary.com/dh99ihggv/video/upload/h_250,q_auto/v1784628793/2_lm7ttu.jpg', entryVideoUrl: 'https://res.cloudinary.com/dh99ihggv/video/upload/v1784628793/2_lm7ttu.mp4', sortOrder: 17 },
+  { itemKey: 'svip_9', name: 'SVIP 9', category: 'VIP', section: 'SVIP', type: 'vip', price: 12000000000, currency: 'chang', durationDays: 30, isVipItem: true, imageUrl: 'https://res.cloudinary.com/dh99ihggv/image/upload/v1784108925/44_xbrrvf.gif', badgeUrl: 'https://res.cloudinary.com/dh99ihggv/image/upload/v1784108925/44_xbrrvf.gif', equipValue: 'https://res.cloudinary.com/dh99ihggv/image/upload/v1784741464/done_9_ve38js.gif', frameUrl: 'https://res.cloudinary.com/dh99ihggv/image/upload/v1784741464/done_9_ve38js.gif', entryImageUrl: 'https://res.cloudinary.com/dh99ihggv/video/upload/h_250,q_auto/v1784628789/6_ewzmzk.jpg', entryVideoUrl: 'https://res.cloudinary.com/dh99ihggv/video/upload/v1784628789/6_ewzmzk.mp4', sortOrder: 18 },
+  { itemKey: 'svip_10', name: 'SVIP 10', category: 'VIP', section: 'SVIP', type: 'vip', price: 25000000000, currency: 'chang', durationDays: 30, isVipItem: true, imageUrl: 'https://res.cloudinary.com/dh99ihggv/image/upload/v1784108928/40_ovz5gx.gif', badgeUrl: 'https://res.cloudinary.com/dh99ihggv/image/upload/v1784108928/40_ovz5gx.gif', equipValue: 'https://res.cloudinary.com/dh99ihggv/image/upload/v1784741457/done_10_ceo0r3.gif', frameUrl: 'https://res.cloudinary.com/dh99ihggv/image/upload/v1784741457/done_10_ceo0r3.gif', entryImageUrl: 'https://res.cloudinary.com/dh99ihggv/video/upload/h_250,q_auto/v1784628786/14_bshtzf.jpg', entryVideoUrl: 'https://res.cloudinary.com/dh99ihggv/video/upload/v1784628786/14_bshtzf.mp4', sortOrder: 19 },
+  { itemKey: 'svip_11', name: 'SVIP 11', category: 'VIP', section: 'SVIP', type: 'vip', price: 50000000000, currency: 'chang', durationDays: 30, isVipItem: true, imageUrl: 'https://res.cloudinary.com/dh99ihggv/image/upload/v1784108932/32_aqy1oy.gif', badgeUrl: 'https://res.cloudinary.com/dh99ihggv/image/upload/v1784108932/32_aqy1oy.gif', equipValue: 'https://res.cloudinary.com/dh99ihggv/image/upload/v1784741455/done_11_cgwyo5.gif', frameUrl: 'https://res.cloudinary.com/dh99ihggv/image/upload/v1784741455/done_11_cgwyo5.gif', entryImageUrl: 'https://res.cloudinary.com/dh99ihggv/video/upload/h_250,q_auto/v1784628783/12_tegcpr.jpg', entryVideoUrl: 'https://res.cloudinary.com/dh99ihggv/video/upload/v1784628783/12_tegcpr.mp4', sortOrder: 20 },
+  { itemKey: 'svip_12', name: 'SVIP 12', category: 'VIP', section: 'SVIP', type: 'vip', price: 100000000000, currency: 'chang', durationDays: 30, isVipItem: true, imageUrl: 'https://res.cloudinary.com/dh99ihggv/image/upload/v1784108925/42_aorxmf.gif', badgeUrl: 'https://res.cloudinary.com/dh99ihggv/image/upload/v1784108925/42_aorxmf.gif', equipValue: 'https://res.cloudinary.com/dh99ihggv/image/upload/v1784741455/no_lt4rqq.gif', frameUrl: 'https://res.cloudinary.com/dh99ihggv/image/upload/v1784741455/no_lt4rqq.gif', entryImageUrl: 'https://res.cloudinary.com/dh99ihggv/video/upload/h_250,q_auto/v1784628781/11_ruumbr.jpg', entryVideoUrl: 'https://res.cloudinary.com/dh99ihggv/video/upload/v1784628781/11_ruumbr.mp4', sortOrder: 21 },
   { itemKey: 'cloud_frame_14_k1gmdn', name: 'Frame 14', category: 'Profile', section: 'Avatar Frame', type: 'frame', price: 29.99, currency: 'chang', durationDays: 30, imageUrl: 'https://res.cloudinary.com/dh99ihggv/image/upload/v1784627198/14_k1gmdn.png', equipValue: 'https://res.cloudinary.com/dh99ihggv/image/upload/v1784627198/14_k1gmdn.png', sortOrder: 100 },
   { itemKey: 'cloud_frame_38_pntuoi', name: 'Frame 38', category: 'Profile', section: 'Avatar Frame', type: 'frame', price: 29.99, currency: 'chang', durationDays: 30, imageUrl: 'https://res.cloudinary.com/dh99ihggv/image/upload/v1784627195/38_pntuoi.png', equipValue: 'https://res.cloudinary.com/dh99ihggv/image/upload/v1784627195/38_pntuoi.png', sortOrder: 101 },
   { itemKey: 'cloud_frame_47_qbtd4b', name: 'Frame 47', category: 'Profile', section: 'Avatar Frame', type: 'frame', price: 29.99, currency: 'chang', durationDays: 30, imageUrl: 'https://res.cloudinary.com/dh99ihggv/image/upload/v1784627193/47_qbtd4b.png', equipValue: 'https://res.cloudinary.com/dh99ihggv/image/upload/v1784627193/47_qbtd4b.png', sortOrder: 102 },
@@ -427,13 +433,17 @@ const clearExpiredStoreItems = async (userId, session = null) => {
 
 const getStoreWallet = async (userId) => {
   await clearExpiredStoreItems(userId);
-  const user = await User.findById(userId).select('daimon chang frameUrl entryVideoUrl');
+  const user = await User.findById(userId).select('daimon chang frameUrl entryVideoUrl isVip vipExpiresAt vipBadgeUrl vipItemKey');
   if (!user) return null;
   return {
     daimon: user.daimon || 0,
     chang: user.chang || 0,
     frameUrl: user.frameUrl || '',
-    entryVideoUrl: user.entryVideoUrl || ''
+    entryVideoUrl: user.entryVideoUrl || '',
+    isVip: !!user.isVip,
+    vipExpiresAt: user.vipExpiresAt || null,
+    vipBadgeUrl: user.vipBadgeUrl || '',
+    vipItemKey: user.vipItemKey || ''
   };
 };
 
@@ -585,6 +595,7 @@ const recordRewardActivity = async (userId, type, metadata = {}) => {
 const recordHostLiveSessionActivity = async ({ hostId, roomId, roomMode, startedAt, endedAt = new Date() }) => {
   try {
     if (!mongoose.Types.ObjectId.isValid(hostId) || !roomId || !startedAt) return;
+    if (roomMode !== 'video') return;
 
     const startDate = new Date(startedAt);
     const endDate = new Date(endedAt);
@@ -665,12 +676,9 @@ const getNewHostRewardEligibility = (user, now = new Date()) => {
 };
 
 const getActiveHostedMinutesToday = async (userId, start, now = new Date()) => {
-  const [audioRooms, videoRooms] = await Promise.all([
-    AudioRoom.find({ hostId: userId, isLive: true, createdAt: { $lt: now } }).select('createdAt').lean(),
-    Room.find({ hostId: userId.toString(), isLive: true, createdAt: { $lt: now } }).select('createdAt').lean()
-  ]);
+  const videoRooms = await Room.find({ hostId: userId.toString(), isLive: true, createdAt: { $lt: now } }).select('createdAt').lean();
 
-  return [...audioRooms, ...videoRooms].reduce((total, room) => {
+  return videoRooms.reduce((total, room) => {
     const liveStart = new Date(Math.max(new Date(room.createdAt).getTime(), start.getTime()));
     const minutes = Math.max(0, Math.floor((now.getTime() - liveStart.getTime()) / 60000));
     return total + minutes;
@@ -688,6 +696,7 @@ const getNewHostLiveRewardStatus = async (user, start, end, dayKey, now = new Da
         $match: {
           userId: userObjectId,
           type: 'host_live_session',
+          'metadata.roomMode': 'video',
           createdAt: { $gte: start, $lt: end }
         }
       },
@@ -728,7 +737,7 @@ const getNewHostLiveRewardStatus = async (user, start, end, dayKey, now = new Da
     expiresAt: eligibility.expiresAt?.toISOString?.() || null,
     eligible: eligibility.eligible,
     description: eligibility.eligible
-      ? `Stream 60 minutes to claim 5,000 coins. You can claim ${NEW_HOST_LIVE_REWARD_DAILY_LIMIT} times per day.`
+      ? `Host a video live for 60 minutes to claim 5,000 coins. You can claim ${NEW_HOST_LIVE_REWARD_DAILY_LIMIT} times per day.`
       : eligibility.reason
   };
 };
@@ -1495,9 +1504,14 @@ io.on('connection', (socket) => {
     });
   });
 
-  socket.on('send_gift', async ({ roomId, senderName, hostId, gift, giftName, avatar, userId, quantity, coins, receiverIds = [] }) => {
+  socket.on('send_gift', async ({ roomId, senderName, hostId, gift, giftThumbnail, giftName, avatar, userId, quantity, coins, receiverIds = [] }) => {
 
     console.log('gift data:', userId, roomId, hostId, coins, receiverIds);
+
+    if (!mongoose.Types.ObjectId.isValid(userId)) {
+      socket.emit('gift_error', { message: 'Invalid gift sender received.' });
+      return;
+    }
 
     const fallbackReceiverId = hostId ? hostId.toString() : '';
     const normalizedReceiverIds = [...new Set(
@@ -1523,6 +1537,7 @@ io.on('connection', (socket) => {
     const perReceiverCost = coinPrice * giftQuantity;
     const totalCost = perReceiverCost * normalizedReceiverIds.length;
     const stringRoomId = roomId ? roomId.toString() : '';
+    const roomMode = stringRoomId.startsWith('glix_') ? 'video' : mongoose.Types.ObjectId.isValid(stringRoomId) ? 'audio' : 'unknown';
 
     const session = await mongoose.startSession();
     session.startTransaction();
@@ -1536,8 +1551,23 @@ io.on('connection', (socket) => {
 
       if (!sender) throw new Error('Insufficient coins');
 
+      const receiverObjectIds = normalizedReceiverIds.map(id => new mongoose.Types.ObjectId(id));
+      const receiverDocs = await User.find({ _id: { $in: receiverObjectIds } })
+        .select('name profilePic glixId daimon')
+        .session(session)
+        .lean();
+
+      if (receiverDocs.length !== normalizedReceiverIds.length) {
+        throw new Error('One or more gift receivers were not found.');
+      }
+
+      const receiverById = receiverDocs.reduce((map, receiver) => {
+        map[receiver._id.toString()] = receiver;
+        return map;
+      }, {});
+
       const receiverUpdate = await User.updateMany(
-        { _id: { $in: normalizedReceiverIds.map(id => new mongoose.Types.ObjectId(id)) } },
+        { _id: { $in: receiverObjectIds } },
         { $inc: { daimon: perReceiverCost } },
         { session }
       );
@@ -1549,13 +1579,32 @@ io.on('connection', (socket) => {
       await GiftTransaction.create(
         normalizedReceiverIds.map(receiverId => ({
           roomId: stringRoomId,
+          roomMode,
           senderId: userId,
+          senderName: sender.name || senderName || 'User',
+          senderAvatar: sender.profilePic || avatar || '',
+          senderGlixId: sender.glixId || '',
           receiverId,
+          receiverName: receiverById[receiverId]?.name || 'User',
+          receiverAvatar: receiverById[receiverId]?.profilePic || '',
+          receiverGlixId: receiverById[receiverId]?.glixId || '',
+          receiverIds: receiverObjectIds,
+          receiverCount: normalizedReceiverIds.length,
           giftName,
           giftImage: gift,
+          giftThumbnail: giftThumbnail || '',
           coinPrice,
           quantity: giftQuantity,
-          totalCost: perReceiverCost
+          perReceiverCost,
+          totalCost: perReceiverCost,
+          batchTotalCost: totalCost,
+          status: 'completed',
+          audit: {
+            senderBalanceAfter: sender.chang || 0,
+            receiverBalanceAfter: Number(receiverById[receiverId]?.daimon || 0) + perReceiverCost,
+            clientSenderName: senderName || '',
+            roomHostId: mongoose.Types.ObjectId.isValid(hostId) ? new mongoose.Types.ObjectId(hostId) : null
+          }
         })),
         { session }
       );
@@ -1576,6 +1625,7 @@ io.on('connection', (socket) => {
       type: 'gift',
       sender: senderName,
       gift,
+      giftThumbnail: giftThumbnail || '',
       giftName,
       avatar,
       quantity: giftQuantity,
@@ -1736,6 +1786,8 @@ io.on('connection', (socket) => {
   socket.on('register_user', (userId) => {
     if (userId) {
       socket.join(userId.toString());
+      activeUsers[userId.toString()] = socket.id;
+      socket.userId = userId.toString();
       console.log(`SUCCESS: User ${userId} joined room: ${userId}`);
       // Send a confirmation back to the client to verify connection
       socket.emit('system_message', `Successfully joined room: ${userId}`);
@@ -1763,6 +1815,16 @@ io.on('connection', (socket) => {
 
       // TARGET THE ROOM NAME
       io.to(receiverId.toString()).emit('receive_direct_message', serverPayload);
+      io.to(receiverId.toString()).emit('chat_unread_changed', {
+        userId: receiverId,
+        partnerId: senderId,
+        reason: 'new_message',
+      });
+      io.to(senderId.toString()).emit('chat_unread_changed', {
+        userId: senderId,
+        partnerId: receiverId,
+        reason: 'message_sent',
+      });
 
       // Echo back to sender
       socket.emit('message_sent_ack', { localId, _id: savedMessage._id.toString() });
@@ -1785,6 +1847,16 @@ io.on('connection', (socket) => {
       if (partnerSocketId) {
         io.to(partnerSocketId).emit('messages_read_receipt', { readerId: userId });
       }
+      io.to(userId.toString()).emit('chat_unread_changed', {
+        userId,
+        partnerId,
+        reason: 'messages_read',
+      });
+      io.to(partnerId.toString()).emit('chat_unread_changed', {
+        userId: partnerId,
+        partnerId: userId,
+        reason: 'messages_read_receipt',
+      });
 
       console.log(`Marked messages from ${partnerId} as read by ${userId}`);
     } catch (err) {
@@ -2050,13 +2122,6 @@ io.on('connection', (socket) => {
             latestRoom.audience = [];
             latestRoom.endedAt = new Date();
 
-            await recordHostLiveSessionActivity({
-              hostId: latestRoom.hostId,
-              roomId,
-              roomMode: 'audio',
-              startedAt: latestRoom.createdAt,
-              endedAt: latestRoom.endedAt
-            });
             await latestRoom.save();
 
             io.to(roomId).emit('audio_room_ended', {
@@ -2431,6 +2496,78 @@ app.get('/gift-history/host/:hostId', async (req, res) => {
   }
 });
 
+app.get('/gift-history/user/:userId', async (req, res) => {
+  try {
+    const { userId } = req.params;
+    const direction = ['sent', 'received', 'all'].includes(req.query.direction) ? req.query.direction : 'all';
+    const limit = Math.min(Math.max(parseInt(req.query.limit, 10) || 50, 1), 100);
+
+    if (!mongoose.Types.ObjectId.isValid(userId)) {
+      return res.status(400).json({ success: false, message: 'Invalid user id' });
+    }
+
+    const userObjectId = new mongoose.Types.ObjectId(userId);
+    const match = direction === 'sent'
+      ? { senderId: userObjectId }
+      : direction === 'received'
+        ? { receiverId: userObjectId }
+        : { $or: [{ senderId: userObjectId }, { receiverId: userObjectId }] };
+
+    const transactions = await GiftTransaction.find(match)
+      .sort({ createdAt: -1 })
+      .limit(limit)
+      .lean();
+
+    const totals = transactions.reduce((acc, item) => {
+      const sentByUser = item.senderId?.toString?.() === userId;
+      const receivedByUser = item.receiverId?.toString?.() === userId;
+
+      if (sentByUser) acc.sentCoins += Number(item.totalCost || 0);
+      if (receivedByUser) acc.receivedCoins += Number(item.totalCost || 0);
+      acc.quantity += Number(item.quantity || 0);
+      acc.transactions += 1;
+      return acc;
+    }, { sentCoins: 0, receivedCoins: 0, quantity: 0, transactions: 0 });
+
+    return res.status(200).json({
+      success: true,
+      direction,
+      totals,
+      transactions: transactions.map(item => ({
+        id: item._id,
+        roomId: item.roomId,
+        roomMode: item.roomMode || 'unknown',
+        sender: {
+          id: item.senderId,
+          name: item.senderName || '',
+          avatar: item.senderAvatar || '',
+          glixId: item.senderGlixId || '',
+        },
+        receiver: {
+          id: item.receiverId,
+          name: item.receiverName || '',
+          avatar: item.receiverAvatar || '',
+          glixId: item.receiverGlixId || '',
+        },
+        receiverIds: item.receiverIds || [],
+        receiverCount: item.receiverCount || 1,
+        giftName: item.giftName || '',
+        giftImage: item.giftImage || '',
+        giftThumbnail: item.giftThumbnail || '',
+        coinPrice: item.coinPrice || 0,
+        quantity: item.quantity || 0,
+        perReceiverCost: item.perReceiverCost || item.totalCost || 0,
+        totalCost: item.totalCost || 0,
+        batchTotalCost: item.batchTotalCost || item.totalCost || 0,
+        status: item.status || 'completed',
+        createdAt: item.createdAt,
+      }))
+    });
+  } catch (error) {
+    return res.status(500).json({ success: false, message: error.message });
+  }
+});
+
 app.post('/create', async (req, res) => {
   try {
     const { title, hostId, numericUid } = req.body;
@@ -2633,13 +2770,6 @@ app.post('/rooms/end', async (req, res) => {
     room.speakers = [];
     room.audience = [];
     room.endedAt = new Date();
-    await recordHostLiveSessionActivity({
-      hostId: room.hostId,
-      roomId: room._id,
-      roomMode: 'audio',
-      startedAt: room.createdAt,
-      endedAt: room.endedAt
-    });
     await room.save();
 
     io.to(stringRoomId).emit('audio_room_ended', {
@@ -3105,33 +3235,54 @@ app.post('/store/purchase', async (req, res) => {
   session.startTransaction();
 
   try {
-    const { userId, itemId } = req.body;
-    if (!mongoose.Types.ObjectId.isValid(userId) || !mongoose.Types.ObjectId.isValid(itemId)) {
+    const { userId, itemId, itemKey, paymentCurrency } = req.body;
+    const requestedItemKey = String(itemKey || '').trim();
+    const hasValidItemId = mongoose.Types.ObjectId.isValid(itemId);
+    const hasValidItemKey = /^[a-zA-Z0-9_-]+$/.test(requestedItemKey);
+    if (!mongoose.Types.ObjectId.isValid(userId) || (!hasValidItemId && !hasValidItemKey)) {
       await session.abortTransaction();
       return res.status(400).json({ success: false, message: 'Invalid purchase request' });
     }
 
-    const item = await StoreItem.findById(itemId).session(session);
+    await ensureDefaultStoreItems();
+    const item = hasValidItemId
+      ? await StoreItem.findById(itemId).session(session)
+      : await StoreItem.findOne({ itemKey: requestedItemKey }).session(session);
     if (!item || !item.isActive) {
       await session.abortTransaction();
       return res.status(404).json({ success: false, message: 'Store item not found' });
     }
 
+    const isVipPurchase = item.type === 'vip' || item.isVipItem;
     const existing = await UserStoreItem.findOne({ userId, itemKey: item.itemKey }).session(session);
-    if (existing && (!existing.expiresAt || existing.expiresAt > new Date())) {
+    if (!isVipPurchase && existing && (!existing.expiresAt || existing.expiresAt > new Date())) {
       await session.abortTransaction();
       return res.status(400).json({ success: false, message: 'Item already owned' });
     }
 
+    const requestedCurrency = paymentCurrency === 'daimon' || paymentCurrency === 'chang' ? paymentCurrency : null;
+    const chargeCurrency = requestedCurrency && isVipPurchase ? requestedCurrency : item.currency || 'chang';
+    const currencyLabel = chargeCurrency === 'daimon' ? 'diamonds' : 'coins';
+    const price = Number(item.price || 0);
+
     const user = await User.findOneAndUpdate(
-      { _id: userId, chang: { $gte: item.price } },
-      { $inc: { chang: -item.price } },
+      { _id: userId, [chargeCurrency]: { $gte: price } },
+      { $inc: { [chargeCurrency]: -price } },
       { new: true, session }
     );
 
-    if (!user) throw new Error('Insufficient coins');
+    if (!user) throw new Error(`Insufficient ${currencyLabel}`);
 
-    const expiresAt = getStoreExpiry(item);
+    let expiresAt = getStoreExpiry(item);
+    if (isVipPurchase) {
+      const durationDays = getStoreDurationDays(item);
+      const baseDate = existing?.expiresAt && existing.expiresAt > new Date() ? new Date(existing.expiresAt) : new Date();
+      if (durationDays && durationDays > 0) {
+        expiresAt = new Date(baseDate);
+        expiresAt.setDate(expiresAt.getDate() + durationDays);
+      }
+    }
+
     await UserStoreItem.findOneAndUpdate(
       { userId, itemKey: item.itemKey },
       {
@@ -3148,9 +3299,34 @@ app.post('/store/purchase', async (req, res) => {
       { upsert: true, new: true, session }
     );
 
+    if (isVipPurchase) {
+      const vipBadgeUrl = item.badgeUrl || item.imageUrl || item.assetKey || '';
+      const vipFrameUrl = item.frameUrl || item.equipValue || '';
+      const vipEntryVideoUrl = item.entryVideoUrl || '';
+      await User.findByIdAndUpdate(
+        userId,
+        {
+          $set: {
+            isVip: true,
+            vipExpiresAt: expiresAt,
+            vipBadgeUrl,
+            vipItemKey: item.itemKey,
+            frameUrl: vipFrameUrl || user.frameUrl || '',
+            entryVideoUrl: vipEntryVideoUrl || user.entryVideoUrl || ''
+          }
+        },
+        { session }
+      );
+    }
+
     await session.commitTransaction();
     const wallet = await getStoreWallet(userId);
-    return res.status(200).json({ success: true, message: 'Purchase successful', wallet });
+    return res.status(200).json({
+      success: true,
+      message: 'Purchase successful',
+      wallet,
+      paymentCurrency: chargeCurrency,
+    });
   } catch (error) {
     await session.abortTransaction();
     return res.status(500).json({ success: false, message: error.message });
@@ -3400,7 +3576,7 @@ app.post('/rewards/claim', async (req, res) => {
   }
 });
 
-const PUBLIC_USER_FIELDS = 'name email profilePic glixId googleId createdAt lastLogin followersCount followingCount daimon chang frameUrl entryVideoUrl settings blacklistedUsers gender birthday countryRegion voiceSignature signature albumPhotos role accountStatus hostStatus agencyStatus coinSellerStatus';
+const PUBLIC_USER_FIELDS = 'name email profilePic glixId googleId createdAt lastLogin followersCount followingCount daimon chang frameUrl entryVideoUrl isVip vipExpiresAt vipBadgeUrl vipItemKey settings blacklistedUsers gender birthday countryRegion voiceSignature signature albumPhotos role accountStatus hostStatus agencyStatus coinSellerStatus';
 
 const sanitizeUserSettings = (settings = {}) => {
   const allowedMessagesFrom = ['everyone', 'following', 'none'];
@@ -4699,6 +4875,48 @@ app.patch('/host/requests/:userId', requireOfficial, async (req, res) => {
   }
 });
 
+const AGENCY_CODE_PATTERN = /^[A-Z0-9_-]{4,24}$/;
+
+const normalizeAgencyCode = (value = '') => String(value || '').trim().toUpperCase().replace(/\s+/g, '');
+
+const validateAgencyCode = (agencyCode) => {
+  if (!agencyCode) return 'Agency code is required.';
+  if (!AGENCY_CODE_PATTERN.test(agencyCode)) {
+    return 'Agency code must be 4-24 characters and use only letters, numbers, underscore, or dash.';
+  }
+  return '';
+};
+
+const findAgencyCodeOwner = async (agencyCode, excludeUserId = null) => {
+  const query = {
+    $or: [
+      { agencyCode },
+      {
+        agencyStatus: { $in: ['pending', 'approved'] },
+        'agencyRegistration.requestedAgencyCode': agencyCode,
+      },
+    ],
+  };
+
+  if (excludeUserId && mongoose.Types.ObjectId.isValid(String(excludeUserId))) {
+    query._id = { $ne: excludeUserId };
+  }
+
+  return User.findOne(query).select('_id name email glixId agencyCode agencyStatus agencyRegistration.requestedAgencyCode').lean();
+};
+
+const sendDuplicateAgencyCodeResponse = (res) => (
+  res.status(409).json({
+    success: false,
+    message: 'Agency code already exists. Please choose another code.',
+  })
+);
+
+const isDuplicateAgencyCodeError = (error) => (
+  error?.code === 11000 &&
+  (error?.keyPattern?.agencyCode || error?.keyValue?.agencyCode)
+);
+
 app.post('/agency/register', async (req, res) => {
   try {
     const user = await getAuthenticatedAppUser(req);
@@ -4714,7 +4932,7 @@ app.post('/agency/register', async (req, res) => {
 
     const agencyName = String(req.body?.agencyName || '').trim();
     const ownerName = String(req.body?.ownerName || '').trim();
-    const requestedAgencyCode = String(req.body?.agencyCode || req.body?.requestedAgencyCode || '').trim().toUpperCase();
+    const requestedAgencyCode = normalizeAgencyCode(req.body?.agencyCode || req.body?.requestedAgencyCode);
     const phoneCountryCode = String(req.body?.phoneCountryCode || '').trim();
     const phoneNumber = String(req.body?.phoneNumber || '').trim();
     const city = String(req.body?.city || '').trim();
@@ -4725,7 +4943,8 @@ app.post('/agency/register', async (req, res) => {
 
     if (!agencyName) return res.status(400).json({ success: false, message: 'Agency name is required.' });
     if (!ownerName) return res.status(400).json({ success: false, message: 'Owner name is required.' });
-    if (!requestedAgencyCode) return res.status(400).json({ success: false, message: 'Agency code is required.' });
+    const agencyCodeError = validateAgencyCode(requestedAgencyCode);
+    if (agencyCodeError) return res.status(400).json({ success: false, message: agencyCodeError });
     if (!phoneNumber) return res.status(400).json({ success: false, message: 'Phone number is required.' });
     if (!city) return res.status(400).json({ success: false, message: 'City is required.' });
     if (!acceptedTerms) return res.status(400).json({ success: false, message: 'Please accept agency terms.' });
@@ -4733,6 +4952,9 @@ app.post('/agency/register', async (req, res) => {
     const requiredPhotos = ['profilePhoto', 'idFront', 'idBack', 'selfiePhoto'];
     const missingPhoto = requiredPhotos.find(key => !verificationImages?.[key]?.base64);
     if (missingPhoto) return res.status(400).json({ success: false, message: `${missingPhoto} photo is required.` });
+
+    const existingAgencyCodeOwner = await findAgencyCodeOwner(requestedAgencyCode, user._id);
+    if (existingAgencyCodeOwner) return sendDuplicateAgencyCodeResponse(res);
 
     const [profilePhotoUrl, idFrontUrl, idBackUrl, selfiePhotoUrl] = await Promise.all([
       uploadAgencyVerificationImage(user._id, verificationImages.profilePhoto, 'profile-photo'),
@@ -4767,6 +4989,7 @@ app.post('/agency/register', async (req, res) => {
     await user.save();
     return res.status(201).json({ success: true, user: serializeOfficialUser(user) });
   } catch (error) {
+    if (isDuplicateAgencyCodeError(error)) return sendDuplicateAgencyCodeResponse(res);
     console.log('Agency registration error:', error);
     return res.status(500).json({ success: false, message: error.message || 'Unable to register agency profile.' });
   }
@@ -4850,12 +5073,19 @@ app.patch('/agency/requests/:userId', requireOfficial, async (req, res) => {
     user.agencyRegistration.reviewedBy = req.officialUser._id;
     user.agencyRegistration.reviewedAt = new Date();
     if (status === 'approved') {
+      const agencyCode = normalizeAgencyCode(user.agencyRegistration?.requestedAgencyCode || user.agencyCode || `AG${String(user.glixId || user._id).slice(-5)}`);
+      const agencyCodeError = validateAgencyCode(agencyCode);
+      if (agencyCodeError) return res.status(400).json({ success: false, message: agencyCodeError });
+      const existingAgencyCodeOwner = await findAgencyCodeOwner(agencyCode, user._id);
+      if (existingAgencyCodeOwner) return sendDuplicateAgencyCodeResponse(res);
       user.role = 'agency';
-      user.agencyCode = (user.agencyRegistration?.requestedAgencyCode || user.agencyCode || `AG${String(user.glixId || user._id).slice(-5)}`).toUpperCase();
+      user.agencyCode = agencyCode;
+      user.agencyRegistration.requestedAgencyCode = agencyCode;
     }
     await user.save();
     return res.json({ success: true, user: serializeOfficialUser(user) });
   } catch (error) {
+    if (isDuplicateAgencyCodeError(error)) return sendDuplicateAgencyCodeResponse(res);
     return res.status(500).json({ success: false, message: error.message });
   }
 });
@@ -4904,11 +5134,31 @@ app.patch('/admin/access/requests/:userId', requireOfficial, async (req, res) =>
 });
 
 const WITHDRAWAL_DIAMOND_TO_PKR = Number(process.env.WITHDRAWAL_DIAMOND_TO_PKR || 0.027);
+const WITHDRAWAL_DIAMOND_TO_USD = Number(process.env.WITHDRAWAL_DIAMOND_TO_USD || (7 / 170000));
 const WITHDRAWAL_MIN_DIAMONDS = Math.floor(Number(process.env.WITHDRAWAL_MIN_DIAMONDS || 10000));
+const DIAMOND_EXCHANGE_RATE = Number(process.env.DIAMOND_EXCHANGE_RATE || 1);
+const DIAMOND_EXCHANGE_MARGIN_PERCENT = Math.min(100, Math.max(0, Number(process.env.DIAMOND_EXCHANGE_MARGIN_PERCENT || 10)));
+const DIAMOND_EXCHANGE_MIN_DIAMONDS = Math.floor(Number(process.env.DIAMOND_EXCHANGE_MIN_DIAMONDS || 1000));
+const HOST_WITHDRAWAL_POLICY = [
+  170000,
+  340000,
+  680000,
+  1360000,
+  2720000,
+  5440000,
+  10880000,
+  21760000,
+  43520000,
+  87040000,
+].map((coins) => ({
+  senderSends: coins,
+  hostReceives: coins,
+  usd: Number((coins * WITHDRAWAL_DIAMOND_TO_USD).toFixed(2)),
+}));
 const WITHDRAWAL_METHODS = [
-  { id: 'paypal', method: 'PayPal', country: 'All Countries', countryCode: 'global', title: 'PayPal', subtitle: 'Transfer to PayPal account', icon: 'card', feePercent: 5, feeFixedDiamonds: 0, arrivalText: '6 hours', payoutCurrency: 'USD', exchangeRate: Number(process.env.WITHDRAWAL_DIAMOND_TO_USD || 0.0001), fields: { accountNumber: 'PayPal Email', firstName: 'First name', lastName: 'Last name' } },
-  { id: 'usdt', method: 'USDT', country: 'All Countries', countryCode: 'global', title: 'USDT', subtitle: 'Cryptocurrency transfer', icon: 'crypto', feePercent: 1.5, feeFixedDiamonds: 0, arrivalText: '6 hours', payoutCurrency: 'USDT', exchangeRate: Number(process.env.WITHDRAWAL_DIAMOND_TO_USD || 0.0001), fields: { accountNumber: 'USDT Wallet Address', firstName: 'First name', lastName: 'Last name' } },
-  { id: 'binance', method: 'Binance', country: 'All Countries', countryCode: 'global', title: 'Binance', subtitle: 'Bank account transfer', icon: 'bank', feePercent: 1.5, feeFixedDiamonds: 0, arrivalText: '6 hours', payoutCurrency: 'USDT', exchangeRate: Number(process.env.WITHDRAWAL_DIAMOND_TO_USD || 0.0001), fields: { accountNumber: 'Binance ID / Email', firstName: 'First name', lastName: 'Last name' } },
+  { id: 'paypal', method: 'PayPal', country: 'All Countries', countryCode: 'global', title: 'PayPal', subtitle: 'Transfer to PayPal account', icon: 'card', feePercent: 5, feeFixedDiamonds: 0, arrivalText: '6 hours', payoutCurrency: 'USD', exchangeRate: WITHDRAWAL_DIAMOND_TO_USD, fields: { accountNumber: 'PayPal Email', firstName: 'First name', lastName: 'Last name' } },
+  { id: 'usdt', method: 'USDT', country: 'All Countries', countryCode: 'global', title: 'USDT', subtitle: 'Cryptocurrency transfer', icon: 'crypto', feePercent: 1.5, feeFixedDiamonds: 0, arrivalText: '6 hours', payoutCurrency: 'USDT', exchangeRate: WITHDRAWAL_DIAMOND_TO_USD, fields: { accountNumber: 'USDT Wallet Address', firstName: 'First name', lastName: 'Last name' } },
+  { id: 'binance', method: 'Binance', country: 'All Countries', countryCode: 'global', title: 'Binance', subtitle: 'Bank account transfer', icon: 'bank', feePercent: 1.5, feeFixedDiamonds: 0, arrivalText: '6 hours', payoutCurrency: 'USDT', exchangeRate: WITHDRAWAL_DIAMOND_TO_USD, fields: { accountNumber: 'Binance ID / Email', firstName: 'First name', lastName: 'Last name' } },
   { id: 'epay', method: 'EPAY Wallet', country: 'All Countries', countryCode: 'global', title: 'EPAY Wallet', subtitle: 'European bank transfer', icon: 'wallet', feePercent: 0, feeFixedDiamonds: 10000, arrivalText: '6 hours', payoutCurrency: 'EUR', exchangeRate: Number(process.env.WITHDRAWAL_DIAMOND_TO_EUR || 0.000092), fields: { accountNumber: 'EPAY Wallet Account', firstName: 'First name', lastName: 'Last name' } },
   { id: 'jazzcash', method: 'JazzCash', country: 'Pakistan', countryCode: 'PK', title: 'JazzCash', subtitle: 'Transfer to JazzCash account', icon: 'wallet', feePercent: 1.7, feeFixedDiamonds: 0, arrivalText: '6 hours', payoutCurrency: 'PKR', exchangeRate: WITHDRAWAL_DIAMOND_TO_PKR, fields: { accountNumber: 'JazzCash Number', firstName: 'First name', lastName: 'Last name' } },
   { id: 'easypaisa', method: 'EasyPaisa', country: 'Pakistan', countryCode: 'PK', title: 'EasyPaisa', subtitle: 'Bank account transfer', icon: 'bank', feePercent: 1.7, feeFixedDiamonds: 0, arrivalText: '6 hours', payoutCurrency: 'PKR', exchangeRate: WITHDRAWAL_DIAMOND_TO_PKR, fields: { accountNumber: 'EasyPaisa Number', firstName: 'First name', lastName: 'Last name' } },
@@ -4934,6 +5184,13 @@ const serializeWithdrawalConfig = () => ({
   success: true,
   minimumDiamonds: WITHDRAWAL_MIN_DIAMONDS,
   defaultExchangeRate: WITHDRAWAL_DIAMOND_TO_PKR,
+  usdExchangeRate: WITHDRAWAL_DIAMOND_TO_USD,
+  hostReceivingPolicy: HOST_WITHDRAWAL_POLICY,
+  diamondExchange: {
+    rate: DIAMOND_EXCHANGE_RATE,
+    marginPercent: DIAMOND_EXCHANGE_MARGIN_PERCENT,
+    minimumDiamonds: DIAMOND_EXCHANGE_MIN_DIAMONDS,
+  },
   methods: WITHDRAWAL_METHODS,
   rules: [
     'Withdrawals are subject to verification to ensure platform security.',
@@ -4944,6 +5201,76 @@ const serializeWithdrawalConfig = () => ({
 
 app.get('/withdrawals/config', async (req, res) => {
   return res.json(serializeWithdrawalConfig());
+});
+
+app.post('/wallet/exchange', async (req, res) => {
+  try {
+    const authUser = await getAuthenticatedAppUser(req);
+    const userId = String(req.body?.userId || authUser?._id || '').trim();
+    if (!mongoose.Types.ObjectId.isValid(userId)) return res.status(400).json({ success: false, message: 'Invalid user id' });
+    if (authUser && String(authUser._id) !== String(userId)) return res.status(403).json({ success: false, message: 'Cannot exchange diamonds for another user' });
+
+    const diamonds = Math.floor(Number(req.body?.amount || req.body?.diamonds));
+    if (!Number.isFinite(diamonds) || diamonds < DIAMOND_EXCHANGE_MIN_DIAMONDS) {
+      return res.status(400).json({ success: false, message: `Minimum exchange is ${DIAMOND_EXCHANGE_MIN_DIAMONDS} diamonds` });
+    }
+
+    const grossCoins = Math.floor(diamonds * DIAMOND_EXCHANGE_RATE);
+    const marginCoins = Math.floor((grossCoins * DIAMOND_EXCHANGE_MARGIN_PERCENT) / 100);
+    const netCoins = Math.max(0, grossCoins - marginCoins);
+    if (netCoins <= 0) return res.status(400).json({ success: false, message: 'Exchange amount is too small after margin.' });
+
+    const updatedUser = await User.findOneAndUpdate(
+      { _id: userId, daimon: { $gte: diamonds } },
+      { $inc: { daimon: -diamonds, chang: netCoins } },
+      { new: true }
+    ).select('daimon chang commissionBalance revenueBalance');
+
+    if (!updatedUser) {
+      return res.status(400).json({ success: false, message: 'Insufficient diamonds.' });
+    }
+
+    const exchange = await DiamondExchange.create({
+      userId,
+      diamonds,
+      grossCoins,
+      marginPercent: DIAMOND_EXCHANGE_MARGIN_PERCENT,
+      marginCoins,
+      netCoins,
+      rate: DIAMOND_EXCHANGE_RATE,
+    });
+
+    return res.status(201).json({
+      success: true,
+      exchange,
+      wallet: {
+        daimon: updatedUser.daimon || 0,
+        chang: updatedUser.chang || 0,
+        commissionBalance: updatedUser.commissionBalance || 0,
+        revenueBalance: updatedUser.revenueBalance || 0,
+      },
+    });
+  } catch (error) {
+    return res.status(500).json({ success: false, message: error.message });
+  }
+});
+
+app.get('/wallet/exchanges/my/:userId', async (req, res) => {
+  try {
+    const authUser = await getAuthenticatedAppUser(req);
+    const { userId } = req.params;
+    if (!mongoose.Types.ObjectId.isValid(userId)) return res.status(400).json({ success: false, message: 'Invalid user id' });
+    if (authUser && String(authUser._id) !== String(userId)) return res.status(403).json({ success: false, message: 'Cannot view exchanges for another user' });
+
+    const exchanges = await DiamondExchange.find({ userId })
+      .sort({ createdAt: -1 })
+      .limit(50)
+      .lean();
+
+    return res.json({ success: true, exchanges });
+  } catch (error) {
+    return res.status(500).json({ success: false, message: error.message });
+  }
 });
 
 const getWithdrawalSourceForUser = (user, requestedSource = '') => {
@@ -4988,10 +5315,9 @@ app.post('/withdrawals', async (req, res) => {
     if (!user) return res.status(404).json({ success: false, message: 'User not found' });
 
     const source = getWithdrawalSourceForUser(user, req.body?.source);
-    const update = { $inc: { [source]: -amount } };
-    const query = { _id: userId, [source]: { $gte: amount } };
-    const updatedUser = await User.findOneAndUpdate(query, update, { new: true }).select('daimon commissionBalance revenueBalance');
-    if (!updatedUser) return res.status(400).json({ success: false, message: 'Insufficient withdrawable balance' });
+    if (Number(user[source] || 0) < amount) {
+      return res.status(400).json({ success: false, message: 'Insufficient withdrawable balance' });
+    }
 
     const withdrawal = await Withdrawal.create({
       userId,
@@ -5010,15 +5336,16 @@ app.post('/withdrawals', async (req, res) => {
       arrivalText: methodConfig.arrivalText,
       proofImageUrl,
       status: 'pending',
+      balanceDeducted: false,
     });
 
     return res.status(201).json({
       success: true,
       withdrawal,
       wallet: {
-        daimon: updatedUser.daimon || 0,
-        commissionBalance: updatedUser.commissionBalance || 0,
-        revenueBalance: updatedUser.revenueBalance || 0,
+        daimon: user.daimon || 0,
+        commissionBalance: user.commissionBalance || 0,
+        revenueBalance: user.revenueBalance || 0,
       },
     });
   } catch (error) {
@@ -5070,16 +5397,113 @@ app.patch('/admin/withdrawals/:withdrawalId', requireOfficial, async (req, res) 
     existingWithdrawal.reviewNote = String(req.body?.reviewNote || req.body?.reason || '');
     existingWithdrawal.transactionRef = String(req.body?.transactionRef || '');
     existingWithdrawal.reviewedAt = new Date();
+
+    let updatedWalletUser = null;
+    const wasBalanceDeducted = existingWithdrawal.balanceDeducted === true;
+    if (status === 'approved' && !wasBalanceDeducted) {
+      updatedWalletUser = await User.findOneAndUpdate(
+        {
+          _id: existingWithdrawal.userId,
+          [existingWithdrawal.source]: { $gte: existingWithdrawal.amount },
+        },
+        {
+          $inc: { [existingWithdrawal.source]: -existingWithdrawal.amount },
+        },
+        { new: true }
+      ).select('daimon commissionBalance revenueBalance');
+
+      if (!updatedWalletUser) {
+        return res.status(400).json({ success: false, message: 'Insufficient withdrawable balance for approval.' });
+      }
+
+      existingWithdrawal.balanceDeducted = true;
+      existingWithdrawal.deductedAt = new Date();
+    }
+
     await existingWithdrawal.save();
 
     if (status === 'rejected') {
-      await User.findByIdAndUpdate(existingWithdrawal.userId, {
-        $inc: { [existingWithdrawal.source]: existingWithdrawal.amount }
-      });
+      if (existingWithdrawal.balanceDeducted === true) {
+        updatedWalletUser = await User.findByIdAndUpdate(existingWithdrawal.userId, {
+          $inc: { [existingWithdrawal.source]: existingWithdrawal.amount }
+        }, { new: true }).select('daimon commissionBalance revenueBalance');
+        existingWithdrawal.balanceDeducted = false;
+        await existingWithdrawal.save();
+      } else {
+        updatedWalletUser = await User.findById(existingWithdrawal.userId).select('daimon commissionBalance revenueBalance');
+      }
     }
 
     const withdrawal = await Withdrawal.findById(existingWithdrawal._id).populate('userId', 'name email glixId');
-    return res.json({ success: true, withdrawal });
+    if (!updatedWalletUser) {
+      updatedWalletUser = await User.findById(existingWithdrawal.userId).select('daimon commissionBalance revenueBalance');
+    }
+
+    return res.json({
+      success: true,
+      withdrawal,
+      wallet: {
+        daimon: updatedWalletUser?.daimon || 0,
+        commissionBalance: updatedWalletUser?.commissionBalance || 0,
+        revenueBalance: updatedWalletUser?.revenueBalance || 0,
+      },
+    });
+  } catch (error) {
+    return res.status(500).json({ success: false, message: error.message });
+  }
+});
+
+app.post('/admin/withdrawals/:withdrawalId/deduct-balance', requireOfficial, async (req, res) => {
+  try {
+    const withdrawal = await Withdrawal.findById(req.params.withdrawalId);
+    if (!withdrawal) return res.status(404).json({ success: false, message: 'Withdrawal not found' });
+    if (withdrawal.status !== 'approved') {
+      return res.status(400).json({ success: false, message: 'Only approved withdrawals can be repaired.' });
+    }
+    if (withdrawal.balanceDeducted === true) {
+      const walletUser = await User.findById(withdrawal.userId).select('daimon commissionBalance revenueBalance');
+      return res.json({
+        success: true,
+        message: 'Withdrawal balance was already deducted.',
+        withdrawal,
+        wallet: {
+          daimon: walletUser?.daimon || 0,
+          commissionBalance: walletUser?.commissionBalance || 0,
+          revenueBalance: walletUser?.revenueBalance || 0,
+        },
+      });
+    }
+
+    const updatedWalletUser = await User.findOneAndUpdate(
+      {
+        _id: withdrawal.userId,
+        [withdrawal.source]: { $gte: withdrawal.amount },
+      },
+      {
+        $inc: { [withdrawal.source]: -withdrawal.amount },
+      },
+      { new: true }
+    ).select('daimon commissionBalance revenueBalance');
+
+    if (!updatedWalletUser) {
+      return res.status(400).json({ success: false, message: 'Insufficient withdrawable balance to repair this approved withdrawal.' });
+    }
+
+    withdrawal.balanceDeducted = true;
+    withdrawal.deductedAt = new Date();
+    withdrawal.reviewNote = [withdrawal.reviewNote, 'Balance deducted by official repair.'].filter(Boolean).join(' ');
+    await withdrawal.save();
+
+    return res.json({
+      success: true,
+      message: 'Withdrawal balance deducted.',
+      withdrawal,
+      wallet: {
+        daimon: updatedWalletUser.daimon || 0,
+        commissionBalance: updatedWalletUser.commissionBalance || 0,
+        revenueBalance: updatedWalletUser.revenueBalance || 0,
+      },
+    });
   } catch (error) {
     return res.status(500).json({ success: false, message: error.message });
   }
@@ -5103,16 +5527,22 @@ app.post('/admin/agencies', requireOfficial, async (req, res) => {
   try {
     const agency = await findUserByIdentifier(req.body?.identifier);
     if (!agency) return res.status(404).json({ success: false, message: 'Agency user not found' });
-    const agencyCode = String(req.body?.agencyCode || agency.agencyCode || `AG${String(agency.glixId || agency._id).slice(-5)}`).trim().toUpperCase();
+    const agencyCode = normalizeAgencyCode(req.body?.agencyCode || agency.agencyCode || `AG${String(agency.glixId || agency._id).slice(-5)}`);
+    const agencyCodeError = validateAgencyCode(agencyCode);
+    if (agencyCodeError) return res.status(400).json({ success: false, message: agencyCodeError });
+    const existingAgencyCodeOwner = await findAgencyCodeOwner(agencyCode, agency._id);
+    if (existingAgencyCodeOwner) return sendDuplicateAgencyCodeResponse(res);
     agency.role = 'agency';
     agency.agencyStatus = 'approved';
     agency.agencyCode = agencyCode;
+    agency.agencyRegistration.requestedAgencyCode = agencyCode;
     agency.agencyRegistration.status = 'approved';
     agency.agencyRegistration.reviewedBy = req.officialUser._id;
     agency.agencyRegistration.reviewedAt = new Date();
     await agency.save();
     return res.json({ success: true, agency: serializeOfficialUser(agency) });
   } catch (error) {
+    if (isDuplicateAgencyCodeError(error)) return sendDuplicateAgencyCodeResponse(res);
     return res.status(500).json({ success: false, message: error.message });
   }
 });
@@ -5120,14 +5550,18 @@ app.post('/admin/agencies', requireOfficial, async (req, res) => {
 
 app.patch('/admin/agencies/:agencyId', requireOfficial, async (req, res) => {
   try {
-    const agencyCode = String(req.body?.agencyCode || '').trim().toUpperCase();
+    const agencyCode = normalizeAgencyCode(req.body?.agencyCode);
     if (!mongoose.Types.ObjectId.isValid(req.params.agencyId)) return res.status(400).json({ success: false, message: 'Invalid agency id' });
-    if (!agencyCode) return res.status(400).json({ success: false, message: 'Agency code is required' });
+    const agencyCodeError = validateAgencyCode(agencyCode);
+    if (agencyCodeError) return res.status(400).json({ success: false, message: agencyCodeError });
+    const existingAgencyCodeOwner = await findAgencyCodeOwner(agencyCode, req.params.agencyId);
+    if (existingAgencyCodeOwner) return sendDuplicateAgencyCodeResponse(res);
 
     const agency = await User.findByIdAndUpdate(req.params.agencyId, { $set: { agencyCode, 'agencyRegistration.requestedAgencyCode': agencyCode } }, { new: true, runValidators: true });
     if (!agency) return res.status(404).json({ success: false, message: 'Agency not found' });
     return res.json({ success: true, agency: serializeOfficialUser(agency) });
   } catch (error) {
+    if (isDuplicateAgencyCodeError(error)) return sendDuplicateAgencyCodeResponse(res);
     return res.status(500).json({ success: false, message: error.message });
   }
 });
