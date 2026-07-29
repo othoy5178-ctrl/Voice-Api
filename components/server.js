@@ -30,6 +30,8 @@ import GameCoinTransaction from "./GameCoinTransaction.js";
 import ProfileVisit from "./ProfileVisit.js";
 import RoomMusicTrack from "./RoomMusicTrack.js";
 import DiamondExchange from "./DiamondExchange.js";
+import CoinBag from "./CoinBag.js";
+import CoinBagClaim from "./CoinBagClaim.js";
 import cloudinary from "./utils/cloudinary.js";
 
 const { RtcTokenBuilder, RtcRole } = pkg;
@@ -63,8 +65,13 @@ const activeUsers = {};
 
 const roomPresence = {};
 const roomControllers = {};
+const roomKeepOpenRooms = {};
 const roomDisconnectTimers = new Map();
 const ROOM_RECONNECT_GRACE_MS = Number(process.env.ROOM_RECONNECT_GRACE_MS || 60000);
+const COIN_BAG_ALLOWED_AMOUNTS = [10000, 30000, 50000, 100000];
+const COIN_BAG_ALLOWED_CLAIM_LIMITS = [10, 20, 50];
+const COIN_BAG_PLATFORM_FEE_RATE = 0.03;
+const COIN_BAG_ACTIVE_MS = 10000;
 
 const getStringRoomId = (roomId) => (roomId ? roomId.toString() : '');
 const getRoomDisconnectTimerKey = (roomId, userId) => `${getStringRoomId(roomId)}:${userId?.toString?.() || String(userId || '')}`;
@@ -828,6 +835,97 @@ const getRoomGiftTotals = async (roomId) => {
   return totals || { totalCoins: 0, totalGifts: 0, totalTransactions: 0 };
 };
 
+const resolveGiftRoomHostId = async (roomId) => {
+  const stringRoomId = roomId ? roomId.toString() : '';
+  if (!stringRoomId) return null;
+
+  if (stringRoomId.startsWith('glix_')) {
+    const videoRoom = await Room.findOne(getVideoRoomFilter(stringRoomId)).select('hostId').lean();
+    return videoRoom?.hostId?.toString?.() || String(videoRoom?.hostId || '') || null;
+  }
+
+  if (!mongoose.Types.ObjectId.isValid(stringRoomId)) return null;
+
+  const audioRoom = await AudioRoom.findById(stringRoomId).select('hostId').lean();
+  return audioRoom?.hostId?.toString?.() || String(audioRoom?.hostId || '') || null;
+};
+
+const resolveCoinBagRoom = async (roomId) => {
+  const stringRoomId = roomId ? roomId.toString() : '';
+  if (!stringRoomId) return null;
+
+  if (stringRoomId.startsWith('glix_')) {
+    const videoRoom = await Room.findOne(getVideoRoomFilter(stringRoomId)).select('_id channelName hostId title isLive').lean();
+    if (!videoRoom || videoRoom.isLive === false) return null;
+    return {
+      roomId: videoRoom.channelName,
+      roomType: 'video',
+      hostId: videoRoom.hostId?.toString?.() || String(videoRoom.hostId || ''),
+      title: videoRoom.title || 'Video Room',
+    };
+  }
+
+  if (!mongoose.Types.ObjectId.isValid(stringRoomId)) return null;
+
+  const audioRoom = await AudioRoom.findById(stringRoomId).select('_id hostId title isLive').lean();
+  if (!audioRoom || audioRoom.isLive === false) return null;
+
+  return {
+    roomId: audioRoom._id.toString(),
+    roomType: 'voice',
+    hostId: audioRoom.hostId?.toString?.() || String(audioRoom.hostId || ''),
+    title: audioRoom.title || 'Voice Room',
+  };
+};
+
+const serializeCoinBag = (bag, extra = {}) => ({
+  id: bag._id?.toString?.() || String(bag._id || ''),
+  coinBagId: bag._id?.toString?.() || String(bag._id || ''),
+  creatorId: bag.creatorId?.toString?.() || String(bag.creatorId || ''),
+  roomId: bag.roomId,
+  roomType: bag.roomType,
+  roomTitle: bag.roomTitle || '',
+  totalCoins: bag.totalCoins || 0,
+  platformFeeCoins: bag.platformFeeCoins || 0,
+  claimableCoins: bag.claimableCoins || 0,
+  claimLimit: bag.claimLimit || 0,
+  claimAmount: bag.claimAmount || 0,
+  remainingClaims: bag.remainingClaims || 0,
+  undistributedCoins: bag.undistributedCoins || 0,
+  remainingCoins: bag.remainingCoins || 0,
+  status: bag.status || 'active',
+  expiresAt: bag.expiresAt,
+  createdAt: bag.createdAt,
+  ...extra,
+});
+
+const getHostRoomIdMatchValues = async (hostObjectId) => {
+  const hostId = hostObjectId.toString();
+  const [audioRooms, videoRooms] = await Promise.all([
+    AudioRoom.find({ hostId: hostObjectId }).select('_id').lean(),
+    Room.find({ hostId }).select('_id channelName').lean()
+  ]);
+
+  const seen = new Set();
+  const values = [];
+  const addValue = (value) => {
+    if (!value) return;
+    const key = value.toString();
+    if (seen.has(key)) return;
+    seen.add(key);
+    values.push(value);
+    if (typeof value !== 'string') values.push(key);
+  };
+
+  audioRooms.forEach(room => addValue(room._id));
+  videoRooms.forEach(room => {
+    addValue(room.channelName);
+    addValue(room._id);
+  });
+
+  return values;
+};
+
 const emitRoomStats = async (roomId) => {
   const stringRoomId = roomId ? roomId.toString() : '';
   if (!stringRoomId) return;
@@ -852,19 +950,21 @@ io.on('connection', (socket) => {
   socket.on('join_audio_room', async ({ roomId, userId, name, profilePic, entryVideoUrl }) => {
     try {
       await clearExpiredStoreItems(userId);
-      const userData = await User.findById(userId).select('frameUrl entryVideoUrl');
+      const userData = await User.findById(userId).select('name profilePic frameUrl entryVideoUrl');
+      const finalJoinName = userData?.name || name || 'User';
+      const finalJoinProfilePic = userData?.profilePic || profilePic || '';
       const frameUrl = userData?.frameUrl || null;
 
       const stringRoomId = roomId ? roomId.toString() : '';
       socket.join(stringRoomId);
       socket.roomId = stringRoomId;
       socket.userId = userId;
-      socket.userName = name;
+      socket.userName = finalJoinName;
 
       if (clearRoomDisconnectTimer(stringRoomId, userId)) {
         io.to(stringRoomId).emit('host_reconnected', {
           userId,
-          message: `${name || 'Host'} reconnected.`
+          message: `${finalJoinName || 'Host'} reconnected.`
         });
       }
 
@@ -872,8 +972,8 @@ io.on('connection', (socket) => {
         roomId: stringRoomId,
         userId,
         socketId: socket.id,
-        name,
-        profilePic,
+        name: finalJoinName,
+        profilePic: finalJoinProfilePic,
         role: stringRoomId.startsWith('glix_') ? 'video' : 'audience'
       });
 
@@ -882,17 +982,19 @@ io.on('connection', (socket) => {
         activeUsers[userId.toString()] = socket.id;
       }
 
-      console.log(`${name} joined real-time room channel: ${stringRoomId}`);
+      console.log(`${finalJoinName} joined real-time room channel: ${stringRoomId}`);
 
       const finalEntryVideoUrl = userData?.entryVideoUrl || entryVideoUrl || null;
 
       socket.to(stringRoomId).emit('user_joined_channel', {
         userId,
-        name,
-        profilePic,
+        name: finalJoinName,
+        profilePic: finalJoinProfilePic,
+        avatar: finalJoinProfilePic,
+        avatarUrl: finalJoinProfilePic,
         entryVideoUrl: finalEntryVideoUrl,
         frameUrl: frameUrl || null,
-        message: `${name} entered the room.`
+        message: `${finalJoinName} entered the room.`
       });
 
       if (finalEntryVideoUrl) {
@@ -1106,6 +1208,69 @@ io.on('connection', (socket) => {
       socket.emit('error_notice', { message: 'Failed to synchronize layout seat state.' });
     }
   });
+
+  const handleKeepRoomOpen = async (payload = {}) => {
+    try {
+      const stringRoomId = getStringRoomId(payload.roomId);
+      if (!stringRoomId) return;
+
+      const controller = payload.controller || null;
+      const controllerUserId = payload.transferToUserId || payload.toUserId || controller?.userId || controller?.id || controller?._id || null;
+      const controllerUid = payload.transferToUid ?? payload.toUid ?? controller?.uid ?? controller?.numericUid ?? null;
+      const requesterId = payload.userId || payload.fromUserId || socket.userId || null;
+      const isVideoRoom = stringRoomId.startsWith('glix_');
+
+      roomKeepOpenRooms[stringRoomId] = {
+        userId: requesterId ? requesterId.toString() : null,
+        controllerUserId: controllerUserId ? controllerUserId.toString() : null,
+        controllerUid,
+        roomMode: isVideoRoom ? 'video' : 'audio',
+        updatedAt: Date.now(),
+      };
+
+      if (controllerUserId || controllerUid !== null) {
+        roomControllers[stringRoomId] = {
+          ...(controller || {}),
+          userId: controllerUserId,
+          uid: controllerUid,
+        };
+      }
+
+      if (requesterId) clearRoomDisconnectTimer(stringRoomId, requesterId);
+
+      const transferPayload = {
+        roomId: stringRoomId,
+        hostId: payload.hostId || null,
+        fromUserId: requesterId,
+        transferToUserId: controllerUserId,
+        transferToUid: controllerUid,
+        controller: roomControllers[stringRoomId] || controller || null,
+        message: controllerUserId || controllerUid !== null
+          ? 'Room is staying open. Control moved to another room user.'
+          : 'Room is staying open while the host is away.',
+      };
+
+      io.to(stringRoomId).emit('host_left_room', transferPayload);
+      io.to(stringRoomId).emit('room_control_transferred', transferPayload);
+      io.to(stringRoomId).emit('room_controller_changed', transferPayload);
+
+      if (isVideoRoom && (controllerUserId || controllerUid !== null)) {
+        io.to(stringRoomId).emit('video_room_admin_assigned', {
+          controller: transferPayload.controller,
+          assignedMessage: 'You can manage this video room while the host is away.',
+        });
+      }
+
+      await emitRoomStats(stringRoomId);
+    } catch (error) {
+      console.log('Keep room open event error:', error);
+      socket.emit('error_notice', { message: 'Unable to keep this room open.' });
+    }
+  };
+
+  socket.on('host_leave_keep_room_open', handleKeepRoomOpen);
+  socket.on('controller_leave_keep_room_open', handleKeepRoomOpen);
+  socket.on('room_control_transfer', handleKeepRoomOpen);
 
   const isRequesterRoomHost = async (roomId, requesterId) => {
     const stringRoomId = roomId ? roomId.toString() : '';
@@ -1513,7 +1678,25 @@ io.on('connection', (socket) => {
       return;
     }
 
-    const fallbackReceiverId = hostId ? hostId.toString() : '';
+    const stringRoomId = roomId ? roomId.toString() : '';
+    const roomMode = stringRoomId.startsWith('glix_') ? 'video' : mongoose.Types.ObjectId.isValid(stringRoomId) ? 'audio' : 'unknown';
+    const resolvedRoomHostId = await resolveGiftRoomHostId(stringRoomId);
+    const finalRoomHostId = resolvedRoomHostId || (mongoose.Types.ObjectId.isValid(hostId) ? hostId.toString() : '');
+
+    if (!mongoose.Types.ObjectId.isValid(finalRoomHostId)) {
+      socket.emit('gift_error', { message: 'Unable to identify this room host.' });
+      return;
+    }
+
+    if (hostId && resolvedRoomHostId && String(hostId) !== String(resolvedRoomHostId)) {
+      console.log('Gift hostId mismatch corrected from room record:', {
+        roomId: stringRoomId,
+        clientHostId: hostId,
+        resolvedRoomHostId
+      });
+    }
+
+    const fallbackReceiverId = finalRoomHostId;
     const normalizedReceiverIds = [...new Set(
       (Array.isArray(receiverIds) && receiverIds.length ? receiverIds : [fallbackReceiverId])
         .map(id => id?.toString?.() || String(id || ''))
@@ -1536,8 +1719,6 @@ io.on('connection', (socket) => {
 
     const perReceiverCost = coinPrice * giftQuantity;
     const totalCost = perReceiverCost * normalizedReceiverIds.length;
-    const stringRoomId = roomId ? roomId.toString() : '';
-    const roomMode = stringRoomId.startsWith('glix_') ? 'video' : mongoose.Types.ObjectId.isValid(stringRoomId) ? 'audio' : 'unknown';
 
     const session = await mongoose.startSession();
     session.startTransaction();
@@ -1603,7 +1784,7 @@ io.on('connection', (socket) => {
             senderBalanceAfter: sender.chang || 0,
             receiverBalanceAfter: Number(receiverById[receiverId]?.daimon || 0) + perReceiverCost,
             clientSenderName: senderName || '',
-            roomHostId: mongoose.Types.ObjectId.isValid(hostId) ? new mongoose.Types.ObjectId(hostId) : null
+            roomHostId: new mongoose.Types.ObjectId(finalRoomHostId)
           }
         })),
         { session }
@@ -1633,6 +1814,7 @@ io.on('connection', (socket) => {
       totalCost,
       perReceiverCost,
       receiverIds: normalizedReceiverIds,
+      roomHostId: finalRoomHostId,
       userId
     });
     await emitRoomStats(stringRoomId);
@@ -2046,14 +2228,20 @@ io.on('connection', (socket) => {
       if (roomId.startsWith('glix_')) {
         const videoRoomDoc = await Room.findOne({ channelName: roomId });
 
-        if (
-          videoRoomDoc &&
-          videoRoomDoc.hostId &&
-          videoRoomDoc.hostId.toString() === currentUserId
-        ) {
-          io.to(roomId).emit('host_reconnecting', {
-            userId: currentUserId,
-            message: 'Host connection lost. Waiting for reconnect...'
+      if (
+        videoRoomDoc &&
+        videoRoomDoc.hostId &&
+        videoRoomDoc.hostId.toString() === currentUserId
+      ) {
+        if (roomKeepOpenRooms[roomId]) {
+          removeRoomPresence({ roomId, userId: currentUserId, socketId: socket.id });
+          await emitRoomStats(roomId);
+          return;
+        }
+
+        io.to(roomId).emit('host_reconnecting', {
+          userId: currentUserId,
+          message: 'Host connection lost. Waiting for reconnect...'
           });
 
           const timerKey = getRoomDisconnectTimerKey(roomId, currentUserId);
@@ -2079,6 +2267,8 @@ io.on('connection', (socket) => {
                 endedAt: new Date()
               });
               await Room.deleteOne({ channelName: roomId });
+              delete roomKeepOpenRooms[roomId];
+              delete roomControllers[roomId];
               console.log(`Video room closed after reconnect grace expired: ${roomId}`);
             } catch (error) {
               console.log('Video room delayed disconnect cleanup error:', error);
@@ -2101,6 +2291,11 @@ io.on('connection', (socket) => {
         room.hostId &&
         room.hostId.toString() === currentUserId
       ) {
+        if (roomKeepOpenRooms[roomId]) {
+          removeRoomPresence({ roomId, userId: currentUserId, socketId: socket.id });
+          return;
+        }
+
         io.to(roomId).emit('host_reconnecting', {
           userId: currentUserId,
           message: 'Host connection lost. Waiting for reconnect...'
@@ -2123,6 +2318,8 @@ io.on('connection', (socket) => {
             latestRoom.endedAt = new Date();
 
             await latestRoom.save();
+            delete roomKeepOpenRooms[roomId];
+            delete roomControllers[roomId];
 
             io.to(roomId).emit('audio_room_ended', {
               message: 'Host disconnected. Room closed.'
@@ -2459,19 +2656,304 @@ app.get('/gift-history/global', async (req, res) => {
     });
   }
 });
+
+app.post('/coin-bags/drop', async (req, res) => {
+  const session = await mongoose.startSession();
+  session.startTransaction();
+
+  try {
+    const userId = req.body?.userId?.toString?.() || String(req.body?.userId || '');
+    const roomId = req.body?.roomId?.toString?.() || String(req.body?.roomId || '');
+    const amount = Number(req.body?.amount);
+    const claimLimit = Number(req.body?.claimLimit || 10);
+
+    if (!mongoose.Types.ObjectId.isValid(userId)) {
+      await session.abortTransaction();
+      return res.status(400).json({ success: false, message: 'Invalid user id.' });
+    }
+
+    if (!COIN_BAG_ALLOWED_AMOUNTS.includes(amount)) {
+      await session.abortTransaction();
+      return res.status(400).json({ success: false, message: 'Invalid coin bag amount.' });
+    }
+
+    if (!COIN_BAG_ALLOWED_CLAIM_LIMITS.includes(claimLimit)) {
+      await session.abortTransaction();
+      return res.status(400).json({ success: false, message: 'Invalid coin bag claim limit.' });
+    }
+
+    const room = await resolveCoinBagRoom(roomId);
+    if (!room) {
+      await session.abortTransaction();
+      return res.status(404).json({ success: false, message: 'Live room not found.' });
+    }
+
+    const creator = await User.findOneAndUpdate(
+      { _id: userId, chang: { $gte: amount } },
+      { $inc: { chang: -amount } },
+      { new: true, session }
+    ).select('name profilePic glixId chang');
+
+    if (!creator) {
+      await session.abortTransaction();
+      return res.status(400).json({ success: false, message: 'Insufficient coins for this coin bag.' });
+    }
+
+    const platformFeeCoins = Math.floor(amount * COIN_BAG_PLATFORM_FEE_RATE);
+    const claimableCoins = Math.max(0, amount - platformFeeCoins);
+    const claimAmount = Math.floor(claimableCoins / claimLimit);
+    const distributableCoins = claimAmount * claimLimit;
+    const undistributedCoins = Math.max(0, claimableCoins - distributableCoins);
+    const now = new Date();
+    const expiresAt = new Date(now.getTime() + COIN_BAG_ACTIVE_MS);
+
+    const [coinBag] = await CoinBag.create([{
+      creatorId: new mongoose.Types.ObjectId(userId),
+      roomId: room.roomId,
+      roomType: room.roomType,
+      roomTitle: room.title,
+      totalCoins: amount,
+      platformFeeCoins,
+      claimableCoins,
+      claimLimit,
+      claimAmount,
+      remainingClaims: claimLimit,
+      undistributedCoins,
+      remainingCoins: distributableCoins,
+      status: 'active',
+      expiresAt,
+      createdAt: now,
+    }], { session });
+
+    await session.commitTransaction();
+
+    const payload = serializeCoinBag(coinBag, {
+      creatorName: creator.name || 'User',
+      creatorAvatar: creator.profilePic || '',
+      creatorGlixId: creator.glixId || '',
+      durationMs: COIN_BAG_ACTIVE_MS,
+    });
+
+    io.emit('coin_bag_global_notice', payload);
+    io.to(room.roomId).emit('coin_bag_dropped', payload);
+
+    return res.status(201).json({
+      success: true,
+      data: payload,
+      wallet: {
+        chang: creator.chang || 0,
+      },
+    });
+  } catch (error) {
+    await session.abortTransaction();
+    return res.status(500).json({ success: false, message: error.message });
+  } finally {
+    session.endSession();
+  }
+});
+
+app.get('/coin-bags/active/:roomId', async (req, res) => {
+  try {
+    const roomId = req.params.roomId?.toString?.() || String(req.params.roomId || '');
+    const now = new Date();
+
+    await CoinBag.updateMany(
+      { roomId, status: 'active', expiresAt: { $lte: now } },
+      { $set: { status: 'expired' } }
+    );
+
+    const bags = await CoinBag.find({
+      roomId,
+      status: 'active',
+      expiresAt: { $gt: now },
+      remainingCoins: { $gt: 0 },
+    }).sort({ createdAt: -1 }).limit(3).lean();
+
+    return res.json({
+      success: true,
+      data: bags.map(bag => serializeCoinBag(bag)),
+    });
+  } catch (error) {
+    return res.status(500).json({ success: false, message: error.message });
+  }
+});
+
+app.post('/coin-bags/:coinBagId/claim', async (req, res) => {
+  const session = await mongoose.startSession();
+  session.startTransaction();
+
+  try {
+    const { coinBagId } = req.params;
+    const userId = req.body?.userId?.toString?.() || String(req.body?.userId || '');
+
+    if (!mongoose.Types.ObjectId.isValid(coinBagId) || !mongoose.Types.ObjectId.isValid(userId)) {
+      await session.abortTransaction();
+      return res.status(400).json({ success: false, message: 'Invalid claim request.' });
+    }
+
+    const existingClaim = await CoinBagClaim.findOne({ coinBagId, userId }).session(session);
+    if (existingClaim) {
+      await session.abortTransaction();
+      return res.status(409).json({ success: false, message: 'You already claimed this coin bag.' });
+    }
+
+    const now = new Date();
+    const bag = await CoinBag.findOne({
+      _id: coinBagId,
+      status: 'active',
+      expiresAt: { $gt: now },
+      remainingCoins: { $gt: 0 },
+      remainingClaims: { $gt: 0 },
+    }).session(session);
+
+    if (!bag) {
+      await CoinBag.updateOne({ _id: coinBagId, status: 'active', expiresAt: { $lte: now } }, { $set: { status: 'expired' } });
+      await session.abortTransaction();
+      return res.status(410).json({ success: false, message: 'This coin bag has expired.' });
+    }
+
+    if (!roomPresence[bag.roomId]?.[userId]) {
+      await session.abortTransaction();
+      return res.status(403).json({ success: false, message: 'Join this room before claiming the coin bag.' });
+    }
+
+    const claimedCoins = Math.max(0, Number(bag.claimAmount || 0));
+    if (claimedCoins <= 0) {
+      await CoinBag.updateOne({ _id: coinBagId }, { $set: { status: 'empty', remainingCoins: 0 } }).session(session);
+      await session.abortTransaction();
+      return res.status(410).json({ success: false, message: 'This coin bag is empty.' });
+    }
+
+    const remainingAfterClaim = Math.max(0, Number(bag.remainingCoins || 0) - claimedCoins);
+    const remainingClaimsAfterClaim = Math.max(0, Number(bag.remainingClaims || 0) - 1);
+    const statusAfterClaim = remainingAfterClaim <= 0 || remainingClaimsAfterClaim <= 0 ? 'empty' : 'active';
+
+    const updatedBag = await CoinBag.findOneAndUpdate(
+      {
+        _id: coinBagId,
+        status: 'active',
+        expiresAt: { $gt: now },
+        remainingCoins: { $gte: claimedCoins },
+        remainingClaims: { $gt: 0 },
+      },
+      {
+        $inc: { remainingCoins: -claimedCoins, remainingClaims: -1 },
+        $set: { status: statusAfterClaim },
+      },
+      { new: true, session }
+    );
+
+    if (!updatedBag) {
+      await session.abortTransaction();
+      return res.status(409).json({ success: false, message: 'Coin bag changed. Please try again.' });
+    }
+
+    await CoinBagClaim.create([{
+      coinBagId: new mongoose.Types.ObjectId(coinBagId),
+      userId: new mongoose.Types.ObjectId(userId),
+      roomId: bag.roomId,
+      claimedCoins,
+      createdAt: now,
+    }], { session });
+
+    const user = await User.findByIdAndUpdate(
+      userId,
+      { $inc: { chang: claimedCoins } },
+      { new: true, session }
+    ).select('name profilePic glixId chang');
+
+    if (!user) {
+      await session.abortTransaction();
+      return res.status(404).json({ success: false, message: 'User not found.' });
+    }
+
+    await session.commitTransaction();
+
+    const payload = {
+      coinBagId,
+      roomId: bag.roomId,
+      claimedCoins,
+      remainingCoins: updatedBag.remainingCoins || 0,
+      remainingClaims: updatedBag.remainingClaims || 0,
+      status: updatedBag.status,
+      userId,
+      name: user.name || 'User',
+      profilePic: user.profilePic || '',
+    };
+
+    io.to(bag.roomId).emit('coin_bag_claimed', payload);
+    if (updatedBag.status !== 'active') {
+      io.to(bag.roomId).emit('coin_bag_ended', {
+        coinBagId,
+        roomId: bag.roomId,
+        status: updatedBag.status,
+      });
+    }
+
+    return res.json({
+      success: true,
+      data: payload,
+      wallet: {
+        chang: user.chang || 0,
+      },
+    });
+  } catch (error) {
+    await session.abortTransaction();
+    if (error?.code === 11000) {
+      return res.status(409).json({ success: false, message: 'You already claimed this coin bag.' });
+    }
+    return res.status(500).json({ success: false, message: error.message });
+  } finally {
+    session.endSession();
+  }
+});
 app.get('/gift-history/host/:hostId', async (req, res) => {
   try {
     const { hostId } = req.params;
+    const period = req.query.period || 'all';
+    const scope = req.query.scope || 'received';
+
+    if (!mongoose.Types.ObjectId.isValid(hostId)) {
+      return res.status(400).json({ success: false, message: 'Invalid host id' });
+    }
+
+    const hostObjectId = new mongoose.Types.ObjectId(hostId);
+    let match;
+
+    if (scope === 'rooms') {
+      const hostRoomIds = await getHostRoomIdMatchValues(hostObjectId);
+      match = {
+        status: 'completed',
+        $or: [
+          { 'audit.roomHostId': hostObjectId }
+        ]
+      };
+
+      if (hostRoomIds.length) {
+        match.$or.push({
+          roomId: { $in: hostRoomIds },
+          $or: [
+            { 'audit.roomHostId': { $exists: false } },
+            { 'audit.roomHostId': null }
+          ]
+        });
+      }
+    } else {
+      match = {
+        status: 'completed',
+        receiverId: hostObjectId
+      };
+    }
+
+    if (period === '24h') {
+      match.createdAt = { $gte: new Date(Date.now() - 24 * 60 * 60 * 1000) };
+    }
 
     const result = await GiftTransaction.aggregate([
-      {
-        $match: {
-          receiverId: new mongoose.Types.ObjectId(hostId)
-        }
-      },
+      { $match: match },
       {
         $group: {
-          _id: "$receiverId",
+          _id: null,
           totalCoins: { $sum: "$totalCost" },
           totalGifts: { $sum: "$quantity" },
           totalTransactions: { $sum: 1 }
@@ -2481,11 +2963,13 @@ app.get('/gift-history/host/:hostId', async (req, res) => {
 
     res.status(200).json({
       success: true,
-      data: result[0] || {
-        totalCoins: 0,
-        totalGifts: 0,
-        totalTransactions: 0
-      }
+      data: {
+        period,
+        scope,
+        totalCoins: result[0]?.totalCoins || 0,
+        totalGifts: result[0]?.totalGifts || 0,
+        totalTransactions: result[0]?.totalTransactions || 0
+      },
     });
 
   } catch (error) {
@@ -2753,6 +3237,8 @@ app.post('/rooms/end', async (req, res) => {
           endedAt: new Date()
         });
         await Room.deleteOne({ _id: videoRoom._id });
+        delete roomKeepOpenRooms[videoRoom.channelName];
+        delete roomControllers[videoRoom.channelName];
         await new Promise(resolve => setTimeout(resolve, 500));
         return res.status(200).json({ success: true, message: "Room closed cleanly." });
       }
@@ -2771,6 +3257,8 @@ app.post('/rooms/end', async (req, res) => {
     room.audience = [];
     room.endedAt = new Date();
     await room.save();
+    delete roomKeepOpenRooms[stringRoomId];
+    delete roomControllers[stringRoomId];
 
     io.to(stringRoomId).emit('audio_room_ended', {
       message: "The live audio room has been closed by the host."

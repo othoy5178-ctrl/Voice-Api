@@ -102,5 +102,6 @@ const GiftTransactionSchema = new mongoose.Schema({
 GiftTransactionSchema.index({ senderId: 1, createdAt: -1 });
 GiftTransactionSchema.index({ receiverId: 1, createdAt: -1 });
 GiftTransactionSchema.index({ roomId: 1, createdAt: -1 });
+GiftTransactionSchema.index({ 'audit.roomHostId': 1, createdAt: -1 });
 
 export default mongoose.model("GiftTransaction", GiftTransactionSchema);
