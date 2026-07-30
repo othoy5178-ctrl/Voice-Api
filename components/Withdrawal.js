@@ -37,6 +37,10 @@ const withdrawalSchema = new mongoose.Schema({
     required: true,
     trim: true
   },
+  details: {
+    type: mongoose.Schema.Types.Mixed,
+    default: {}
+  },
   payoutCurrency: {
     type: String,
     trim: true,

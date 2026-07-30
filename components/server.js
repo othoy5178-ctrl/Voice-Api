@@ -72,6 +72,37 @@ const COIN_BAG_ALLOWED_AMOUNTS = [10000, 30000, 50000, 100000];
 const COIN_BAG_ALLOWED_CLAIM_LIMITS = [10, 20, 50];
 const COIN_BAG_PLATFORM_FEE_RATE = 0.03;
 const COIN_BAG_ACTIVE_MS = 10000;
+const LEVEL_LAKH_REQUIREMENTS = [
+  1, 1, 1, 2, 2, 2, 3, 3, 4, 5,
+  6, 7, 8, 9, 10, 12, 14, 16, 18, 20,
+  22, 24, 26, 28, 30, 33, 36, 39, 42, 45,
+  50, 55, 60, 65, 70, 75, 80, 85, 90, 95,
+  100, 110, 120, 130, 140, 150, 160, 170, 180, 190,
+  200, 210, 220, 230, 240, 250, 260, 270, 280, 290,
+  300, 310, 320, 330, 340, 350, 360, 370, 380, 390,
+  400, 410, 420, 430, 440, 450, 460, 470, 480, 490,
+  500, 510, 520, 530, 540, 550, 560, 570, 580, 590,
+  600, 610, 620, 630, 640, 650, 660, 670, 680, 700,
+];
+const LEVEL_THRESHOLDS = LEVEL_LAKH_REQUIREMENTS.reduce((thresholds, value) => {
+  const previousTotal = thresholds[thresholds.length - 1] || 0;
+  thresholds.push(previousTotal + (value * 100000));
+  return thresholds;
+}, []);
+const calculateUserLevelValue = (value = 0) => {
+  const total = Math.max(0, Number(value) || 0);
+  let level = 1;
+
+  for (let index = 0; index < LEVEL_THRESHOLDS.length; index += 1) {
+    if (total >= LEVEL_THRESHOLDS[index]) {
+      level = index + 1;
+    } else {
+      break;
+    }
+  }
+
+  return level;
+};
 
 const getStringRoomId = (roomId) => (roomId ? roomId.toString() : '');
 const getRoomDisconnectTimerKey = (roomId, userId) => `${getStringRoomId(roomId)}:${userId?.toString?.() || String(userId || '')}`;
@@ -166,6 +197,46 @@ const removeRoomPresence = ({ roomId, userId, socketId }) => {
   }
 
   emitRoomMembers(stringRoomId);
+};
+
+const closeKeptOpenAudioRoomIfNoAudience = async (roomId, reason = 'empty_audience') => {
+  const stringRoomId = getStringRoomId(roomId);
+  if (!stringRoomId || stringRoomId.startsWith('glix_') || !roomKeepOpenRooms[stringRoomId]) return false;
+  if (!mongoose.Types.ObjectId.isValid(stringRoomId)) return false;
+
+  const room = await AudioRoom.findById(stringRoomId).select('hostId isLive speakers audience createdAt');
+  if (!room || !room.isLive) return false;
+
+  const hostId = room.hostId ? room.hostId.toString() : '';
+  const livePresenceUsers = Object.values(roomPresence[stringRoomId] || {})
+    .filter(member => member?.id && String(member.id) !== hostId);
+  const dbAudience = Array.isArray(room.audience)
+    ? room.audience.filter(userId => userId && String(userId) !== hostId)
+    : [];
+  const dbSpeakers = Array.isArray(room.speakers)
+    ? room.speakers.filter(speaker => speaker?.userId && String(speaker.userId) !== hostId)
+    : [];
+
+  if (livePresenceUsers.length || dbAudience.length || dbSpeakers.length) return false;
+
+  room.isLive = false;
+  room.speakers = [];
+  room.audience = [];
+  room.endedAt = new Date();
+  await room.save();
+
+  delete roomKeepOpenRooms[stringRoomId];
+  delete roomControllers[stringRoomId];
+  delete roomPresence[stringRoomId];
+
+  io.to(stringRoomId).emit('room_members_updated', []);
+  io.to(stringRoomId).emit('audio_room_ended', {
+    reason,
+    message: 'The voice room closed because no audience is left.'
+  });
+
+  console.log(`Kept-open audio room closed because no audience is left: ${stringRoomId}`);
+  return true;
 };
 
 const LIVE_ROOM_STALE_MS = 5 * 60 * 1000;
@@ -950,10 +1021,12 @@ io.on('connection', (socket) => {
   socket.on('join_audio_room', async ({ roomId, userId, name, profilePic, entryVideoUrl }) => {
     try {
       await clearExpiredStoreItems(userId);
-      const userData = await User.findById(userId).select('name profilePic frameUrl entryVideoUrl');
+      const userData = await User.findById(userId).select('name profilePic frameUrl entryVideoUrl daimon');
       const finalJoinName = userData?.name || name || 'User';
       const finalJoinProfilePic = userData?.profilePic || profilePic || '';
       const frameUrl = userData?.frameUrl || null;
+      const joinerDaimon = Number(userData?.daimon || 0);
+      const joinerLevel = calculateUserLevelValue(joinerDaimon);
 
       const stringRoomId = roomId ? roomId.toString() : '';
       socket.join(stringRoomId);
@@ -994,6 +1067,12 @@ io.on('connection', (socket) => {
         avatarUrl: finalJoinProfilePic,
         entryVideoUrl: finalEntryVideoUrl,
         frameUrl: frameUrl || null,
+        daimon: joinerDaimon,
+        level: joinerLevel,
+        user: {
+          daimon: joinerDaimon,
+          level: joinerLevel
+        },
         message: `${finalJoinName} entered the room.`
       });
 
@@ -1632,14 +1711,21 @@ io.on('connection', (socket) => {
   });
 
   // 3. EVENT: Chat Messages
-  socket.on('send_message', ({ roomId, senderName, text, userId }) => {
+  socket.on('send_message', ({ roomId, senderName, text, userId, mentions = [] }) => {
     const stringRoomId = roomId ? roomId.toString() : '';
+    const normalizedMentions = [...new Set(
+      (Array.isArray(mentions) ? mentions : [])
+        .map(id => id?.toString?.() || String(id || ''))
+        .filter(Boolean)
+    )];
+
     io.to(stringRoomId).emit('receive_message', {
       id: Date.now().toString() + Math.random().toString(),
       type: 'user',
       sender: senderName,
       text: text,
-      userId: userId
+      userId: userId,
+      mentions: normalizedMentions
     });
   });
 
@@ -2293,6 +2379,7 @@ io.on('connection', (socket) => {
       ) {
         if (roomKeepOpenRooms[roomId]) {
           removeRoomPresence({ roomId, userId: currentUserId, socketId: socket.id });
+          await closeKeptOpenAudioRoomIfNoAudience(roomId, 'host_left_no_audience');
           return;
         }
 
@@ -2351,6 +2438,8 @@ io.on('connection', (socket) => {
           audience: currentUserId
         }
       });
+
+      await closeKeptOpenAudioRoomIfNoAudience(roomId, 'last_audience_left');
 
       if (oldSlotIndex !== undefined) {
         io.to(roomId).emit("slot_state_changed", {
@@ -5646,7 +5735,7 @@ const HOST_WITHDRAWAL_POLICY = [
 const WITHDRAWAL_METHODS = [
   { id: 'paypal', method: 'PayPal', country: 'All Countries', countryCode: 'global', title: 'PayPal', subtitle: 'Transfer to PayPal account', icon: 'card', feePercent: 5, feeFixedDiamonds: 0, arrivalText: '6 hours', payoutCurrency: 'USD', exchangeRate: WITHDRAWAL_DIAMOND_TO_USD, fields: { accountNumber: 'PayPal Email', firstName: 'First name', lastName: 'Last name' } },
   { id: 'usdt', method: 'USDT', country: 'All Countries', countryCode: 'global', title: 'USDT', subtitle: 'Cryptocurrency transfer', icon: 'crypto', feePercent: 1.5, feeFixedDiamonds: 0, arrivalText: '6 hours', payoutCurrency: 'USDT', exchangeRate: WITHDRAWAL_DIAMOND_TO_USD, fields: { accountNumber: 'USDT Wallet Address', firstName: 'First name', lastName: 'Last name' } },
-  { id: 'binance', method: 'Binance', country: 'All Countries', countryCode: 'global', title: 'Binance', subtitle: 'Bank account transfer', icon: 'bank', feePercent: 1.5, feeFixedDiamonds: 0, arrivalText: '6 hours', payoutCurrency: 'USDT', exchangeRate: WITHDRAWAL_DIAMOND_TO_USD, fields: { accountNumber: 'Binance ID / Email', firstName: 'First name', lastName: 'Last name' } },
+  { id: 'binance', method: 'Binance', country: 'All Countries', countryCode: 'global', title: 'Binance', subtitle: 'Crypto transfer via Binance', icon: 'crypto', feePercent: 1.5, feeFixedDiamonds: 0, arrivalText: '6 hours', payoutCurrency: 'USDT', exchangeRate: WITHDRAWAL_DIAMOND_TO_USD, fields: { accountNumber: 'Binance ID / Email', network: 'Network, e.g. TRC20 / BEP20', walletAddress: 'Wallet Address', firstName: 'First name', lastName: 'Last name' } },
   { id: 'epay', method: 'EPAY Wallet', country: 'All Countries', countryCode: 'global', title: 'EPAY Wallet', subtitle: 'European bank transfer', icon: 'wallet', feePercent: 0, feeFixedDiamonds: 10000, arrivalText: '6 hours', payoutCurrency: 'EUR', exchangeRate: Number(process.env.WITHDRAWAL_DIAMOND_TO_EUR || 0.000092), fields: { accountNumber: 'EPAY Wallet Account', firstName: 'First name', lastName: 'Last name' } },
   { id: 'jazzcash', method: 'JazzCash', country: 'Pakistan', countryCode: 'PK', title: 'JazzCash', subtitle: 'Transfer to JazzCash account', icon: 'wallet', feePercent: 1.7, feeFixedDiamonds: 0, arrivalText: '6 hours', payoutCurrency: 'PKR', exchangeRate: WITHDRAWAL_DIAMOND_TO_PKR, fields: { accountNumber: 'JazzCash Number', firstName: 'First name', lastName: 'Last name' } },
   { id: 'easypaisa', method: 'EasyPaisa', country: 'Pakistan', countryCode: 'PK', title: 'EasyPaisa', subtitle: 'Bank account transfer', icon: 'bank', feePercent: 1.7, feeFixedDiamonds: 0, arrivalText: '6 hours', payoutCurrency: 'PKR', exchangeRate: WITHDRAWAL_DIAMOND_TO_PKR, fields: { accountNumber: 'EasyPaisa Number', firstName: 'First name', lastName: 'Last name' } },
@@ -5784,6 +5873,9 @@ app.post('/withdrawals', async (req, res) => {
     const note = String(req.body?.note || '').trim();
     const firstName = String(req.body?.firstName || '').trim();
     const lastName = String(req.body?.lastName || '').trim();
+    const details = req.body?.details && typeof req.body.details === 'object' && !Array.isArray(req.body.details)
+      ? Object.fromEntries(Object.entries(req.body.details).map(([key, value]) => [key, String(value || '').trim()]))
+      : {};
 
     const methodConfig = getWithdrawalMethodConfig(method, country);
     if (!Number.isFinite(amount) || amount < WITHDRAWAL_MIN_DIAMONDS) {
@@ -5791,6 +5883,12 @@ app.post('/withdrawals', async (req, res) => {
     }
     if (!methodConfig) return res.status(400).json({ success: false, message: 'Invalid withdrawal method' });
     if (!accountTitle || !accountNumber) return res.status(400).json({ success: false, message: 'Account title and account number are required' });
+    const missingDetailField = Object.entries(methodConfig.fields || {}).find(([key]) => (
+      !['accountNumber', 'firstName', 'lastName'].includes(key) && !details[key]
+    ));
+    if (missingDetailField) {
+      return res.status(400).json({ success: false, message: `${missingDetailField[1]} is required` });
+    }
 
     const feeAmount = Math.ceil((amount * Number(methodConfig.feePercent || 0)) / 100) + Math.floor(Number(methodConfig.feeFixedDiamonds || 0));
     const netDiamonds = Math.max(0, amount - feeAmount);
@@ -5815,6 +5913,7 @@ app.post('/withdrawals', async (req, res) => {
       country: methodConfig.country,
       accountTitle,
       accountNumber,
+      details,
       note: note || [firstName, lastName].filter(Boolean).join(' '),
       payoutCurrency: methodConfig.payoutCurrency,
       exchangeRate: methodConfig.exchangeRate,
