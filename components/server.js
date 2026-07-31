@@ -1,4 +1,4 @@
-import 'dotenv/config';
+﻿import 'dotenv/config';
 import "./conn.js";
 import { Server } from 'socket.io';
 import http from 'http';
@@ -8,6 +8,7 @@ import mongoose from "mongoose";
 import pkg from "agora-token";
 
 import User from "./User.js";
+import OfficialUser from "./OfficialUser.js";
 import AudioRoom from "./AudioRoom.js";
 import Room from "./RoomSchema.js";
 import DirectMessage from "./DirectMessage.js";
@@ -4745,21 +4746,27 @@ const OFFICIAL_SESSION_MS = OFFICIAL_SESSION_DAYS * 24 * 60 * 60 * 1000;
 const hashToken = (token) => crypto.createHash('sha256').update(String(token || '')).digest('hex');
 
 const officialUserProjection = 'name email profilePic glixId role accountStatus createdAt lastLogin chang daimon hostStatus agencyStatus coinSellerStatus sellerBalance sellerTotalSold adminNote';
+const officialAccountProjection = 'name email role status permissions sourceUserId note rejectionReason createdBy reviewedBy reviewedAt createdAt updatedAt lastLogin';
 
 const serializeOfficialUser = (user) => {
   if (!user) return null;
   const plain = typeof user.toObject === 'function' ? user.toObject() : user;
-  const { password, passwordResetOtpHash, ...safe } = plain;
+  const { password, passwordResetOtpHash, passwordResetOtpExpiresAt, passwordResetOtpRequestedAt, passwordResetOtpAttempts, ...safe } = plain;
+  if (safe._id && !safe.id) safe.id = safe._id.toString();
   return safe;
 };
 
-const createOfficialSession = async (userId) => {
+const serializeOfficialAccount = (account) => serializeOfficialUser(account);
+
+const createOfficialSession = async (userId, options = {}) => {
   const token = crypto.randomBytes(32).toString('hex');
-  await AuthSession.create({
-    userId,
+  const sessionPayload = {
     tokenHash: hashToken(token),
     expiresAt: new Date(Date.now() + OFFICIAL_SESSION_MS),
-  });
+  };
+  if (options.officialUserId) sessionPayload.officialUserId = options.officialUserId;
+  else sessionPayload.userId = userId;
+  await AuthSession.create(sessionPayload);
   return token;
 };
 
@@ -4796,15 +4803,15 @@ const requireOfficial = async (req, res, next) => {
     const session = await AuthSession.findOne({
       tokenHash: hashToken(token),
       expiresAt: { $gt: new Date() },
-    }).populate('userId');
+    }).populate('officialUserId');
 
-    const officialUser = session?.userId;
+    const officialUser = session?.officialUserId;
     if (!officialUser) return res.status(401).json({ success: false, message: 'Official session expired' });
     if (officialUser.role !== 'super_admin') {
       return res.status(403).json({ success: false, message: 'Only the Super Admin can access the Official Portal' });
     }
-    if ((officialUser.accountStatus || 'active') !== 'active') {
-      return res.status(403).json({ success: false, message: `Official account is ${officialUser.accountStatus}` });
+    if ((officialUser.status || 'pending') !== 'active') {
+      return res.status(403).json({ success: false, message: `Official account is ${officialUser.status}` });
     }
 
     req.officialUser = officialUser;
@@ -5174,25 +5181,24 @@ app.post('/login', async (req, res) => {
     const password = String(req.body?.password || '');
     if (!email || !password) return res.status(400).json({ success: false, message: 'Email and password are required' });
 
-    const user = await User.findOne({ email });
-    if (!user || !user.password) return res.status(401).json({ success: false, message: 'Invalid email or password' });
+    const officialUser = await OfficialUser.findOne({ email });
+    if (!officialUser || !officialUser.password) return res.status(401).json({ success: false, message: 'Invalid email or password' });
 
-    const ok = await bcrypt.compare(password, user.password);
+    const ok = await bcrypt.compare(password, officialUser.password);
     if (!ok) return res.status(401).json({ success: false, message: 'Invalid email or password' });
 
-    if (user.role !== 'super_admin') {
+    if (officialUser.role !== 'super_admin') {
       return res.status(403).json({ success: false, message: 'Only the Super Admin can access the Official Portal' });
     }
-    if ((user.accountStatus || 'active') !== 'active') {
-      return res.status(403).json({ success: false, message: `Your account is ${user.accountStatus}` });
+    if ((officialUser.status || 'pending') !== 'active') {
+      return res.status(403).json({ success: false, message: `Your Official Portal account is ${officialUser.status}. Please wait for approval.` });
     }
 
-    user.lastLogin = new Date();
-    if (!user.glixId) user.glixId = await createUniqueUserPublicId();
-    await user.save();
+    officialUser.lastLogin = new Date();
+    await officialUser.save();
 
-    const token = await createOfficialSession(user._id);
-    return res.json({ success: true, token, user: serializeOfficialUser(user) });
+    const token = await createOfficialSession(null, { officialUserId: officialUser._id });
+    return res.json({ success: true, token, user: serializeOfficialAccount(officialUser) });
   } catch (error) {
     return res.status(500).json({ success: false, message: error.message });
   }
@@ -5201,17 +5207,17 @@ app.post('/login', async (req, res) => {
 app.post('/admin/auth/forgot-password', async (req, res) => {
   try {
     const email = String(req.body?.email || '').trim().toLowerCase();
-    const user = await User.findOne({ email });
-    if (!user || user.role !== 'super_admin') {
+    const officialUser = await OfficialUser.findOne({ email });
+    if (!officialUser || officialUser.role !== 'super_admin') {
       return res.status(404).json({ success: false, message: 'Official account not found' });
     }
 
     const otp = String(Math.floor(100000 + Math.random() * 900000));
-    user.passwordResetOtpHash = await bcrypt.hash(otp, 10);
-    user.passwordResetOtpExpiresAt = new Date(Date.now() + 10 * 60 * 1000);
-    user.passwordResetOtpRequestedAt = new Date();
-    user.passwordResetOtpAttempts = 0;
-    await user.save();
+    officialUser.passwordResetOtpHash = await bcrypt.hash(otp, 10);
+    officialUser.passwordResetOtpExpiresAt = new Date(Date.now() + 10 * 60 * 1000);
+    officialUser.passwordResetOtpRequestedAt = new Date();
+    officialUser.passwordResetOtpAttempts = 0;
+    await officialUser.save();
 
     console.log(`Official portal password reset OTP for ${email}: ${otp}`);
     return res.json({ success: true, message: 'OTP generated. Check backend logs or configure email delivery.', devOtp: otp });
@@ -5225,29 +5231,29 @@ app.post('/admin/auth/reset-password', async (req, res) => {
     const email = String(req.body?.email || '').trim().toLowerCase();
     const otp = String(req.body?.otp || '').trim();
     const newPassword = String(req.body?.newPassword || '');
-    const user = await User.findOne({ email });
-    if (!user || user.role !== 'super_admin') return res.status(404).json({ success: false, message: 'Official account not found' });
-    if (!user.passwordResetOtpHash || !user.passwordResetOtpExpiresAt || user.passwordResetOtpExpiresAt < new Date()) {
+    const officialUser = await OfficialUser.findOne({ email });
+    if (!officialUser || officialUser.role !== 'super_admin') return res.status(404).json({ success: false, message: 'Official account not found' });
+    if (!officialUser.passwordResetOtpHash || !officialUser.passwordResetOtpExpiresAt || officialUser.passwordResetOtpExpiresAt < new Date()) {
       return res.status(400).json({ success: false, message: 'OTP expired. Request a new code.' });
     }
-    if ((user.passwordResetOtpAttempts || 0) >= 5) {
+    if ((officialUser.passwordResetOtpAttempts || 0) >= 5) {
       return res.status(429).json({ success: false, message: 'Too many OTP attempts. Request a new code.' });
     }
-    const validOtp = await bcrypt.compare(otp, user.passwordResetOtpHash);
+    const validOtp = await bcrypt.compare(otp, officialUser.passwordResetOtpHash);
     if (!validOtp) {
-      user.passwordResetOtpAttempts = (user.passwordResetOtpAttempts || 0) + 1;
-      await user.save();
+      officialUser.passwordResetOtpAttempts = (officialUser.passwordResetOtpAttempts || 0) + 1;
+      await officialUser.save();
       return res.status(400).json({ success: false, message: 'Invalid OTP' });
     }
     if (newPassword.length < 6) return res.status(400).json({ success: false, message: 'Password must be at least 6 characters' });
 
-    user.password = await bcrypt.hash(newPassword, 10);
-    user.passwordResetOtpHash = '';
-    user.passwordResetOtpExpiresAt = null;
-    user.passwordResetOtpRequestedAt = null;
-    user.passwordResetOtpAttempts = 0;
-    await user.save();
-    await AuthSession.deleteMany({ userId: user._id });
+    officialUser.password = await bcrypt.hash(newPassword, 10);
+    officialUser.passwordResetOtpHash = '';
+    officialUser.passwordResetOtpExpiresAt = null;
+    officialUser.passwordResetOtpRequestedAt = null;
+    officialUser.passwordResetOtpAttempts = 0;
+    await officialUser.save();
+    await AuthSession.deleteMany({ officialUserId: officialUser._id });
     return res.json({ success: true, message: 'Password reset successful' });
   } catch (error) {
     return res.status(500).json({ success: false, message: error.message });
@@ -5267,29 +5273,44 @@ app.post('/admin/access/register', async (req, res) => {
       return res.status(400).json({ success: false, message: 'Name, email and a 6 character password are required' });
     }
 
-    let user = await User.findOne({ email });
-    if (!user) {
-      user = await User.create({
-        name,
-        email,
-        password: await bcrypt.hash(password, 10),
-        glixId: await createUniqueUserPublicId(),
-        role: 'user',
-      });
+    const existingOfficial = await OfficialUser.findOne({ email });
+    if (existingOfficial) {
+      if (existingOfficial.status === 'rejected') {
+        existingOfficial.name = name;
+        existingOfficial.password = await bcrypt.hash(password, 10);
+        existingOfficial.role = requestedRole;
+        existingOfficial.status = 'pending';
+        existingOfficial.note = note;
+        existingOfficial.rejectionReason = '';
+        existingOfficial.reviewedBy = null;
+        existingOfficial.reviewedAt = null;
+        await existingOfficial.save();
+        return res.json({ success: true, message: 'Official access request submitted' });
+      }
+      return res.status(409).json({ success: false, message: `Official account already exists with status ${existingOfficial.status}` });
     }
 
-    user.adminAccessRequest = {
-      requestedRole,
-      status: 'pending',
+    const hasActiveSuperAdmin = await OfficialUser.exists({ role: 'super_admin', status: 'active' });
+    const status = hasActiveSuperAdmin ? 'pending' : 'active';
+    const officialUser = await OfficialUser.create({
+      name,
+      email,
+      password: await bcrypt.hash(password, 10),
+      role: hasActiveSuperAdmin ? requestedRole : 'super_admin',
+      status,
       note,
-      rejectionReason: '',
-      reviewedBy: null,
-      reviewedAt: null,
-      requestedAt: new Date(),
-    };
-    await user.save();
-    return res.json({ success: true, message: 'Official access request submitted' });
+      reviewedAt: status === 'active' ? new Date() : null,
+    });
+
+    return res.json({
+      success: true,
+      message: status === 'active'
+        ? 'First Official Super Admin created. You can sign in now.'
+        : 'Official access request submitted',
+      account: serializeOfficialAccount(officialUser),
+    });
   } catch (error) {
+    if (error?.code === 11000) return res.status(409).json({ success: false, message: 'Official email already exists' });
     return res.status(500).json({ success: false, message: error.message });
   }
 });
@@ -5670,8 +5691,33 @@ app.patch('/agency/requests/:userId', requireOfficial, async (req, res) => {
 app.get('/admin/access/requests', requireOfficial, async (req, res) => {
   try {
     const status = String(req.query.status || 'pending');
-    const query = status === 'all' ? { 'adminAccessRequest.status': { $ne: 'none' } } : { 'adminAccessRequest.status': status };
-    const requests = await User.find(query).select('-password -passwordResetOtpHash').sort({ 'adminAccessRequest.requestedAt': -1 }).lean();
+    const appQuery = status === 'all' ? { 'adminAccessRequest.status': { $ne: 'none' } } : { 'adminAccessRequest.status': status };
+    const officialStatus = status === 'approved' ? 'active' : status;
+    const officialQuery = status === 'all' ? { status: { $in: ['pending', 'rejected'] } } : { status: officialStatus };
+
+    const [appRequests, officialRequests] = await Promise.all([
+      User.find(appQuery).select('-password -passwordResetOtpHash').sort({ 'adminAccessRequest.requestedAt': -1 }).lean(),
+      OfficialUser.find(officialQuery).select(officialAccountProjection).sort({ createdAt: -1 }).lean(),
+    ]);
+
+    const officialRows = officialRequests.map(account => ({
+      ...account,
+      requestKind: 'official',
+      adminAccessRequest: {
+        requestedRole: account.role,
+        status: account.status === 'active' ? 'approved' : account.status,
+        note: account.note || '',
+        rejectionReason: account.rejectionReason || '',
+        reviewedBy: account.reviewedBy || null,
+        reviewedAt: account.reviewedAt || null,
+        requestedAt: account.createdAt,
+      },
+    }));
+    const appRows = appRequests.map(user => ({ ...user, requestKind: 'app_user' }));
+    const requests = [...officialRows, ...appRows].sort((a, b) => (
+      new Date(b.adminAccessRequest?.requestedAt || b.createdAt || 0) - new Date(a.adminAccessRequest?.requestedAt || a.createdAt || 0)
+    ));
+
     return res.json({ success: true, requests });
   } catch (error) {
     return res.status(500).json({ success: false, message: error.message });
@@ -5683,7 +5729,23 @@ app.patch('/admin/access/requests/:userId', requireOfficial, async (req, res) =>
     const status = ['approved', 'rejected'].includes(req.body?.status) ? req.body.status : null;
     if (!status) return res.status(400).json({ success: false, message: 'Invalid request status' });
 
-    const targetUser = await User.findById(req.params.userId).select('adminAccessRequest');
+    const requestKind = String(req.body?.requestKind || '').trim();
+    if (requestKind === 'official') {
+      const officialUser = await OfficialUser.findById(req.params.userId);
+      if (!officialUser) return res.status(404).json({ success: false, message: 'Official account request not found' });
+      if (String(officialUser._id) === String(req.officialUser._id) && status === 'rejected') {
+        return res.status(400).json({ success: false, message: 'You cannot reject your own official account' });
+      }
+      officialUser.status = status === 'approved' ? 'active' : 'rejected';
+      officialUser.role = ['admin', 'manager', 'super_admin'].includes(req.body?.role) ? req.body.role : officialUser.role;
+      officialUser.rejectionReason = status === 'rejected' ? String(req.body?.reason || '') : '';
+      officialUser.reviewedBy = req.officialUser._id;
+      officialUser.reviewedAt = new Date();
+      await officialUser.save();
+      return res.json({ success: true, user: serializeOfficialAccount(officialUser) });
+    }
+
+    const targetUser = await User.findById(req.params.userId).select('name email password adminAccessRequest');
     if (!targetUser) return res.status(404).json({ success: false, message: 'User not found' });
 
     const requestedRole = ['admin', 'manager', 'super_admin'].includes(req.body?.role)
@@ -5699,13 +5761,106 @@ app.patch('/admin/access/requests/:userId', requireOfficial, async (req, res) =>
       'adminAccessRequest.reviewedAt': new Date(),
       'adminAccessRequest.rejectionReason': status === 'rejected' ? String(req.body?.reason || '') : '',
     };
-    if (status === 'approved') {
-      update.role = requestedRole;
-      update.accountStatus = 'active';
-    }
     const user = await User.findByIdAndUpdate(req.params.userId, { $set: update }, { new: true, runValidators: true });
-    return res.json({ success: true, user: serializeOfficialUser(user) });
+
+    let tempPassword = '';
+    if (status === 'approved') {
+      tempPassword = targetUser.password ? '' : crypto.randomBytes(9).toString('base64url');
+      await OfficialUser.findOneAndUpdate(
+        { email: targetUser.email },
+        {
+          $set: {
+            name: targetUser.name || targetUser.email,
+            role: requestedRole,
+            status: 'active',
+            sourceUserId: targetUser._id,
+            note: targetUser.adminAccessRequest?.note || '',
+            rejectionReason: '',
+            reviewedBy: req.officialUser._id,
+            reviewedAt: new Date(),
+          },
+          $setOnInsert: {
+            password: targetUser.password || await bcrypt.hash(tempPassword, 10),
+            createdBy: req.officialUser._id,
+          },
+        },
+        { upsert: true, new: true, runValidators: true }
+      );
+    }
+
+    return res.json({ success: true, user: serializeOfficialUser(user), tempPassword });
   } catch (error) {
+    if (error?.code === 11000) return res.status(409).json({ success: false, message: 'Official email already exists' });
+    return res.status(500).json({ success: false, message: error.message });
+  }
+});
+
+app.get('/admin/official-users', requireOfficial, async (req, res) => {
+  try {
+    const accounts = await OfficialUser.find({}).select(officialAccountProjection).sort({ role: -1, createdAt: -1 }).lean();
+    return res.json({ success: true, accounts: accounts.map(serializeOfficialAccount) });
+  } catch (error) {
+    return res.status(500).json({ success: false, message: error.message });
+  }
+});
+
+app.post('/admin/official-users', requireOfficial, async (req, res) => {
+  try {
+    const name = String(req.body?.name || '').trim();
+    const email = String(req.body?.email || '').trim().toLowerCase();
+    const password = String(req.body?.password || '');
+    const role = ['admin', 'manager', 'super_admin'].includes(req.body?.role) ? req.body.role : 'manager';
+    const status = ['active', 'pending', 'blocked'].includes(req.body?.status) ? req.body.status : 'active';
+    const permissions = Array.isArray(req.body?.permissions) ? req.body.permissions.map(item => String(item).trim()).filter(Boolean) : [];
+
+    if (!name || !email || password.length < 6) {
+      return res.status(400).json({ success: false, message: 'Name, email and a 6 character password are required' });
+    }
+
+    const account = await OfficialUser.create({
+      name,
+      email,
+      password: await bcrypt.hash(password, 10),
+      role,
+      status,
+      permissions,
+      createdBy: req.officialUser._id,
+      reviewedBy: req.officialUser._id,
+      reviewedAt: new Date(),
+    });
+    return res.status(201).json({ success: true, account: serializeOfficialAccount(account) });
+  } catch (error) {
+    if (error?.code === 11000) return res.status(409).json({ success: false, message: 'Official email already exists' });
+    return res.status(500).json({ success: false, message: error.message });
+  }
+});
+
+app.patch('/admin/official-users/:officialUserId', requireOfficial, async (req, res) => {
+  try {
+    const account = await OfficialUser.findById(req.params.officialUserId);
+    if (!account) return res.status(404).json({ success: false, message: 'Official account not found' });
+
+    const isSelf = String(account._id) === String(req.officialUser._id);
+    if (Object.prototype.hasOwnProperty.call(req.body, 'name')) account.name = String(req.body.name || '').trim() || account.name;
+    if (Object.prototype.hasOwnProperty.call(req.body, 'email')) account.email = String(req.body.email || '').trim().toLowerCase() || account.email;
+    if (['admin', 'manager', 'super_admin'].includes(req.body?.role)) {
+      if (isSelf && req.body.role !== 'super_admin') return res.status(400).json({ success: false, message: 'You cannot remove your own Super Admin role' });
+      account.role = req.body.role;
+    }
+    if (['active', 'pending', 'blocked', 'rejected'].includes(req.body?.status)) {
+      if (isSelf && req.body.status !== 'active') return res.status(400).json({ success: false, message: 'You cannot disable your own official account' });
+      account.status = req.body.status;
+    }
+    if (Array.isArray(req.body?.permissions)) account.permissions = req.body.permissions.map(item => String(item).trim()).filter(Boolean);
+    if (String(req.body?.password || '').length >= 6) account.password = await bcrypt.hash(String(req.body.password), 10);
+    if (Object.prototype.hasOwnProperty.call(req.body, 'rejectionReason')) account.rejectionReason = String(req.body.rejectionReason || '').trim();
+    account.reviewedBy = req.officialUser._id;
+    account.reviewedAt = new Date();
+    await account.save();
+
+    return res.json({ success: true, account: serializeOfficialAccount(account) });
+  } catch (error) {
+    if (error?.code === 11000) return res.status(409).json({ success: false, message: 'Official email already exists' });
     return res.status(500).json({ success: false, message: error.message });
   }
 });
@@ -6708,6 +6863,7 @@ app.use((req, res) => {
 server.listen(PORT, () => {
   console.log(`Server listening on port ${PORT}`);
 });
+
 
 
 

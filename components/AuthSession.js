@@ -4,7 +4,13 @@ const authSessionSchema = new mongoose.Schema({
   userId: {
     type: mongoose.Schema.Types.ObjectId,
     ref: 'User',
-    required: true,
+    default: null,
+    index: true
+  },
+  officialUserId: {
+    type: mongoose.Schema.Types.ObjectId,
+    ref: 'OfficialUser',
+    default: null,
     index: true
   },
   tokenHash: {
@@ -24,6 +30,14 @@ const authSessionSchema = new mongoose.Schema({
 }, { timestamps: true });
 
 authSessionSchema.index({ expiresAt: 1 }, { expireAfterSeconds: 0 });
+
+authSessionSchema.pre('validate', function requireSessionOwner(next) {
+  if (!this.userId && !this.officialUserId) {
+    next(new Error('Auth session requires a userId or officialUserId'));
+    return;
+  }
+  next();
+});
 
 const AuthSession = mongoose.model('AuthSession', authSessionSchema);
 
