@@ -73,6 +73,7 @@ const COIN_BAG_ALLOWED_AMOUNTS = [10000, 30000, 50000, 100000];
 const COIN_BAG_ALLOWED_CLAIM_LIMITS = [10, 20, 50];
 const COIN_BAG_PLATFORM_FEE_RATE = 0.03;
 const COIN_BAG_ACTIVE_MS = 10000;
+const GIFT_QUANTITY_OPTIONS = [500, 1000, 5000, 20000, 30000, 50000, 80000, 100000, 150000, 200000, 300000, 500000, 700000, 1000000, 2000000, 3000000, 5000000, 7000000];
 const LEVEL_LAKH_REQUIREMENTS = [
   1, 1, 1, 2, 2, 2, 3, 3, 4, 5,
   6, 7, 8, 9, 10, 12, 14, 16, 18, 20,
@@ -1797,10 +1798,10 @@ io.on('connection', (socket) => {
     }
 
     const coinPrice = Number(coins);
-    const giftQuantity = Number(quantity);
+    const giftQuantity = Math.floor(Number(quantity));
 
-    if (!Number.isFinite(coinPrice) || !Number.isFinite(giftQuantity) || coinPrice <= 0 || giftQuantity <= 0) {
-      socket.emit('gift_error', { message: 'Invalid gift cost received.' });
+    if (!Number.isFinite(coinPrice) || coinPrice <= 0 || !GIFT_QUANTITY_OPTIONS.includes(giftQuantity)) {
+      socket.emit('gift_error', { message: 'Invalid gift quantity received.' });
       return;
     }
 
@@ -6863,6 +6864,7 @@ app.use((req, res) => {
 server.listen(PORT, () => {
   console.log(`Server listening on port ${PORT}`);
 });
+
 
 
 
