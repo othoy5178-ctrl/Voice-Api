@@ -74,6 +74,17 @@ const COIN_BAG_ALLOWED_CLAIM_LIMITS = [10, 20, 50];
 const COIN_BAG_PLATFORM_FEE_RATE = 0.03;
 const COIN_BAG_ACTIVE_MS = 10000;
 const GIFT_QUANTITY_OPTIONS = [1, 5, 10, 20, 50, 100];
+const LUCKY_GIFT_NAMES = new Set([
+  'love burst',
+  'dream castle',
+  'victory car',
+  'ocean pearl',
+  'fire phoenix',
+  'treasure box',
+  'neon party',
+]);
+const LUCKY_GIFT_RETURN_CHANCE_PERCENT = Math.min(100, Math.max(0, Number(process.env.LUCKY_GIFT_RETURN_CHANCE_PERCENT || 10)));
+const LUCKY_GIFT_REWARD_MULTIPLIER = Math.max(0, Number(process.env.LUCKY_GIFT_REWARD_MULTIPLIER || 1));
 const LEVEL_LAKH_REQUIREMENTS = [
   1, 1, 1, 2, 2, 2, 3, 3, 4, 5,
   6, 7, 8, 9, 10, 12, 14, 16, 18, 20,
@@ -1757,7 +1768,7 @@ io.on('connection', (socket) => {
     });
   });
 
-  socket.on('send_gift', async ({ roomId, senderName, hostId, gift, giftThumbnail, giftName, avatar, userId, quantity, coins, receiverIds = [] }) => {
+  socket.on('send_gift', async ({ roomId, senderName, hostId, gift, giftThumbnail, giftName, avatar, userId, quantity, coins, receiverIds = [], isLuckyGift: clientIsLuckyGift = false }) => {
 
     console.log('gift data:', userId, roomId, hostId, coins, receiverIds);
 
@@ -1821,6 +1832,26 @@ io.on('connection', (socket) => {
     }
     const perReceiverCost = coinPrice * giftQuantity;
     const totalCost = perReceiverCost * normalizedReceiverIds.length;
+    const normalizedGiftName = String(giftName || '').trim().toLowerCase();
+    const isLuckyGiftEligible = LUCKY_GIFT_NAMES.has(normalizedGiftName);
+    const luckyChancePercent = isLuckyGiftEligible ? LUCKY_GIFT_RETURN_CHANCE_PERCENT : 0;
+    const luckyGiftWon = isLuckyGiftEligible && luckyChancePercent > 0 && Math.random() * 100 < luckyChancePercent;
+    const luckyRewardDiamonds = luckyGiftWon ? Math.floor(totalCost * LUCKY_GIFT_REWARD_MULTIPLIER) : 0;
+    const luckyGiftResult = {
+      eligible: isLuckyGiftEligible,
+      won: luckyGiftWon,
+      chancePercent: luckyChancePercent,
+      rewardMultiplier: LUCKY_GIFT_REWARD_MULTIPLIER,
+      rewardDiamonds: luckyRewardDiamonds
+    };
+
+    if (clientIsLuckyGift && !isLuckyGiftEligible) {
+      console.warn('Client marked a non-lucky gift as lucky. Ignoring client flag.', {
+        roomId: stringRoomId,
+        userId,
+        giftName,
+      });
+    }
 
     const session = await mongoose.startSession();
     session.startTransaction();
@@ -1859,6 +1890,16 @@ io.on('connection', (socket) => {
         throw new Error('One or more gift receivers were not found.');
       }
 
+      let luckySenderDaimonAfter = 0;
+      if (luckyRewardDiamonds > 0) {
+        const luckySender = await User.findByIdAndUpdate(
+          userId,
+          { $inc: { daimon: luckyRewardDiamonds } },
+          { new: true, session }
+        ).select('daimon');
+        luckySenderDaimonAfter = luckySender?.daimon || 0;
+      }
+
       await GiftTransaction.create(
         normalizedReceiverIds.map(receiverId => ({
           roomId: stringRoomId,
@@ -1881,10 +1922,12 @@ io.on('connection', (socket) => {
           perReceiverCost,
           totalCost: perReceiverCost,
           batchTotalCost: totalCost,
+          luckyGift: luckyGiftResult,
           status: 'completed',
           audit: {
             senderBalanceAfter: sender.chang || 0,
             receiverBalanceAfter: Number(receiverById[receiverId]?.daimon || 0) + perReceiverCost,
+            luckySenderDaimonAfter,
             clientSenderName: senderName || '',
             roomHostId: new mongoose.Types.ObjectId(finalRoomHostId)
           }
@@ -1917,6 +1960,7 @@ io.on('connection', (socket) => {
       perReceiverCost,
       receiverIds: normalizedReceiverIds,
       roomHostId: finalRoomHostId,
+      luckyGift: luckyGiftResult,
       userId
     });
     await emitRoomStats(stringRoomId);
@@ -6376,6 +6420,36 @@ const serializeSeller = (user) => {
   return safe;
 };
 
+app.get('/coin-sellers/public', async (req, res) => {
+  try {
+    const sellers = await User.find({
+      accountStatus: { $ne: 'blocked' },
+      coinSellerStatus: { $ne: 'suspended' },
+      $or: [
+        { coinSellerStatus: 'approved' },
+        { 'coinSellerRegistration.status': 'approved' },
+      ],
+    })
+      .select('name profilePic glixId countryRegion coinSellerStatus coinSellerRegistration')
+      .sort({ 'coinSellerRegistration.reviewedAt': -1, name: 1 })
+      .lean();
+
+    const publicSellers = sellers.map((seller) => ({
+      id: seller._id?.toString?.() || String(seller._id),
+      name: seller.coinSellerRegistration?.fullName || seller.name || 'Coin Seller',
+      profilePic: seller.profilePic || '',
+      glixId: seller.glixId || '',
+      country: seller.countryRegion || '',
+      city: seller.coinSellerRegistration?.city || '',
+      phoneNumber: seller.coinSellerRegistration?.phoneNumber || '',
+      paymentMethod: seller.coinSellerRegistration?.paymentMethod || '',
+    }));
+
+    return res.json({ success: true, sellers: publicSellers });
+  } catch (error) {
+    return res.status(500).json({ success: false, message: error.message });
+  }
+});
 const requireCoinSeller = async (req, res, next) => {
   try {
     const authHeader = req.headers.authorization || '';

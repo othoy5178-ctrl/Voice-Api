@@ -69,6 +69,13 @@ const GiftTransactionSchema = new mongoose.Schema({
   perReceiverCost: Number,
   totalCost: Number,
   batchTotalCost: Number,
+  luckyGift: {
+    eligible: { type: Boolean, default: false },
+    won: { type: Boolean, default: false },
+    chancePercent: { type: Number, default: 0 },
+    rewardMultiplier: { type: Number, default: 1 },
+    rewardDiamonds: { type: Number, default: 0 }
+  },
   roomMode: {
     type: String,
     enum: ['audio', 'video', 'unknown'],
@@ -84,6 +91,7 @@ const GiftTransactionSchema = new mongoose.Schema({
   audit: {
     senderBalanceAfter: { type: Number, default: 0 },
     receiverBalanceAfter: { type: Number, default: 0 },
+    luckySenderDaimonAfter: { type: Number, default: 0 },
     clientSenderName: { type: String, trim: true, default: '' },
     roomHostId: {
       type: mongoose.Schema.Types.ObjectId,
