@@ -306,6 +306,61 @@ const createCleanSlotsBlueprint = () => Array.from({ length: 25 }, (_, i) => ({
   isMuted: false
 }));
 
+const buildRoomSlotsSnapshot = async (roomId) => {
+  const stringRoomId = getStringRoomId(roomId);
+  if (!stringRoomId) return null;
+
+  const slots = createCleanSlotsBlueprint();
+  const isVideoRoom = stringRoomId.startsWith('glix_');
+
+  if (isVideoRoom) {
+    const videoRoomDoc = await Room.findOne({ channelName: stringRoomId }).select('slots').lean();
+    return Array.isArray(videoRoomDoc?.slots) ? videoRoomDoc.slots : slots;
+  }
+
+  if (!mongoose.Types.ObjectId.isValid(stringRoomId)) return slots;
+
+  const audioRoomDoc = await AudioRoom.findById(stringRoomId)
+    .populate('speakers.userId', 'name profilePic')
+    .select('speakers micSeatCount micLayoutType backgroundThemeId backgroundThemeUrl lockedSlots')
+    .lean();
+
+  if (!audioRoomDoc) return null;
+
+  const lockedSlots = new Set((audioRoomDoc.lockedSlots || [3, 12, 19]).map(Number));
+  (audioRoomDoc.speakers || []).filter(speaker => speaker && speaker.userId).forEach(speaker => {
+    const index = Number(speaker.slotIndex);
+    if (index >= 0 && index < slots.length) {
+      slots[index] = {
+        ...slots[index],
+        locked: lockedSlots.has(index),
+        userId: speaker.userId?._id?.toString?.() || speaker.userId?.toString?.() || null,
+        uid: speaker.numericUid || null,
+        username: speaker.userId?.name || 'Broadcaster',
+        avatar: speaker.userId?.profilePic || null,
+        frameUrl: speaker.frameUrl || null,
+        isMuted: !!speaker.isMuted,
+      };
+    }
+  });
+
+  return {
+    slots: slots.map((slot, index) => ({ ...slot, locked: lockedSlots.has(index) })),
+    micSeatCount: audioRoomDoc.micSeatCount || 15,
+    micLayoutType: audioRoomDoc.micLayoutType || 'chatroom',
+    backgroundThemeId: audioRoomDoc.backgroundThemeId || null,
+    backgroundThemeUrl: audioRoomDoc.backgroundThemeUrl || null,
+  };
+};
+
+const emitRoomSlotsSnapshot = async (roomId) => {
+  const stringRoomId = getStringRoomId(roomId);
+  if (!stringRoomId) return;
+
+  const snapshot = await buildRoomSlotsSnapshot(stringRoomId);
+  if (snapshot) io.to(stringRoomId).emit('room_slots_updated', snapshot);
+};
+
 
 const DEFAULT_STORE_ITEMS = [
   { itemKey: 'toyota_ride', name: 'Toyota', category: 'Ride', section: 'New This Month', type: 'ride', price: 400, currency: 'chang', durationDays: 30, assetKey: 'Ride', sortOrder: 1 },
@@ -1282,7 +1337,7 @@ io.on('connection', (socket) => {
         });
       }
 
-        io.to(stringRoomId).emit('slot_state_changed', {
+      io.to(stringRoomId).emit('slot_state_changed', {
         slotIndex: normalizedSlotIndex,
         user: {
           uid: numericUid ? parseInt(numericUid, 10) : null,
@@ -1294,6 +1349,7 @@ io.on('connection', (socket) => {
           cameraOn: !!cameraOn
         }
       });
+      await emitRoomSlotsSnapshot(stringRoomId);
 
     } catch (error) {
       console.log("Socket array persistence exception error:", error);
@@ -1620,6 +1676,7 @@ io.on('connection', (socket) => {
           cameraOn: false
         }
       });
+      await emitRoomSlotsSnapshot(stringRoomId);
 
       const removalPayload = {
         roomId: stringRoomId,
@@ -2020,18 +2077,34 @@ io.on('connection', (socket) => {
           role: isVideoRoom ? 'cohost' : 'speaker'
         });
 
+        await Room.findOneAndUpdate(
+          { channelName: stringRoomId, "slots.id": acceptedSlotIndex + 1 },
+          {
+            $set: {
+              "slots.$.userId": acceptedUserId,
+              "slots.$.uid": parseInt(data.user.uid ?? data.user.numericUid, 10),
+              "slots.$.username": data.user.username || data.user.name || 'Co-Host',
+              "slots.$.avatar": data.user.avatar || data.user.profilePic || '',
+              "slots.$.frameUrl": data.user.frameUrl || null,
+              "slots.$.isMuted": false,
+              "slots.$.cameraOn": data.user.cameraOn !== false
+            }
+          }
+        );
+
         io.to(stringRoomId).emit('slot_state_changed', {
           slotIndex: acceptedSlotIndex,
           user: {
-            uid: data.user.uid,
+            uid: data.user.uid ?? data.user.numericUid,
             userId: acceptedUserId,
-            username: data.user.username,
-            avatar: data.user.avatar,
+            username: data.user.username || data.user.name || 'Co-Host',
+            avatar: data.user.avatar || data.user.profilePic || '',
             frameUrl: data.user.frameUrl || null,
             isMuted: false,
             cameraOn: data.user.cameraOn !== false
           }
         });
+        await emitRoomSlotsSnapshot(stringRoomId);
         return;
       }
 
@@ -2094,7 +2167,7 @@ io.on('connection', (socket) => {
           role: isVideoRoom ? 'cohost' : 'speaker'
         });
 
-        io.to(stringRoomId).emit('slot_state_changed', {
+      io.to(stringRoomId).emit('slot_state_changed', {
         slotIndex: acceptedSlotIndex,
         user: {
           uid: data.user.uid,
@@ -2105,6 +2178,7 @@ io.on('connection', (socket) => {
           isMuted: false
         }
       });
+      await emitRoomSlotsSnapshot(stringRoomId);
 
     } catch (err) {
       console.log("Host response error:", err);
@@ -2513,6 +2587,7 @@ io.on('connection', (socket) => {
             isMuted: false
           }
         });
+        await emitRoomSlotsSnapshot(roomId);
       }
 
       if (!roomId || roomId.length !== 24 || !/^[0-9a-fA-F]{24}$/.test(roomId)) {
@@ -3409,6 +3484,7 @@ app.post('/audio-room/join-mic-slot', async (req, res) => {
         isMuted: !!isMuted,
       }
     });
+    await emitRoomSlotsSnapshot(stringRoomId);
 
     return res.json({
       success: true,
