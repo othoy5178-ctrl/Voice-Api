@@ -3326,6 +3326,108 @@ app.post('/join', async (req, res) => {
   }
 });
 
+app.post('/audio-room/join-mic-slot', async (req, res) => {
+  try {
+    const { roomId, userId, numericUid, targetSlotIndex, isMuted } = req.body;
+    const stringRoomId = roomId ? roomId.toString() : '';
+    const slotIndex = Number(targetSlotIndex);
+    const sanitizedUid = parseInt(numericUid, 10) || 0;
+
+    if (!mongoose.Types.ObjectId.isValid(stringRoomId) || !mongoose.Types.ObjectId.isValid(userId) || !sanitizedUid) {
+      return res.status(400).json({ success: false, message: 'Invalid mic slot request.' });
+    }
+    if (!Number.isInteger(slotIndex) || slotIndex < 0) {
+      return res.status(400).json({ success: false, message: 'Invalid mic slot selected.' });
+    }
+
+    const room = await AudioRoom.findById(stringRoomId);
+    if (!room || !room.isLive) return res.status(404).json({ success: false, message: 'Audio room is not available.' });
+    if (slotIndex >= (room.micSeatCount || 15)) {
+      return res.status(400).json({ success: false, message: 'Mic slot is outside this room layout.' });
+    }
+    if ((room.lockedSlots || []).map(Number).includes(slotIndex)) {
+      return res.status(423).json({ success: false, message: 'This mic slot is locked.' });
+    }
+
+    const currentSpeakers = Array.isArray(room.speakers) ? room.speakers : [];
+    const occupiedByOther = currentSpeakers.some(s => (
+      Number(s?.slotIndex) === slotIndex &&
+      s?.userId &&
+      String(s.userId) !== String(userId)
+    ));
+    if (occupiedByOther) return res.status(409).json({ success: false, message: 'This mic slot is already occupied.' });
+
+    const user = await User.findById(userId).select('name profilePic frameUrl');
+    if (!user) return res.status(404).json({ success: false, message: 'User not found.' });
+
+    const appId = process.env.AGORA_APP_ID;
+    const appCertificate = process.env.AGORA_APP_CERTIFICATE;
+    if (!appId || !appCertificate) {
+      return res.status(500).json({ success: false, message: 'Agora credentials are not configured.' });
+    }
+
+    room.speakers = currentSpeakers.filter(s => s?.userId && String(s.userId) !== String(userId));
+    room.speakers.push({
+      userId,
+      slotIndex,
+      numericUid: sanitizedUid,
+      isMuted: !!isMuted,
+      frameUrl: user.frameUrl || null,
+    });
+    room.audience = (room.audience || []).filter(id => String(id) !== String(userId));
+    room.lastHeartbeatAt = new Date();
+    await room.save();
+
+    const privilegeExpiredTs = Math.floor(Date.now() / 1000) + 3600;
+    const agoraToken = RtcTokenBuilder.buildTokenWithUid(
+      appId,
+      appCertificate,
+      stringRoomId,
+      sanitizedUid,
+      RtcRole.PUBLISHER,
+      privilegeExpiredTs
+    );
+
+    await upsertRoomPresence({
+      roomId: stringRoomId,
+      userId,
+      socketId: activeUsers[userId.toString()] || null,
+      name: user.name || 'User',
+      profilePic: user.profilePic || '',
+      numericUid: sanitizedUid,
+      role: 'speaker'
+    });
+
+    io.to(stringRoomId).emit('slot_state_changed', {
+      slotIndex,
+      user: {
+        uid: sanitizedUid,
+        userId,
+        username: user.name || 'User',
+        avatar: user.profilePic || '',
+        frameUrl: user.frameUrl || null,
+        isMuted: !!isMuted,
+      }
+    });
+
+    return res.json({
+      success: true,
+      agoraToken,
+      userRole: 'speaker',
+      slotIndex,
+      user: {
+        uid: sanitizedUid,
+        userId,
+        username: user.name || 'User',
+        avatar: user.profilePic || '',
+        frameUrl: user.frameUrl || null,
+        isMuted: !!isMuted,
+      }
+    });
+  } catch (error) {
+    return res.status(500).json({ success: false, message: error.message });
+  }
+});
 app.post('/regenerate-token', async (req, res) => {
   try {
     const { roomId, userId, numericUid, isBecomingSpeaker } = req.body;
