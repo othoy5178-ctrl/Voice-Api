@@ -30,6 +30,14 @@ const audioRoomSchema = new mongoose.Schema({
   backgroundThemeUrl: { type: String, default: null },
   lockedSlots: [{ type: Number }],
 
+  isPermanent: { type: Boolean, default: false, index: true },
+  visibility: {
+    type: String,
+    enum: ['public', 'followers'],
+    default: 'public',
+    index: true
+  },
+
   isLive: { type: Boolean, default: true },
   lastHeartbeatAt: { type: Date, default: Date.now },
   endedAt: { type: Date, default: null },

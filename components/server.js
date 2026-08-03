@@ -83,6 +83,62 @@ const LUCKY_GIFT_NAMES = new Set([
   'treasure box',
   'neon party',
 ]);
+
+const buildPermanentAudioRoomTitle = (user = {}) => {
+  const name = String(user?.name || '').trim();
+  return name ? `${name}'s Room` : 'My Voice Room';
+};
+
+const ensurePermanentAudioRoomForUser = async (userId) => {
+  if (!mongoose.Types.ObjectId.isValid(userId)) return null;
+
+  const user = await User.findById(userId).select('name profilePic glixId').lean();
+  if (!user) return null;
+
+  let room = await AudioRoom.findOne({
+    hostId: userId,
+    isPermanent: true
+  }).sort({ createdAt: 1 });
+
+  if (!room) {
+    room = await AudioRoom.create({
+      title: buildPermanentAudioRoomTitle(user),
+      hostId: userId,
+      speakers: [],
+      audience: [],
+      lockedSlots: [3, 12, 19],
+      isPermanent: true,
+      visibility: 'followers',
+      isLive: false,
+      endedAt: null,
+      lastHeartbeatAt: new Date()
+    });
+  }
+
+  return room;
+};
+
+const serializePermanentAudioRoom = (room = {}) => {
+  const host = room.hostId || {};
+  const roomId = room._id?.toString?.() || String(room._id || '');
+
+  return {
+    id: roomId,
+    _id: roomId,
+    roomId,
+    roomMode: 'audio',
+    title: room.title || buildPermanentAudioRoomTitle(host),
+    hostId: host?._id?.toString?.() || room.hostId?.toString?.() || '',
+    host: host?._id ? host : null,
+    isPermanent: true,
+    visibility: room.visibility || 'followers',
+    isLive: !!room.isLive,
+    speakerCount: Array.isArray(room.speakers) ? room.speakers.length : 0,
+    audienceCount: Array.isArray(room.audience) ? room.audience.length : 0,
+    createdAt: room.createdAt,
+    lastHeartbeatAt: room.lastHeartbeatAt,
+  };
+};
 const LUCKY_GIFT_RETURN_CHANCE_PERCENT = Math.min(100, Math.max(0, Number(process.env.LUCKY_GIFT_RETURN_CHANCE_PERCENT || 10)));
 const LUCKY_GIFT_REWARD_MULTIPLIER = Math.max(0, Number(process.env.LUCKY_GIFT_REWARD_MULTIPLIER || 1));
 const LEVEL_LAKH_REQUIREMENTS = [
@@ -3349,19 +3405,31 @@ app.post('/join', async (req, res) => {
       if (!mongoose.Types.ObjectId.isValid(stringRoomId)) return res.status(400).json({ error: "Invalid Room ID format" });
       roomObj = await AudioRoom.findById(stringRoomId);
       if (!roomObj) return res.status(404).json({ error: "Audio room not found" });
-      if (!roomObj.isLive) return res.status(400).json({ error: "This room has already ended" });
+      if (!roomObj.isLive && !roomObj.isPermanent) return res.status(400).json({ error: "This room has already ended" });
+      if (!roomObj.isLive && roomObj.isPermanent) {
+        roomObj.isLive = true;
+        roomObj.endedAt = null;
+      }
 
       const currentSpeakers = Array.isArray(roomObj.speakers) ? roomObj.speakers : [];
       const currentAudience = Array.isArray(roomObj.audience) ? roomObj.audience : [];
       const validSpeakers = currentSpeakers.filter(s => s && s.userId);
       const validAudience = currentAudience.filter(Boolean);
+      const isRoomOwner = String(roomObj.hostId) === String(userId);
       const existingSpeakerIndex = validSpeakers.findIndex(s => String(s.userId) === String(userId));
       const isAlreadySpeaker = existingSpeakerIndex !== -1;
       roomObj.speakers = validSpeakers;
       roomObj.audience = validAudience.filter(id => String(id) !== String(userId));
       roomObj.lastHeartbeatAt = new Date();
 
-      if (isAlreadySpeaker) {
+      if (isRoomOwner) {
+        const nonOwnerSpeakers = roomObj.speakers.filter(s => String(s.userId) !== String(userId));
+        roomObj.speakers = [
+          { userId, isMuted: false, slotIndex: 0, numericUid: sanitizedUid },
+          ...nonOwnerSpeakers
+        ];
+        userRole = RtcRole.PUBLISHER;
+      } else if (isAlreadySpeaker) {
         roomObj.speakers[existingSpeakerIndex].numericUid = sanitizedUid;
         userRole = RtcRole.PUBLISHER;
       } else {
@@ -3389,7 +3457,15 @@ app.post('/join', async (req, res) => {
       room: {
         hostId: roomObj.hostId,
         _id: roomObj._id.toString(),
-        channelName
+        channelName,
+        title: roomObj.title,
+        micSeatCount: roomObj.micSeatCount,
+        micLayoutType: roomObj.micLayoutType,
+        backgroundThemeId: roomObj.backgroundThemeId,
+        backgroundThemeUrl: roomObj.backgroundThemeUrl,
+        isPermanent: !!roomObj.isPermanent,
+        visibility: roomObj.visibility || 'public',
+        isLive: !!roomObj.isLive
       },
       agoraToken: token,
       channelName,
@@ -3725,6 +3801,50 @@ app.get('/rooms/:roomId', async (req, res) => {
   }
 });
 
+app.get('/permanent-rooms/mine/:userId', async (req, res) => {
+  try {
+    const { userId } = req.params;
+    if (!mongoose.Types.ObjectId.isValid(userId)) {
+      return res.status(400).json({ success: false, message: 'Invalid user id' });
+    }
+
+    await closeStaleLiveRooms();
+    await ensurePermanentAudioRoomForUser(userId);
+
+    const followingRows = await Follow.find({ followerId: userId }).select('followingId').lean();
+    const followingIds = followingRows
+      .map(row => row.followingId?.toString?.() || String(row.followingId || ''))
+      .filter(id => mongoose.Types.ObjectId.isValid(id));
+
+    await Promise.all(followingIds.map(id => ensurePermanentAudioRoomForUser(id)));
+
+    const [myRoom, followingRooms] = await Promise.all([
+      AudioRoom.findOne({ hostId: userId, isPermanent: true })
+        .populate('hostId', 'name profilePic username glixId')
+        .sort({ createdAt: 1 })
+        .lean(),
+      followingIds.length
+        ? AudioRoom.find({
+          hostId: { $in: followingIds },
+          isPermanent: true,
+          visibility: 'followers'
+        })
+          .populate('hostId', 'name profilePic username glixId')
+          .sort({ isLive: -1, lastHeartbeatAt: -1, createdAt: -1 })
+          .lean()
+        : Promise.resolve([])
+    ]);
+
+    return res.status(200).json({
+      success: true,
+      myRoom: myRoom ? serializePermanentAudioRoom(myRoom) : null,
+      followingRooms: followingRooms.map(serializePermanentAudioRoom)
+    });
+  } catch (error) {
+    return res.status(500).json({ success: false, message: error.message });
+  }
+});
+
 app.get('/live-rooms', async (req, res) => {
   try {
     await closeStaleLiveRooms();
@@ -3760,6 +3880,8 @@ app.get('/live-rooms', async (req, res) => {
       title: room.title || 'Live Audio Room',
       hostId: room.hostId?._id?.toString?.() || room.hostId?.toString?.() || '',
       host: room.hostId || null,
+      isPermanent: !!room.isPermanent,
+      visibility: room.visibility || 'public',
       speakerCount: Array.isArray(room.speakers) ? room.speakers.length : 0,
       audienceCount: Array.isArray(room.audience) ? room.audience.length : 0,
       createdAt: room.createdAt,
@@ -3849,6 +3971,7 @@ app.post('/register', async (req, res) => {
       }
       user.lastLogin = new Date();
       await user.save();
+      await ensurePermanentAudioRoomForUser(user._id);
       const token = await createOfficialSession(user._id);
       return res.status(200).json({
         success: true,
@@ -3869,6 +3992,7 @@ app.post('/register', async (req, res) => {
       glixId: await createUniqueUserPublicId()
     });
     await newUser.save();
+    await ensurePermanentAudioRoomForUser(newUser._id);
     const token = await createOfficialSession(newUser._id);
     return res.status(201).json({
       success: true,
