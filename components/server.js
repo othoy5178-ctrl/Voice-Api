@@ -33,6 +33,8 @@ import RoomMusicTrack from "./RoomMusicTrack.js";
 import DiamondExchange from "./DiamondExchange.js";
 import CoinBag from "./CoinBag.js";
 import CoinBagClaim from "./CoinBagClaim.js";
+import CustomRoomTheme from "./CustomRoomTheme.js";
+import { ROOM_BACKGROUND_THEMES } from "./roomBackgroundThemes.js";
 import cloudinary from "./utils/cloudinary.js";
 
 const { RtcTokenBuilder, RtcRole } = pkg;
@@ -73,6 +75,8 @@ const COIN_BAG_ALLOWED_AMOUNTS = [10000, 30000, 50000, 100000];
 const COIN_BAG_ALLOWED_CLAIM_LIMITS = [10, 20, 50];
 const COIN_BAG_PLATFORM_FEE_RATE = 0.03;
 const COIN_BAG_ACTIVE_MS = 10000;
+const CUSTOM_ROOM_THEME_PRICE_COINS = 50000;
+const CUSTOM_ROOM_THEME_DURATION_DAYS = 30;
 const GIFT_QUANTITY_OPTIONS = [1, 5, 10, 20, 50, 100];
 const LUCKY_GIFT_NAMES = new Set([
   'love burst',
@@ -1779,7 +1783,7 @@ io.on('connection', (socket) => {
       const nextSeatCount = [5, 10, 15, 24].includes(Number(micSeatCount)) ? Number(micSeatCount) : 15;
       const nextLayoutType = ['chatroom', 'dating', 'party', 'birthday'].includes(micLayoutType) ? micLayoutType : 'chatroom';
       const nextBackgroundThemeId = backgroundThemeId ? String(backgroundThemeId) : null;
-      const nextBackgroundThemeUrl = backgroundThemeUrl ? String(backgroundThemeUrl) : null;
+      let nextBackgroundThemeUrl = backgroundThemeUrl ? String(backgroundThemeUrl) : null;
 
       const audioRoom = await AudioRoom.findById(stringRoomId).populate('speakers.userId', 'name profilePic');
       if (!audioRoom) {
@@ -1797,6 +1801,27 @@ io.on('connection', (socket) => {
       if (hasOccupiedOutsideLayout) {
         socket.emit('error_notice', { message: 'Please clear higher mic slots before reducing seats.' });
         return;
+      }
+
+      if (nextBackgroundThemeId?.startsWith('custom-theme-')) {
+        const customThemeId = nextBackgroundThemeId.replace(/^custom-theme-/, '');
+        if (!mongoose.Types.ObjectId.isValid(customThemeId)) {
+          socket.emit('error_notice', { message: 'Invalid custom room theme.' });
+          return;
+        }
+
+        const customTheme = await CustomRoomTheme.findOne({
+          _id: customThemeId,
+          userId: requesterId,
+          status: 'approved',
+          expiresAt: { $gt: new Date() },
+        }).lean();
+
+        if (!customTheme) {
+          socket.emit('error_notice', { message: 'This custom room theme is not approved or has expired.' });
+          return;
+        }
+        nextBackgroundThemeUrl = customTheme.imageUrl;
       }
 
       audioRoom.micSeatCount = nextSeatCount;
@@ -4136,6 +4161,14 @@ app.get('/store/items', async (req, res) => {
   }
 });
 
+app.get('/room/background-themes', (req, res) => {
+  const themes = ROOM_BACKGROUND_THEMES
+    .filter(theme => theme?.id && theme?.url)
+    .sort((a, b) => Number(a.sortOrder || 0) - Number(b.sortOrder || 0));
+
+  return res.status(200).json({ success: true, themes });
+});
+
 app.get('/store/wallet/:userId', async (req, res) => {
   try {
     const { userId } = req.params;
@@ -5210,6 +5243,135 @@ const getAuthenticatedAppUser = async (req) => {
   return user;
 };
 
+const requireAppUser = async (req, res, next) => {
+  try {
+    const user = await getAuthenticatedAppUser(req);
+    if (!user) return res.status(401).json({ success: false, message: 'Please login again.' });
+    if ((user.accountStatus || 'active') !== 'active') {
+      return res.status(403).json({ success: false, message: `Your account is ${user.accountStatus}` });
+    }
+    req.authUser = user;
+    next();
+  } catch (error) {
+    return res.status(401).json({ success: false, message: error.message || 'Auth failed' });
+  }
+};
+
+const serializeCustomRoomTheme = (theme) => {
+  const plain = typeof theme?.toObject === 'function' ? theme.toObject() : theme;
+  if (!plain) return null;
+
+  const now = new Date();
+  const isExpired = plain.status === 'approved' && plain.expiresAt && new Date(plain.expiresAt) <= now;
+
+  return {
+    _id: plain._id?.toString?.() || String(plain._id || ''),
+    id: `custom-theme-${plain._id?.toString?.() || String(plain._id || '')}`,
+    label: 'Mine',
+    url: plain.imageUrl || '',
+    imageUrl: plain.imageUrl || '',
+    thumbnailUrl: plain.thumbnailUrl || plain.imageUrl || '',
+    status: isExpired ? 'expired' : plain.status,
+    priceCoins: plain.priceCoins || CUSTOM_ROOM_THEME_PRICE_COINS,
+    expiresAt: plain.expiresAt || null,
+    rejectionReason: plain.rejectionReason || '',
+    createdAt: plain.createdAt || null,
+    approvedAt: plain.approvedAt || null,
+    isCustom: true,
+  };
+};
+
+const uploadCustomRoomThemeImage = async (userId, image) => {
+  if (!image?.base64) throw new Error('Theme image is required.');
+  const mimeType = image.type || image.mime || 'image/jpeg';
+  const dataUri = String(image.base64).startsWith('data:')
+    ? image.base64
+    : `data:${mimeType};base64,${image.base64}`;
+
+  const result = await cloudinary.uploader.upload(dataUri, {
+    folder: `room-themes/custom/${userId}`,
+    public_id: `theme-${Date.now()}`,
+    resource_type: 'image',
+    transformation: [
+      { width: 1080, height: 1920, crop: 'fill', gravity: 'auto', quality: 'auto', fetch_format: 'auto' },
+    ],
+  });
+
+  return {
+    imageUrl: result.secure_url || '',
+    thumbnailUrl: result.secure_url
+      ? result.secure_url.replace('/image/upload/', '/image/upload/w_320,h_568,c_fill,q_auto,f_auto/')
+      : '',
+    publicId: result.public_id || '',
+  };
+};
+
+const markExpiredCustomRoomThemes = () => (
+  CustomRoomTheme.updateMany(
+    { status: 'approved', expiresAt: { $lte: new Date() } },
+    { $set: { status: 'expired' } }
+  ).catch(error => console.log('Custom room theme expiry update failed:', error))
+);
+
+app.get('/room-themes/my', requireAppUser, async (req, res) => {
+  try {
+    await markExpiredCustomRoomThemes();
+    const themes = await CustomRoomTheme.find({ userId: req.authUser._id })
+      .sort({ createdAt: -1 })
+      .lean();
+    return res.json({ success: true, themes: themes.map(serializeCustomRoomTheme).filter(Boolean) });
+  } catch (error) {
+    return res.status(500).json({ success: false, message: error.message || 'Unable to load your themes.' });
+  }
+});
+
+app.post('/room-themes/request', requireAppUser, async (req, res) => {
+  let deductedUserId = null;
+  try {
+    const activePendingCount = await CustomRoomTheme.countDocuments({
+      userId: req.authUser._id,
+      status: { $in: ['pending', 'approved'] },
+      $or: [{ expiresAt: null }, { expiresAt: { $gt: new Date() } }],
+    });
+    if (activePendingCount >= 5) {
+      return res.status(400).json({ success: false, message: 'You can have up to 5 pending or active custom themes.' });
+    }
+
+    const uploaded = await uploadCustomRoomThemeImage(req.authUser._id, req.body?.image || req.body);
+    const chargedUser = await User.findOneAndUpdate(
+      { _id: req.authUser._id, chang: { $gte: CUSTOM_ROOM_THEME_PRICE_COINS } },
+      { $inc: { chang: -CUSTOM_ROOM_THEME_PRICE_COINS } },
+      { new: true }
+    ).select('chang');
+
+    if (!chargedUser) {
+      return res.status(400).json({ success: false, message: `You need ${CUSTOM_ROOM_THEME_PRICE_COINS} coins to request a custom room theme.` });
+    }
+    deductedUserId = req.authUser._id;
+
+    const theme = await CustomRoomTheme.create({
+      userId: req.authUser._id,
+      imageUrl: uploaded.imageUrl,
+      thumbnailUrl: uploaded.thumbnailUrl,
+      publicId: uploaded.publicId,
+      status: 'pending',
+      priceCoins: CUSTOM_ROOM_THEME_PRICE_COINS,
+    });
+
+    return res.status(201).json({
+      success: true,
+      message: 'Theme request submitted for official approval.',
+      theme: serializeCustomRoomTheme(theme),
+      balance: chargedUser.chang || 0,
+    });
+  } catch (error) {
+    if (deductedUserId) {
+      User.findByIdAndUpdate(deductedUserId, { $inc: { chang: CUSTOM_ROOM_THEME_PRICE_COINS } }).catch(() => {});
+    }
+    return res.status(500).json({ success: false, message: error.message || 'Unable to request custom room theme.' });
+  }
+});
+
 app.get('/admin/rooms/resolve/:roomId', requireOfficial, async (req, res) => {
   try {
     await closeStaleLiveRooms();
@@ -5719,13 +5881,14 @@ app.get('/admin/dashboard', requireOfficial, async (req, res) => {
     await closeStaleLiveRooms();
     const weekStart = new Date();
     weekStart.setDate(weekStart.getDate() - 7);
-    const [totalUsers, activeUsers, suspendedUsers, pendingHosts, pendingAgencies, pendingWithdrawals, liveAudioRooms, liveVideoRooms, weeklyGiftAgg] = await Promise.all([
+    const [totalUsers, activeUsers, suspendedUsers, pendingHosts, pendingAgencies, pendingWithdrawals, pendingRoomThemes, liveAudioRooms, liveVideoRooms, weeklyGiftAgg] = await Promise.all([
       User.countDocuments({}),
       User.countDocuments({ accountStatus: 'active' }),
       User.countDocuments({ accountStatus: { $in: ['suspended', 'banned'] } }),
       User.countDocuments({ hostStatus: 'pending' }),
       User.countDocuments({ agencyStatus: 'pending' }),
       Withdrawal.countDocuments({ status: 'pending' }),
+      CustomRoomTheme.countDocuments({ status: 'pending' }),
       AudioRoom.countDocuments({ isLive: true, lastHeartbeatAt: { $gte: getLiveRoomFreshCutoff() } }),
       Room.countDocuments({ lastHeartbeatAt: { $gte: getLiveRoomFreshCutoff() } }),
       GiftTransaction.aggregate([
@@ -5743,6 +5906,7 @@ app.get('/admin/dashboard', requireOfficial, async (req, res) => {
         pendingHosts,
         pendingAgencies,
         pendingWithdrawals,
+        pendingRoomThemes,
         liveRooms: liveAudioRooms + liveVideoRooms,
         liveAudioRooms,
         liveVideoRooms,
@@ -5752,6 +5916,83 @@ app.get('/admin/dashboard', requireOfficial, async (req, res) => {
     });
   } catch (error) {
     return res.status(500).json({ success: false, message: error.message });
+  }
+});
+
+app.get('/admin/room-themes/requests', requireOfficial, async (req, res) => {
+  try {
+    await markExpiredCustomRoomThemes();
+    const status = String(req.query.status || 'pending').trim();
+    const query = status && status !== 'all' ? { status } : {};
+    const themes = await CustomRoomTheme.find(query)
+      .populate('userId', 'name email glixId profilePic chang')
+      .populate('approvedBy', 'name email role')
+      .sort({ createdAt: -1 })
+      .limit(200)
+      .lean();
+
+    return res.json({
+      success: true,
+      requests: themes.map(theme => ({
+        ...serializeCustomRoomTheme(theme),
+        user: theme.userId ? {
+          _id: theme.userId._id,
+          name: theme.userId.name,
+          email: theme.userId.email,
+          glixId: theme.userId.glixId,
+          profilePic: theme.userId.profilePic,
+          chang: theme.userId.chang,
+        } : null,
+        approvedBy: theme.approvedBy || null,
+      })),
+    });
+  } catch (error) {
+    return res.status(500).json({ success: false, message: error.message || 'Unable to load room theme requests.' });
+  }
+});
+
+app.patch('/admin/room-themes/requests/:themeId', requireOfficial, async (req, res) => {
+  try {
+    const themeId = String(req.params.themeId || '').replace(/^custom-theme-/, '');
+    if (!mongoose.Types.ObjectId.isValid(themeId)) {
+      return res.status(400).json({ success: false, message: 'Invalid theme id.' });
+    }
+
+    const status = ['approved', 'rejected'].includes(req.body?.status) ? req.body.status : '';
+    const reason = String(req.body?.reason || req.body?.rejectionReason || '').trim();
+    if (!status) return res.status(400).json({ success: false, message: 'Invalid review status.' });
+
+    const theme = await CustomRoomTheme.findById(themeId);
+    if (!theme) return res.status(404).json({ success: false, message: 'Theme request not found.' });
+    if (theme.status !== 'pending') {
+      return res.status(400).json({ success: false, message: `Theme request is already ${theme.status}.` });
+    }
+
+    if (status === 'approved') {
+      theme.status = 'approved';
+      theme.approvedAt = new Date();
+      theme.approvedBy = req.officialUser._id;
+      theme.expiresAt = new Date(Date.now() + CUSTOM_ROOM_THEME_DURATION_DAYS * 24 * 60 * 60 * 1000);
+      theme.rejectionReason = '';
+    } else {
+      theme.status = 'rejected';
+      theme.rejectionReason = reason || 'Rejected by Official Portal.';
+      theme.approvedBy = req.officialUser._id;
+      theme.approvedAt = new Date();
+      theme.expiresAt = null;
+      if (!theme.refundedAt) {
+        await User.findByIdAndUpdate(theme.userId, { $inc: { chang: theme.priceCoins || CUSTOM_ROOM_THEME_PRICE_COINS } });
+        theme.refundedAt = new Date();
+      }
+    }
+
+    await theme.save();
+    const populated = await CustomRoomTheme.findById(theme._id)
+      .populate('userId', 'name email glixId profilePic chang')
+      .lean();
+    return res.json({ success: true, request: serializeCustomRoomTheme(populated) });
+  } catch (error) {
+    return res.status(500).json({ success: false, message: error.message || 'Unable to review theme request.' });
   }
 });
 
