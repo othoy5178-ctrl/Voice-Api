@@ -1880,6 +1880,44 @@ io.on('connection', (socket) => {
     });
   });
 
+  socket.on('clear_room_chat', async ({ roomId, requesterId, roomMode }) => {
+    try {
+      const stringRoomId = roomId ? roomId.toString() : '';
+      const stringRequesterId = requesterId ? requesterId.toString() : '';
+      if (!stringRoomId || !stringRequesterId) {
+        socket.emit('error_notice', { message: 'Unable to clean chat right now.' });
+        return;
+      }
+
+      let hostId = '';
+      if (roomMode === 'audio' && mongoose.Types.ObjectId.isValid(stringRoomId)) {
+        const audioRoom = await AudioRoom.findById(stringRoomId).select('hostId').lean();
+        hostId = audioRoom?.hostId?.toString?.() || '';
+      } else {
+        const videoQuery = mongoose.Types.ObjectId.isValid(stringRoomId)
+          ? { $or: [{ _id: stringRoomId }, { channelName: stringRoomId }] }
+          : { channelName: stringRoomId };
+        const videoRoom = await Room.findOne(videoQuery).select('hostId channelName').lean();
+        hostId = videoRoom?.hostId?.toString?.() || '';
+      }
+
+      if (!hostId || String(hostId) !== String(stringRequesterId)) {
+        socket.emit('error_notice', { message: 'Only the host can clean room chat.' });
+        return;
+      }
+
+      io.to(stringRoomId).emit('room_chat_cleared', {
+        roomId: stringRoomId,
+        clearedBy: stringRequesterId,
+        roomMode: roomMode || 'room',
+        clearedAt: new Date().toISOString(),
+      });
+    } catch (error) {
+      console.log('Clear room chat error:', error);
+      socket.emit('error_notice', { message: 'Failed to clean room chat.' });
+    }
+  });
+
   socket.on('send_expressive_emoji', (payload = {}) => {
     const stringRoomId = payload.roomId ? payload.roomId.toString() : '';
     const emoji = String(payload.emoji || payload.text || '').trim();
