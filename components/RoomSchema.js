@@ -22,6 +22,15 @@ const RoomSchema = new mongoose.Schema({
   lastHeartbeatAt: { type: Date, default: Date.now },
   endedAt: { type: Date, default: null },
   createdAt: { type: Date, default: Date.now },
+  coverUrl: { type: String, default: '' },
+  description: { type: String, default: '' },
+  announcement: { type: String, default: '' },
+  welcomeMessage: { type: String, default: '' },
+  roomTag: { type: String, default: '' },
+  roomPassword: { type: String, default: '' },
+  automaticSeatInvitation: { type: Boolean, default: true },
+  enablePublicChat: { type: Boolean, default: true },
+  autoEmojiEnabled: { type: Boolean, default: false },
   slots: [SlotSchema] // Uses the sub-schema defined above
 });
 

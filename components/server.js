@@ -88,6 +88,96 @@ const LUCKY_GIFT_NAMES = new Set([
   'neon party',
 ]);
 
+const ROOM_SETTING_STRING_FIELDS = [
+  'title',
+  'coverUrl',
+  'description',
+  'announcement',
+  'welcomeMessage',
+  'roomTag',
+  'roomPassword',
+];
+const ROOM_SETTING_BOOLEAN_FIELDS = [
+  'automaticSeatInvitation',
+  'enablePublicChat',
+  'autoEmojiEnabled',
+];
+
+const serializeRoomSettings = (room = {}) => ({
+  title: room.title || '',
+  coverUrl: room.coverUrl || '',
+  description: room.description || '',
+  announcement: room.announcement || '',
+  welcomeMessage: room.welcomeMessage || '',
+  roomTag: room.roomTag || '',
+  hasPassword: !!room.roomPassword,
+  automaticSeatInvitation: room.automaticSeatInvitation !== false,
+  enablePublicChat: room.enablePublicChat !== false,
+  autoEmojiEnabled: !!room.autoEmojiEnabled,
+});
+
+const buildRoomSettingsUpdate = (body = {}) => {
+  const updates = {};
+
+  ROOM_SETTING_STRING_FIELDS.forEach((field) => {
+    if (Object.prototype.hasOwnProperty.call(body, field)) {
+      const maxLength = field === 'title' ? 40 : field === 'roomPassword' ? 24 : 240;
+      updates[field] = String(body[field] ?? '').trim().slice(0, maxLength);
+    }
+  });
+
+  ROOM_SETTING_BOOLEAN_FIELDS.forEach((field) => {
+    if (Object.prototype.hasOwnProperty.call(body, field)) {
+      updates[field] = !!body[field];
+    }
+  });
+
+  if (updates.title === '') delete updates.title;
+  return updates;
+};
+
+const roomPasswordMatches = (room = {}, incomingPassword = '') => {
+  const savedPassword = String(room?.roomPassword || '').trim();
+  if (!savedPassword) return true;
+  return String(incomingPassword || '').trim() === savedPassword;
+};
+
+const findRoomForSettings = async (roomId) => {
+  const stringRoomId = roomId ? roomId.toString() : '';
+  if (!stringRoomId) return { room: null, roomMode: '', socketRoomId: '' };
+
+  if (mongoose.Types.ObjectId.isValid(stringRoomId)) {
+    const audioRoom = await AudioRoom.findById(stringRoomId);
+    if (audioRoom) return { room: audioRoom, roomMode: 'audio', socketRoomId: audioRoom._id.toString() };
+
+    const videoById = await Room.findById(stringRoomId);
+    if (videoById) return { room: videoById, roomMode: 'video', socketRoomId: videoById.channelName };
+  }
+
+  const videoRoom = await Room.findOne({ channelName: stringRoomId });
+  if (videoRoom) return { room: videoRoom, roomMode: 'video', socketRoomId: videoRoom.channelName };
+
+  return { room: null, roomMode: '', socketRoomId: '' };
+};
+
+const uploadRoomCoverAsset = async (dataUri, roomId = 'room') => {
+  const cleanDataUri = String(dataUri || '').trim();
+  if (!cleanDataUri.startsWith('data:image/')) {
+    throw new Error('Invalid room cover image.');
+  }
+
+  const result = await cloudinary.uploader.upload(cleanDataUri, {
+    folder: `room-covers/${roomId}`,
+    resource_type: 'image',
+    overwrite: false,
+    transformation: [
+      { width: 1200, height: 680, crop: 'fill', gravity: 'auto', quality: 'auto', fetch_format: 'auto' }
+    ],
+  });
+
+  return result.secure_url;
+};
+
 const buildPermanentAudioRoomTitle = (user = {}) => {
   const name = String(user?.name || '').trim();
   return name ? `${name}'s Room` : 'My Voice Room';
@@ -2887,7 +2977,9 @@ app.post('/create-video', async (req, res) => {
       room: {
         hostId: newRoom.hostId,
         _id: newRoom._id.toString(),
-        channelName: uniqueChannelName
+        channelName: uniqueChannelName,
+        title: newRoom.title,
+        settings: serializeRoomSettings(newRoom)
       },
       channelName: uniqueChannelName,
       agoraToken: token,
@@ -3435,7 +3527,7 @@ app.post('/create', async (req, res) => {
 
 app.post('/join', async (req, res) => {
   try {
-    const { roomId, userId, numericUid } = req.body;
+    const { roomId, userId, numericUid, roomPassword } = req.body;
     if (!roomId || !userId || !numericUid) return res.status(400).json({ error: "Missing required fields" });
 
     const sanitizedUid = parseInt(numericUid, 10) || 0;
@@ -3456,6 +3548,10 @@ app.post('/join', async (req, res) => {
     if (videoFilter) {
       roomObj = await Room.findOne(videoFilter);
       if (roomObj) {
+        if (String(roomObj.hostId) !== String(userId) && !roomPasswordMatches(roomObj, roomPassword)) {
+          return res.status(403).json({ success: false, requiresPassword: true, message: 'Room password is required.' });
+        }
+
         isVideoRoom = true;
         channelName = roomObj.channelName;
         await Room.findByIdAndUpdate(roomObj._id, {
@@ -3468,6 +3564,9 @@ app.post('/join', async (req, res) => {
       if (!mongoose.Types.ObjectId.isValid(stringRoomId)) return res.status(400).json({ error: "Invalid Room ID format" });
       roomObj = await AudioRoom.findById(stringRoomId);
       if (!roomObj) return res.status(404).json({ error: "Audio room not found" });
+      if (String(roomObj.hostId) !== String(userId) && !roomPasswordMatches(roomObj, roomPassword)) {
+        return res.status(403).json({ success: false, requiresPassword: true, message: 'Room password is required.' });
+      }
       if (!roomObj.isLive && !roomObj.isPermanent) return res.status(400).json({ error: "This room has already ended" });
       if (!roomObj.isLive && roomObj.isPermanent) {
         roomObj.isLive = true;
@@ -3526,6 +3625,7 @@ app.post('/join', async (req, res) => {
         micLayoutType: roomObj.micLayoutType,
         backgroundThemeId: roomObj.backgroundThemeId,
         backgroundThemeUrl: roomObj.backgroundThemeUrl,
+        settings: serializeRoomSettings(roomObj),
         isPermanent: !!roomObj.isPermanent,
         visibility: roomObj.visibility || 'public',
         isLive: !!roomObj.isLive
@@ -3847,6 +3947,57 @@ app.get(['/room/:roomId', '/r/:roomId'], async (req, res) => {
   }
 });
 
+app.get('/rooms/:roomId/settings', async (req, res) => {
+  try {
+    const { room, roomMode } = await findRoomForSettings(req.params.roomId);
+    if (!room) return res.status(404).json({ success: false, message: 'Room not found' });
+
+    return res.json({
+      success: true,
+      roomMode,
+      settings: serializeRoomSettings(room),
+    });
+  } catch (error) {
+    return res.status(500).json({ success: false, message: error.message });
+  }
+});
+
+app.patch('/rooms/:roomId/settings', async (req, res) => {
+  try {
+    const requesterId = req.body?.requesterId?.toString?.() || String(req.body?.requesterId || '');
+    const { room, roomMode, socketRoomId } = await findRoomForSettings(req.params.roomId);
+    if (!room) return res.status(404).json({ success: false, message: 'Room not found' });
+
+    const hostId = room.hostId?.toString?.() || String(room.hostId || '');
+    if (!requesterId || requesterId !== hostId) {
+      return res.status(403).json({ success: false, message: 'Only the room host can update room settings.' });
+    }
+
+    const updates = buildRoomSettingsUpdate(req.body);
+    if (req.body?.coverData) {
+      updates.coverUrl = await uploadRoomCoverAsset(req.body.coverData, socketRoomId || room._id?.toString?.() || 'room');
+    }
+
+    if (!Object.keys(updates).length) {
+      return res.status(400).json({ success: false, message: 'No room setting changes received.' });
+    }
+
+    Object.assign(room, updates);
+    await room.save();
+
+    const settings = serializeRoomSettings(room);
+    io.to(socketRoomId).emit('room_settings_updated', {
+      roomId: socketRoomId,
+      roomMode,
+      settings,
+    });
+
+    return res.json({ success: true, roomMode, settings });
+  } catch (error) {
+    return res.status(500).json({ success: false, message: error.message });
+  }
+});
+
 app.get('/rooms/:roomId', async (req, res) => {
   try {
     const { roomId } = req.params;
@@ -3941,6 +4092,11 @@ app.get('/live-rooms', async (req, res) => {
       roomId: room._id?.toString?.() || String(room._id),
       roomMode: 'audio',
       title: room.title || 'Live Audio Room',
+      hasPassword: !!room.roomPassword,
+      coverUrl: room.coverUrl || '',
+      roomTag: room.roomTag || '',
+      description: room.description || '',
+      announcement: room.announcement || '',
       hostId: room.hostId?._id?.toString?.() || room.hostId?.toString?.() || '',
       host: room.hostId || null,
       isPermanent: !!room.isPermanent,
@@ -3965,6 +4121,11 @@ app.get('/live-rooms', async (req, res) => {
         channelName: room.channelName,
         roomMode: 'video',
         title: room.title || 'Glix Live Room',
+        hasPassword: !!room.roomPassword,
+        coverUrl: room.coverUrl || '',
+        roomTag: room.roomTag || '',
+        description: room.description || '',
+        announcement: room.announcement || '',
         hostId,
         host,
         slots,
@@ -4009,6 +4170,9 @@ app.get('/rooms', async (req, res) => {
       roomId: room._id,
       roomMode: 'audio',
       title: room.title,
+      hasPassword: !!room.roomPassword,
+      coverUrl: room.coverUrl || '',
+      roomTag: room.roomTag || '',
       host: room.hostId,
       hostId: room.hostId?._id || room.hostId,
       speakerCount: room.speakers.length,

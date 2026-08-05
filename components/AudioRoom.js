@@ -29,6 +29,15 @@ const audioRoomSchema = new mongoose.Schema({
   backgroundThemeId: { type: String, default: null },
   backgroundThemeUrl: { type: String, default: null },
   lockedSlots: [{ type: Number }],
+  coverUrl: { type: String, default: '' },
+  description: { type: String, default: '' },
+  announcement: { type: String, default: '' },
+  welcomeMessage: { type: String, default: '' },
+  roomTag: { type: String, default: '' },
+  roomPassword: { type: String, default: '' },
+  automaticSeatInvitation: { type: Boolean, default: true },
+  enablePublicChat: { type: Boolean, default: true },
+  autoEmojiEnabled: { type: Boolean, default: false },
 
   isPermanent: { type: Boolean, default: false, index: true },
   visibility: {
