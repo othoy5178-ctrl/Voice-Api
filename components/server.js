@@ -2035,7 +2035,7 @@ io.on('connection', (socket) => {
     });
   });
 
-  socket.on('send_gift', async ({ roomId, senderName, hostId, gift, giftThumbnail, giftName, avatar, userId, quantity, coins, receiverIds = [], isLuckyGift: clientIsLuckyGift = false }) => {
+  socket.on('send_gift', async ({ roomId, senderName, hostId, giftId, gift, giftAnimationUrl, giftThumbnail, giftMediaType, giftName, avatar, userId, quantity, coins, receiverIds = [], isLuckyGift: clientIsLuckyGift = false }) => {
 
     console.log('gift data:', userId, roomId, hostId, coins, receiverIds);
 
@@ -2075,7 +2075,20 @@ io.on('connection', (socket) => {
       return;
     }
 
-    const coinPrice = Number(coins);
+    let catalogGift = null;
+    if (mongoose.Types.ObjectId.isValid(giftId)) {
+      catalogGift = await GiftCatalog.findOne({ _id: giftId, isActive: true }).lean();
+      if (!catalogGift) {
+        socket.emit('gift_error', { message: 'Gift is not available.' });
+        return;
+      }
+    }
+
+    const resolvedGiftName = catalogGift?.name || giftName;
+    const resolvedGiftAnimation = catalogGift?.animationUrl || giftAnimationUrl || gift;
+    const resolvedGiftThumbnail = catalogGift?.thumbnailUrl || giftThumbnail || '';
+    const resolvedGiftMediaType = catalogGift?.mediaType || giftMediaType || detectGiftMediaType(resolvedGiftAnimation);
+    const coinPrice = Number(catalogGift?.price ?? coins);
     let giftQuantity = Math.floor(Number(quantity));
 
     if (!Number.isFinite(coinPrice) || coinPrice <= 0) {
@@ -2099,9 +2112,11 @@ io.on('connection', (socket) => {
     }
     const perReceiverCost = coinPrice * giftQuantity;
     const totalCost = perReceiverCost * normalizedReceiverIds.length;
-    const normalizedGiftName = String(giftName || '').trim().toLowerCase();
-    const isLuckyGiftEligible = LUCKY_GIFT_NAMES.has(normalizedGiftName);
-    const luckyChancePercent = isLuckyGiftEligible ? LUCKY_GIFT_RETURN_CHANCE_PERCENT : 0;
+    const normalizedGiftName = String(resolvedGiftName || '').trim().toLowerCase();
+    const isLuckyGiftEligible = catalogGift ? !!catalogGift.isLuckyGift : LUCKY_GIFT_NAMES.has(normalizedGiftName);
+    const luckyChancePercent = isLuckyGiftEligible
+      ? Number(catalogGift?.luckyReturnChance || LUCKY_GIFT_RETURN_CHANCE_PERCENT)
+      : 0;
     const luckyGiftWon = isLuckyGiftEligible && luckyChancePercent > 0 && Math.random() * 100 < luckyChancePercent;
     const luckyRewardDiamonds = luckyGiftWon ? Math.floor(totalCost * LUCKY_GIFT_REWARD_MULTIPLIER) : 0;
     const luckyGiftResult = {
@@ -2116,7 +2131,7 @@ io.on('connection', (socket) => {
       console.warn('Client marked a non-lucky gift as lucky. Ignoring client flag.', {
         roomId: stringRoomId,
         userId,
-        giftName,
+        giftName: resolvedGiftName,
       });
     }
 
@@ -2181,9 +2196,11 @@ io.on('connection', (socket) => {
           receiverGlixId: receiverById[receiverId]?.glixId || '',
           receiverIds: receiverObjectIds,
           receiverCount: normalizedReceiverIds.length,
-          giftName,
-          giftImage: gift,
-          giftThumbnail: giftThumbnail || '',
+          giftName: resolvedGiftName,
+          giftCatalogId: catalogGift?._id || null,
+          giftImage: resolvedGiftAnimation,
+          giftThumbnail: resolvedGiftThumbnail || '',
+          giftMediaType: resolvedGiftMediaType,
           coinPrice,
           quantity: giftQuantity,
           perReceiverCost,
@@ -2217,9 +2234,12 @@ io.on('connection', (socket) => {
       id: Date.now().toString() + Math.random().toString(),
       type: 'gift',
       sender: senderName,
-      gift,
-      giftThumbnail: giftThumbnail || '',
-      giftName,
+      giftId: catalogGift?._id?.toString?.() || giftId || null,
+      gift: resolvedGiftAnimation,
+      giftAnimationUrl: resolvedGiftAnimation,
+      giftThumbnail: resolvedGiftThumbnail || '',
+      giftMediaType: resolvedGiftMediaType,
+      giftName: resolvedGiftName,
       avatar,
       quantity: giftQuantity,
       coins: coinPrice,
@@ -5422,6 +5442,152 @@ const requireOfficial = async (req, res, next) => {
     return res.status(401).json({ success: false, message: error.message || 'Official auth failed' });
   }
 };
+
+const detectGiftMediaType = (value = '') => {
+  const source = String(value || '').toLowerCase();
+  if (source.includes('video/') || source.endsWith('.mp4') || source.includes('/video/upload/')) return 'mp4';
+  if (source.includes('image/gif') || source.endsWith('.gif')) return 'gif';
+  return 'gif';
+};
+
+const serializeGiftCatalogItem = (gift = {}) => {
+  const id = gift._id?.toString?.() || String(gift._id || '');
+  return {
+    id,
+    _id: id,
+    name: gift.name || 'Gift',
+    category: gift.category || 'Popular',
+    tab: gift.category || 'Popular',
+    price: Number(gift.price || 0),
+    mediaType: gift.mediaType || detectGiftMediaType(gift.animationUrl),
+    animationUrl: gift.animationUrl || '',
+    icon: gift.animationUrl || '',
+    thumbnailUrl: gift.thumbnailUrl || '',
+    thumbnail: gift.thumbnailUrl || '',
+    isLuckyGift: !!gift.isLuckyGift,
+    luckyReturnChance: Number(gift.luckyReturnChance || 0),
+    isActive: gift.isActive !== false,
+    sortOrder: Number(gift.sortOrder || 0),
+    createdAt: gift.createdAt,
+    updatedAt: gift.updatedAt,
+  };
+};
+
+const getCloudinaryVideoThumbnail = (videoUrl = '') => {
+  if (typeof videoUrl !== 'string' || !videoUrl.includes('/video/upload/')) return '';
+  return videoUrl
+    .replace('/video/upload/', '/video/upload/so_0,w_360,h_360,c_fill,q_auto/')
+    .replace(/\.[a-z0-9]+($|\?)/i, '.jpg$1');
+};
+
+const uploadGiftAsset = async (dataUri, folder, resourceType = 'auto') => {
+  const cleanDataUri = typeof dataUri === 'string' ? dataUri.trim() : '';
+  if (!cleanDataUri) return { url: '', publicId: '' };
+
+  const result = await cloudinary.uploader.upload(cleanDataUri, {
+    folder,
+    resource_type: resourceType,
+    overwrite: false,
+  });
+
+  return {
+    url: result.secure_url || result.url || '',
+    publicId: result.public_id || '',
+  };
+};
+
+const getGiftCatalogPayload = async (body = {}, existing = null, officialUserId = null) => {
+  const name = String(body.name ?? existing?.name ?? '').trim();
+  if (!name) throw new Error('Gift name is required.');
+
+  const price = Number(body.price ?? existing?.price ?? 0);
+  if (!Number.isFinite(price) || price <= 0) throw new Error('Gift price must be greater than 0.');
+
+  const mediaType = String(body.mediaType || detectGiftMediaType(body.animationData || body.animationUrl || existing?.animationUrl || '')).toLowerCase() === 'mp4'
+    ? 'mp4'
+    : 'gif';
+
+  const uploadedAnimation = body.animationData
+    ? await uploadGiftAsset(body.animationData, `official-gifts/${mediaType}`, mediaType === 'mp4' ? 'video' : 'image')
+    : { url: '', publicId: '' };
+  const uploadedThumbnail = body.thumbnailData
+    ? await uploadGiftAsset(body.thumbnailData, 'official-gifts/thumbnails', 'image')
+    : { url: '', publicId: '' };
+
+  const animationUrl = uploadedAnimation.url || String(body.animationUrl || existing?.animationUrl || '').trim();
+  if (!animationUrl) throw new Error('Gift animation file or URL is required.');
+
+  const thumbnailUrl = uploadedThumbnail.url ||
+    String(body.thumbnailUrl || existing?.thumbnailUrl || '').trim() ||
+    (mediaType === 'mp4' ? getCloudinaryVideoThumbnail(animationUrl) : animationUrl);
+
+  return {
+    name,
+    price,
+    category: String(body.category ?? existing?.category ?? 'Popular').trim() || 'Popular',
+    mediaType,
+    animationUrl,
+    thumbnailUrl,
+    publicId: uploadedAnimation.publicId || existing?.publicId || '',
+    thumbnailPublicId: uploadedThumbnail.publicId || existing?.thumbnailPublicId || '',
+    isLuckyGift: body.isLuckyGift !== undefined ? !!body.isLuckyGift : !!existing?.isLuckyGift,
+    luckyReturnChance: Number(body.luckyReturnChance ?? existing?.luckyReturnChance ?? 0),
+    isActive: body.isActive !== undefined ? !!body.isActive : existing?.isActive !== false,
+    sortOrder: Number(body.sortOrder ?? existing?.sortOrder ?? 0),
+    uploadedBy: existing?.uploadedBy || officialUserId || null,
+  };
+};
+
+app.get('/gifts', async (req, res) => {
+  try {
+    const gifts = await GiftCatalog.find({ isActive: true })
+      .sort({ sortOrder: 1, createdAt: -1 })
+      .lean();
+    return res.json({ success: true, gifts: gifts.map(serializeGiftCatalogItem) });
+  } catch (error) {
+    return res.status(500).json({ success: false, message: error.message });
+  }
+});
+
+app.get('/admin/gifts', requireOfficial, async (req, res) => {
+  try {
+    const includeInactive = req.query?.includeInactive === 'true';
+    const query = includeInactive ? {} : { isActive: true };
+    const gifts = await GiftCatalog.find(query)
+      .sort({ sortOrder: 1, createdAt: -1 })
+      .lean();
+    return res.json({ success: true, gifts: gifts.map(serializeGiftCatalogItem) });
+  } catch (error) {
+    return res.status(500).json({ success: false, message: error.message });
+  }
+});
+
+app.post('/admin/gifts', requireOfficial, async (req, res) => {
+  try {
+    const payload = await getGiftCatalogPayload(req.body, null, req.officialUser?._id || null);
+    const gift = await GiftCatalog.create(payload);
+    return res.status(201).json({ success: true, gift: serializeGiftCatalogItem(gift) });
+  } catch (error) {
+    return res.status(400).json({ success: false, message: error.message });
+  }
+});
+
+app.patch('/admin/gifts/:giftId', requireOfficial, async (req, res) => {
+  try {
+    if (!mongoose.Types.ObjectId.isValid(req.params.giftId)) {
+      return res.status(400).json({ success: false, message: 'Invalid gift id.' });
+    }
+    const gift = await GiftCatalog.findById(req.params.giftId);
+    if (!gift) return res.status(404).json({ success: false, message: 'Gift not found.' });
+
+    const payload = await getGiftCatalogPayload(req.body, gift, req.officialUser?._id || null);
+    Object.assign(gift, payload);
+    await gift.save();
+    return res.json({ success: true, gift: serializeGiftCatalogItem(gift) });
+  } catch (error) {
+    return res.status(400).json({ success: false, message: error.message });
+  }
+});
 
 const findUserByIdentifier = async (identifier) => {
   const clean = String(identifier || '').trim();
