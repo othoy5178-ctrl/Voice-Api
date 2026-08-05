@@ -14,6 +14,7 @@ import Room from "./RoomSchema.js";
 import DirectMessage from "./DirectMessage.js";
 import Follow from './Follow.js';
 import GiftTransaction from './GiftTransation.js';
+import GiftCatalog from './GiftCatalog.js';
 import RewardActivity from './RewardActivity.js';
 import RewardClaim from './RewardClaim.js';
 import HostLiveRewardClaim from './HostLiveRewardClaim.js';
@@ -3974,6 +3975,9 @@ app.patch('/rooms/:roomId/settings', async (req, res) => {
     }
 
     const updates = buildRoomSettingsUpdate(req.body);
+    if (req.body?.unlockRoom === true) {
+      updates.roomPassword = '';
+    }
     if (req.body?.coverData) {
       updates.coverUrl = await uploadRoomCoverAsset(req.body.coverData, socketRoomId || room._id?.toString?.() || 'room');
     }

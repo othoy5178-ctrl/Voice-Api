@@ -58,10 +58,20 @@ const GiftTransactionSchema = new mongoose.Schema({
   },
 
   giftName: String,
+  giftCatalogId: {
+    type: mongoose.Schema.Types.ObjectId,
+    ref: "GiftCatalog",
+    default: null
+  },
   giftImage: String,
   giftThumbnail: {
     type: String,
     default: ''
+  },
+  giftMediaType: {
+    type: String,
+    enum: ['gif', 'mp4', 'image', 'unknown'],
+    default: 'unknown'
   },
 
   coinPrice: Number,
