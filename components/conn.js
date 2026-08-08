@@ -1,4 +1,4 @@
-import 'dotenv/config'; 
+import 'dotenv/config';
 import mongoose from 'mongoose';
 
 mongoose.set('strictQuery', false);
@@ -26,8 +26,11 @@ async function checkConnection() {
     console.log(`Connection state: ${mongoose.connection.readyState}`);
   } catch (error) {
     console.error(`❌ Mongoose connection error: ${error.message}`);
-    process.exit(1);  
+    process.exit(1);
   }
 }
 
 checkConnection();
+
+
+//before-game-key= 1SD9AUHS8n4m2s1WfmYoqGUmokmokmoDWKpRmzmV-hUfBf-_46IjiojfIM-bwZVSfkjojoijrxdZe8FA5b_I

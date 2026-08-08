@@ -27,6 +27,8 @@ import { getMessaging } from "firebase-admin/messaging";
 import AuthSession from "./AuthSession.js";
 import Withdrawal from "./Withdrawal.js";
 import MonthlyCommission from "./MonthlyCommission.js";
+import DailyCommission from "./DailyCommission.js";
+import AgencyTarget from "./AgencyTarget.js";
 import CoinSellerTransaction from "./CoinSellerTransaction.js";
 import GameCoinTransaction from "./GameCoinTransaction.js";
 import ProfileVisit from "./ProfileVisit.js";
@@ -71,7 +73,9 @@ const roomPresence = {};
 const roomControllers = {};
 const roomKeepOpenRooms = {};
 const roomDisconnectTimers = new Map();
+const roomEmptyAudienceTimers = new Map();
 const ROOM_RECONNECT_GRACE_MS = Number(process.env.ROOM_RECONNECT_GRACE_MS || 60000);
+const KEPT_OPEN_EMPTY_AUDIENCE_GRACE_MS = Number(process.env.KEPT_OPEN_EMPTY_AUDIENCE_GRACE_MS || 30000);
 const COIN_BAG_ALLOWED_AMOUNTS = [10000, 30000, 50000, 100000];
 const COIN_BAG_ALLOWED_CLAIM_LIMITS = [10, 20, 50];
 const COIN_BAG_PLATFORM_FEE_RATE = 0.03;
@@ -79,6 +83,7 @@ const COIN_BAG_ACTIVE_MS = 10000;
 const CUSTOM_ROOM_THEME_PRICE_COINS = 50000;
 const CUSTOM_ROOM_THEME_DURATION_DAYS = 30;
 const GIFT_QUANTITY_OPTIONS = [1, 5, 10, 20, 50, 100];
+const AGENCY_COMMISSION_RATE_PERCENT = Number(process.env.AGENCY_COMMISSION_RATE_PERCENT || 10);
 const LUCKY_GIFT_NAMES = new Set([
   'love burst',
   'dream castle',
@@ -270,6 +275,7 @@ const calculateUserLevelValue = (value = 0) => {
 
 const getStringRoomId = (roomId) => (roomId ? roomId.toString() : '');
 const getRoomDisconnectTimerKey = (roomId, userId) => `${getStringRoomId(roomId)}:${userId?.toString?.() || String(userId || '')}`;
+const getRoomEmptyAudienceTimerKey = (roomId) => getStringRoomId(roomId);
 
 const clearRoomDisconnectTimer = (roomId, userId) => {
   const timerKey = getRoomDisconnectTimerKey(roomId, userId);
@@ -277,6 +283,15 @@ const clearRoomDisconnectTimer = (roomId, userId) => {
   if (!timer) return false;
   clearTimeout(timer);
   roomDisconnectTimers.delete(timerKey);
+  return true;
+};
+
+const clearRoomEmptyAudienceTimer = (roomId) => {
+  const timerKey = getRoomEmptyAudienceTimerKey(roomId);
+  const timer = roomEmptyAudienceTimers.get(timerKey);
+  if (!timer) return false;
+  clearTimeout(timer);
+  roomEmptyAudienceTimers.delete(timerKey);
   return true;
 };
 
@@ -310,6 +325,8 @@ const emitRoomMembers = (roomId) => {
 const upsertRoomPresence = async ({ roomId, userId, socketId, name, profilePic, numericUid = null, role = 'audience' }) => {
   const stringRoomId = getStringRoomId(roomId);
   if (!stringRoomId || !userId) return;
+
+  clearRoomEmptyAudienceTimer(stringRoomId);
 
   const userKey = userId.toString();
   if (!roomPresence[stringRoomId]) roomPresence[stringRoomId] = {};
@@ -389,6 +406,7 @@ const closeKeptOpenAudioRoomIfNoAudience = async (roomId, reason = 'empty_audien
   room.endedAt = new Date();
   await room.save();
 
+  clearRoomEmptyAudienceTimer(stringRoomId);
   delete roomKeepOpenRooms[stringRoomId];
   delete roomControllers[stringRoomId];
   delete roomPresence[stringRoomId];
@@ -400,6 +418,26 @@ const closeKeptOpenAudioRoomIfNoAudience = async (roomId, reason = 'empty_audien
   });
 
   console.log(`Kept-open audio room closed because no audience is left: ${stringRoomId}`);
+  return true;
+};
+
+const scheduleKeptOpenAudioRoomEmptyCheck = (roomId, reason = 'empty_audience') => {
+  const stringRoomId = getStringRoomId(roomId);
+  if (!stringRoomId || stringRoomId.startsWith('glix_') || !roomKeepOpenRooms[stringRoomId]) return false;
+  if (!mongoose.Types.ObjectId.isValid(stringRoomId)) return false;
+
+  clearRoomEmptyAudienceTimer(stringRoomId);
+
+  const timer = setTimeout(async () => {
+    roomEmptyAudienceTimers.delete(stringRoomId);
+    try {
+      await closeKeptOpenAudioRoomIfNoAudience(stringRoomId, reason);
+    } catch (error) {
+      console.log('Delayed kept-open audio room empty check error:', error);
+    }
+  }, KEPT_OPEN_EMPTY_AUDIENCE_GRACE_MS);
+
+  roomEmptyAudienceTimers.set(stringRoomId, timer);
   return true;
 };
 
@@ -1353,7 +1391,7 @@ io.on('connection', (socket) => {
   });
 
   // 2. EVENT: Request Slot Change
-  socket.on('request_slot_change', async ({ roomId, userId, name, profilePic, frameUrl, targetSlotIndex, numericUid, isMuted, cameraOn, locked }) => {
+  socket.on('request_slot_change', async ({ roomId, userId, name, profilePic, frameUrl, targetSlotIndex, numericUid, isMuted, cameraOn, locked, slotLocked }) => {
     try {
 
       let finalFrameUrl = frameUrl;
@@ -1368,8 +1406,19 @@ io.on('connection', (socket) => {
       const isVideoRoom = stringRoomId.startsWith('glix_');
       const normalizedSlotIndex = Number(targetSlotIndex);
       if (!Number.isInteger(normalizedSlotIndex) || normalizedSlotIndex < 0) return;
+      const isLockOnlyRequest = (
+        typeof locked === 'boolean' &&
+        slotLocked === undefined &&
+        name === undefined &&
+        profilePic === undefined &&
+        frameUrl === undefined &&
+        numericUid === undefined &&
+        isMuted === undefined &&
+        cameraOn === undefined
+      );
+      let emittedSlotLocked = typeof slotLocked === 'boolean' ? slotLocked : (typeof locked === 'boolean' ? locked : undefined);
 
-      if (typeof locked === 'boolean') {
+      if (isLockOnlyRequest) {
         if (isVideoRoom) {
           socket.emit('error_notice', { message: 'Video slots cannot be locked from this action.' });
           return;
@@ -1474,6 +1523,9 @@ io.on('connection', (socket) => {
             }
           });
         }
+
+        const latestAudioRoom = await AudioRoom.findById(stringRoomId).select('lockedSlots').lean();
+        emittedSlotLocked = (latestAudioRoom?.lockedSlots || []).map(Number).includes(normalizedSlotIndex);
       }
 
       if (profilePic !== null) {
@@ -1497,6 +1549,7 @@ io.on('connection', (socket) => {
           avatar: profilePic,
           frameUrl: finalFrameUrl,
           isMuted: isMuted || false,
+          locked: emittedSlotLocked,
           cameraOn: !!cameraOn
         }
       });
@@ -2221,6 +2274,14 @@ io.on('connection', (socket) => {
 
       await session.commitTransaction();
       await recordRewardActivity(userId, 'send_gift', { roomId: stringRoomId, totalCost, receiverIds: normalizedReceiverIds });
+      Promise.all(
+        normalizedReceiverIds.map(receiverId => recordAgencyCommissionForGift({
+          receiverId,
+          sourceCoins: perReceiverCost,
+        }))
+      ).catch(error => {
+        console.log('Agency commission recording failed:', error);
+      });
 
     } catch (error) {
       await session.abortTransaction();
@@ -2644,6 +2705,8 @@ io.on('connection', (socket) => {
     socket.roomId = stringRoomId;
     socket.userId = userId;
 
+    clearRoomEmptyAudienceTimer(stringRoomId);
+
     if (clearRoomDisconnectTimer(stringRoomId, userId)) {
       io.to(stringRoomId).emit('host_reconnected', {
         userId,
@@ -2743,7 +2806,7 @@ io.on('connection', (socket) => {
       ) {
         if (roomKeepOpenRooms[roomId]) {
           removeRoomPresence({ roomId, userId: currentUserId, socketId: socket.id });
-          await closeKeptOpenAudioRoomIfNoAudience(roomId, 'host_left_no_audience');
+          scheduleKeptOpenAudioRoomEmptyCheck(roomId, 'host_left_no_audience');
           return;
         }
 
@@ -2769,6 +2832,7 @@ io.on('connection', (socket) => {
             latestRoom.endedAt = new Date();
 
             await latestRoom.save();
+            clearRoomEmptyAudienceTimer(roomId);
             delete roomKeepOpenRooms[roomId];
             delete roomControllers[roomId];
 
@@ -2803,7 +2867,7 @@ io.on('connection', (socket) => {
         }
       });
 
-      await closeKeptOpenAudioRoomIfNoAudience(roomId, 'last_audience_left');
+      scheduleKeptOpenAudioRoomEmptyCheck(roomId, 'last_audience_left');
 
       if (oldSlotIndex !== undefined) {
         io.to(roomId).emit("slot_state_changed", {
@@ -3824,6 +3888,7 @@ app.post('/rooms/end', async (req, res) => {
           endedAt: new Date()
         });
         await Room.deleteOne({ _id: videoRoom._id });
+        clearRoomEmptyAudienceTimer(videoRoom.channelName);
         delete roomKeepOpenRooms[videoRoom.channelName];
         delete roomControllers[videoRoom.channelName];
         await new Promise(resolve => setTimeout(resolve, 500));
@@ -3844,6 +3909,7 @@ app.post('/rooms/end', async (req, res) => {
     room.audience = [];
     room.endedAt = new Date();
     await room.save();
+    clearRoomEmptyAudienceTimer(stringRoomId);
     delete roomKeepOpenRooms[stringRoomId];
     delete roomControllers[stringRoomId];
 
@@ -6430,17 +6496,21 @@ app.patch('/host/requests/:userId', requireOfficial, async (req, res) => {
   try {
     const status = ['approved', 'rejected'].includes(req.body?.status) ? req.body.status : null;
     if (!status) return res.status(400).json({ success: false, message: 'Invalid host status' });
-    const update = {
-      hostStatus: status,
-      hostRejectionReason: status === 'rejected' ? String(req.body?.reason || '') : '',
-      'hostRegistration.status': status,
-      'hostRegistration.rejectionReason': status === 'rejected' ? String(req.body?.reason || '') : '',
-      'hostRegistration.reviewedBy': req.officialUser._id,
-      'hostRegistration.reviewedAt': new Date(),
-    };
-    if (status === 'approved') update.role = 'host';
-    const user = await User.findByIdAndUpdate(req.params.userId, { $set: update }, { new: true });
+    const user = await User.findById(req.params.userId);
     if (!user) return res.status(404).json({ success: false, message: 'User not found' });
+    user.hostStatus = status;
+    user.hostRejectionReason = status === 'rejected' ? String(req.body?.reason || '') : '';
+    user.hostRegistration.status = status;
+    user.hostRegistration.rejectionReason = user.hostRejectionReason;
+    user.hostRegistration.reviewedBy = req.officialUser._id;
+    user.hostRegistration.reviewedAt = new Date();
+
+    if (status === 'approved') {
+      user.role = user.agencyStatus === 'approved' || user.role === 'agency' ? 'agency' : 'host';
+      await linkApprovedHostToAgency(user);
+    }
+
+    await user.save();
     return res.json({ success: true, user: serializeOfficialUser(user) });
   } catch (error) {
     return res.status(500).json({ success: false, message: error.message });
@@ -6475,6 +6545,218 @@ const findAgencyCodeOwner = async (agencyCode, excludeUserId = null) => {
   }
 
   return User.findOne(query).select('_id name email glixId agencyCode agencyStatus agencyRegistration.requestedAgencyCode').lean();
+};
+
+const isOfficialAgencyCode = (agencyCode = '') => {
+  const cleanCode = normalizeAgencyCode(agencyCode);
+  return !cleanCode || cleanCode === 'OFFICIAL';
+};
+
+const findApprovedAgencyByCode = async (agencyCode, excludeUserId = null) => {
+  const cleanCode = normalizeAgencyCode(agencyCode);
+  if (isOfficialAgencyCode(cleanCode)) return null;
+
+  const query = {
+    agencyStatus: 'approved',
+    $or: [
+      { agencyCode: cleanCode },
+      { 'agencyRegistration.requestedAgencyCode': cleanCode },
+    ],
+  };
+
+  if (excludeUserId && mongoose.Types.ObjectId.isValid(String(excludeUserId))) {
+    query._id = { $ne: excludeUserId };
+  }
+
+  return User.findOne(query).select('_id agencyCode agencyStatus').lean();
+};
+
+const linkApprovedHostToAgency = async (hostUser) => {
+  if (!hostUser || hostUser.hostStatus !== 'approved') return null;
+
+  const agencyCode = normalizeAgencyCode(hostUser.hostRegistration?.agencyCode || hostUser.agencyCode || '');
+  if (isOfficialAgencyCode(agencyCode)) {
+    hostUser.agencyCode = agencyCode || 'OFFICIAL';
+    hostUser.agencyId = null;
+    if (hostUser.hostRegistration) hostUser.hostRegistration.agencyCode = hostUser.agencyCode;
+    return null;
+  }
+
+  const agency = await findApprovedAgencyByCode(agencyCode, hostUser._id);
+  if (!agency) return null;
+
+  hostUser.agencyId = agency._id;
+  hostUser.agencyCode = agency.agencyCode || agencyCode;
+  if (hostUser.hostRegistration) hostUser.hostRegistration.agencyCode = hostUser.agencyCode;
+  return agency;
+};
+
+const backfillApprovedHostsForAgency = async (agencyUser) => {
+  if (!agencyUser || agencyUser.agencyStatus !== 'approved') return 0;
+  const agencyCode = normalizeAgencyCode(agencyUser.agencyCode || agencyUser.agencyRegistration?.requestedAgencyCode || '');
+  if (isOfficialAgencyCode(agencyCode)) return 0;
+
+  const result = await User.updateMany(
+    {
+      _id: { $ne: agencyUser._id },
+      hostStatus: 'approved',
+      $or: [
+        { agencyCode },
+        { 'hostRegistration.agencyCode': agencyCode },
+      ],
+    },
+    {
+      $set: {
+        agencyId: agencyUser._id,
+        agencyCode,
+        'hostRegistration.agencyCode': agencyCode,
+      },
+    }
+  );
+
+  return result.modifiedCount ?? result.nModified ?? 0;
+};
+
+const buildAgencyHostQuery = (agencyUser) => {
+  const agencyCode = normalizeAgencyCode(agencyUser?.agencyCode || agencyUser?.agencyRegistration?.requestedAgencyCode || '');
+  const query = {
+    _id: { $ne: agencyUser?._id },
+    hostStatus: 'approved',
+    $or: [{ agencyId: agencyUser?._id }],
+  };
+
+  if (!isOfficialAgencyCode(agencyCode)) {
+    query.$or.push(
+      { agencyCode },
+      { 'hostRegistration.agencyCode': agencyCode }
+    );
+  }
+
+  return query;
+};
+
+const getCommissionMonthKey = (date = new Date()) => {
+  const year = date.getUTCFullYear();
+  const month = String(date.getUTCMonth() + 1).padStart(2, '0');
+  return `${year}-${month}`;
+};
+
+const getCommissionDayKey = (date = new Date()) => {
+  const year = date.getUTCFullYear();
+  const month = String(date.getUTCMonth() + 1).padStart(2, '0');
+  const day = String(date.getUTCDate()).padStart(2, '0');
+  return `${year}-${month}-${day}`;
+};
+
+const updateAgencyTargetProgress = async ({ agencyId, month, sourceCoins }) => {
+  if (!agencyId || !month || !Number.isFinite(sourceCoins) || sourceCoins <= 0) return null;
+
+  const target = await AgencyTarget.findOneAndUpdate(
+    { agencyId, month },
+    { $inc: { achievedCoins: sourceCoins } },
+    { new: true }
+  );
+
+  if (
+    target &&
+    target.targetCoins > 0 &&
+    target.achievedCoins >= target.targetCoins &&
+    target.status !== 'achieved'
+  ) {
+    target.status = 'achieved';
+    await target.save();
+  }
+
+  return target;
+};
+
+const recordAgencyCommissionForGift = async ({ receiverId, sourceCoins }) => {
+  if (!mongoose.Types.ObjectId.isValid(String(receiverId))) return null;
+
+  const coins = Number(sourceCoins || 0);
+  const defaultRatePercent = Number.isFinite(AGENCY_COMMISSION_RATE_PERCENT) ? AGENCY_COMMISSION_RATE_PERCENT : 10;
+  if (!Number.isFinite(coins) || coins <= 0 || defaultRatePercent <= 0) return null;
+
+  const host = await User.findById(receiverId)
+    .select('hostStatus agencyId agencyCode hostRegistration.agencyCode')
+    .lean();
+
+  if (!host || host.hostStatus !== 'approved') return null;
+
+  let agencyId = host.agencyId || null;
+  if (!agencyId) {
+    const agencyCode = normalizeAgencyCode(host.agencyCode || host.hostRegistration?.agencyCode || '');
+    const agency = await findApprovedAgencyByCode(agencyCode, host._id);
+    agencyId = agency?._id || null;
+    if (agencyId) {
+      await User.findByIdAndUpdate(host._id, {
+        $set: {
+          agencyId,
+          agencyCode: agency.agencyCode || agencyCode,
+          'hostRegistration.agencyCode': agency.agencyCode || agencyCode,
+        },
+      });
+    }
+  }
+
+  if (!agencyId) return null;
+
+  const month = getCommissionMonthKey();
+  const day = getCommissionDayKey();
+  const activeTarget = await AgencyTarget.findOne({ agencyId, month }).select('commissionRatePercent').lean();
+  const targetRatePercent = Number(activeTarget?.commissionRatePercent || 0);
+  const ratePercent = targetRatePercent > 0 ? targetRatePercent : defaultRatePercent;
+  const commissionAmount = Math.floor((coins * ratePercent) / 100);
+
+  await Promise.all([
+    MonthlyCommission.findOneAndUpdate(
+      {
+        beneficiaryId: agencyId,
+        beneficiaryRole: 'agency',
+        hostId: receiverId,
+        month,
+      },
+      {
+        $inc: {
+          sourceCoins: coins,
+          commissionAmount,
+        },
+        $set: {
+          ratePercent,
+          status: 'pending',
+        },
+      },
+      { upsert: true, new: true, setDefaultsOnInsert: true }
+    ),
+    DailyCommission.findOneAndUpdate(
+      {
+        beneficiaryId: agencyId,
+        beneficiaryRole: 'agency',
+        hostId: receiverId,
+        day,
+      },
+      {
+        $inc: {
+          sourceCoins: coins,
+          commissionAmount,
+        },
+        $set: {
+          ratePercent,
+          status: 'pending',
+        },
+      },
+      { upsert: true, new: true, setDefaultsOnInsert: true }
+    ),
+    updateAgencyTargetProgress({ agencyId, month, sourceCoins: coins }),
+    User.findByIdAndUpdate(agencyId, {
+      $inc: {
+        totalHostCoins: coins,
+        commissionBalance: commissionAmount,
+      },
+    }),
+  ]);
+
+  return { agencyId, sourceCoins: coins, commissionAmount, ratePercent, month, day };
 };
 
 const sendDuplicateAgencyCodeResponse = (res) => (
@@ -6655,6 +6937,7 @@ app.patch('/agency/requests/:userId', requireOfficial, async (req, res) => {
       user.agencyRegistration.requestedAgencyCode = agencyCode;
     }
     await user.save();
+    if (status === 'approved') await backfillApprovedHostsForAgency(user);
     return res.json({ success: true, user: serializeOfficialUser(user) });
   } catch (error) {
     if (isDuplicateAgencyCodeError(error)) return sendDuplicateAgencyCodeResponse(res);
@@ -7229,7 +7512,44 @@ app.get('/admin/agencies', requireOfficial, async (req, res) => {
   try {
     const agencies = await User.aggregate([
       { $match: { $or: [{ role: 'agency' }, { agencyStatus: 'approved' }] } },
-      { $lookup: { from: 'users', localField: '_id', foreignField: 'agencyId', as: 'hosts' } },
+      {
+        $lookup: {
+          from: 'users',
+          let: { agencyUserId: '$_id', code: '$agencyCode' },
+          pipeline: [
+            {
+              $match: {
+                hostStatus: 'approved',
+                $expr: {
+                  $and: [
+                    { $ne: ['$_id', '$$agencyUserId'] },
+                    {
+                      $or: [
+                        { $eq: ['$agencyId', '$$agencyUserId'] },
+                        {
+                          $and: [
+                            { $ne: ['$$code', ''] },
+                            { $ne: ['$$code', 'OFFICIAL'] },
+                            { $eq: ['$agencyCode', '$$code'] },
+                          ],
+                        },
+                        {
+                          $and: [
+                            { $ne: ['$$code', ''] },
+                            { $ne: ['$$code', 'OFFICIAL'] },
+                            { $eq: ['$hostRegistration.agencyCode', '$$code'] },
+                          ],
+                        },
+                      ],
+                    },
+                  ],
+                },
+              },
+            },
+          ],
+          as: 'hosts',
+        },
+      },
       { $project: { name: 1, email: 1, glixId: 1, agencyCode: 1, totalHostCoins: 1, commissionBalance: 1, hostsCount: { $size: '$hosts' } } },
       { $sort: { createdAt: -1 } },
     ]);
@@ -7256,6 +7576,7 @@ app.post('/admin/agencies', requireOfficial, async (req, res) => {
     agency.agencyRegistration.reviewedBy = req.officialUser._id;
     agency.agencyRegistration.reviewedAt = new Date();
     await agency.save();
+    await backfillApprovedHostsForAgency(agency);
     return res.json({ success: true, agency: serializeOfficialUser(agency) });
   } catch (error) {
     if (isDuplicateAgencyCodeError(error)) return sendDuplicateAgencyCodeResponse(res);
@@ -7275,6 +7596,7 @@ app.patch('/admin/agencies/:agencyId', requireOfficial, async (req, res) => {
 
     const agency = await User.findByIdAndUpdate(req.params.agencyId, { $set: { agencyCode, 'agencyRegistration.requestedAgencyCode': agencyCode } }, { new: true, runValidators: true });
     if (!agency) return res.status(404).json({ success: false, message: 'Agency not found' });
+    await backfillApprovedHostsForAgency(agency);
     return res.json({ success: true, agency: serializeOfficialUser(agency) });
   } catch (error) {
     if (isDuplicateAgencyCodeError(error)) return sendDuplicateAgencyCodeResponse(res);
@@ -7285,7 +7607,9 @@ app.patch('/admin/agencies/:agencyId', requireOfficial, async (req, res) => {
 app.get('/admin/agencies/:agencyId/hosts', requireOfficial, async (req, res) => {
   try {
     if (!mongoose.Types.ObjectId.isValid(req.params.agencyId)) return res.status(400).json({ success: false, message: 'Invalid agency id' });
-    const hosts = await User.find({ agencyId: req.params.agencyId }).select('-password -passwordResetOtpHash').sort({ createdAt: -1 }).lean();
+    const agency = await User.findById(req.params.agencyId).select('_id agencyCode agencyRegistration agencyStatus').lean();
+    if (!agency) return res.status(404).json({ success: false, message: 'Agency not found' });
+    const hosts = await User.find(buildAgencyHostQuery(agency)).select('-password -passwordResetOtpHash').sort({ createdAt: -1 }).lean();
     return res.json({ success: true, hosts });
   } catch (error) {
     return res.status(500).json({ success: false, message: error.message });
@@ -7629,6 +7953,139 @@ app.get('/admin/monthly-commissions', requireOfficial, async (req, res) => {
       return acc;
     }, { sourceCoins: 0, commissionAmount: 0 });
     return res.json({ success: true, commissions, totals });
+  } catch (error) {
+    return res.status(500).json({ success: false, message: error.message });
+  }
+});
+
+app.get('/admin/daily-commissions', requireOfficial, async (req, res) => {
+  try {
+    const query = {};
+    if (req.query.status && req.query.status !== 'all') query.status = req.query.status;
+    if (req.query.day) query.day = String(req.query.day).trim();
+    const commissions = await DailyCommission.find(query)
+      .populate('beneficiaryId', 'name email glixId agencyCode')
+      .populate('hostId', 'name email glixId')
+      .sort({ day: -1, createdAt: -1 })
+      .lean();
+    const totals = commissions.reduce((acc, row) => {
+      acc.sourceCoins += row.sourceCoins || 0;
+      acc.commissionAmount += row.commissionAmount || 0;
+      return acc;
+    }, { sourceCoins: 0, commissionAmount: 0 });
+    return res.json({ success: true, commissions, totals });
+  } catch (error) {
+    return res.status(500).json({ success: false, message: error.message });
+  }
+});
+
+app.get('/admin/agency-targets', requireOfficial, async (req, res) => {
+  try {
+    const query = {};
+    if (req.query.month) query.month = String(req.query.month).trim();
+    if (req.query.status && req.query.status !== 'all') query.status = req.query.status;
+
+    const targets = await AgencyTarget.find(query)
+      .populate('agencyId', 'name email glixId agencyCode commissionBalance totalHostCoins')
+      .populate('assignedBy', 'name email')
+      .sort({ month: -1, createdAt: -1 })
+      .lean();
+
+    const totals = targets.reduce((acc, row) => {
+      acc.targetCoins += row.targetCoins || 0;
+      acc.achievedCoins += row.achievedCoins || 0;
+      return acc;
+    }, { targetCoins: 0, achievedCoins: 0 });
+
+    return res.json({ success: true, targets, totals });
+  } catch (error) {
+    return res.status(500).json({ success: false, message: error.message });
+  }
+});
+
+app.post('/admin/agency-targets', requireOfficial, async (req, res) => {
+  try {
+    const agencyId = String(req.body?.agencyId || '').trim();
+    const month = String(req.body?.month || getCommissionMonthKey()).trim();
+    const targetCoins = Math.floor(Number(req.body?.targetCoins || 0));
+    const commissionRatePercent = Number(req.body?.commissionRatePercent || AGENCY_COMMISSION_RATE_PERCENT || 10);
+    const note = String(req.body?.note || '').trim();
+
+    if (!mongoose.Types.ObjectId.isValid(agencyId)) {
+      return res.status(400).json({ success: false, message: 'Valid agencyId is required' });
+    }
+    if (!/^\d{4}-\d{2}$/.test(month)) {
+      return res.status(400).json({ success: false, message: 'Month must use YYYY-MM format' });
+    }
+    if (!Number.isFinite(targetCoins) || targetCoins < 0) {
+      return res.status(400).json({ success: false, message: 'Target coins must be zero or greater' });
+    }
+    if (!Number.isFinite(commissionRatePercent) || commissionRatePercent < 0) {
+      return res.status(400).json({ success: false, message: 'Commission rate must be zero or greater' });
+    }
+
+    const agency = await User.findOne({
+      _id: agencyId,
+      $or: [{ role: 'agency' }, { agencyStatus: 'approved' }],
+    }).select('_id');
+    if (!agency) return res.status(404).json({ success: false, message: 'Approved agency not found' });
+
+    const target = await AgencyTarget.findOneAndUpdate(
+      { agencyId, month },
+      {
+        $set: {
+          targetCoins,
+          commissionRatePercent,
+          note,
+          assignedBy: req.officialUser?._id || null,
+        },
+        $setOnInsert: { achievedCoins: 0 },
+      },
+      { upsert: true, new: true, setDefaultsOnInsert: true }
+    ).populate('agencyId', 'name email glixId agencyCode commissionBalance totalHostCoins');
+
+    if (target.targetCoins > 0 && target.achievedCoins >= target.targetCoins && target.status !== 'achieved') {
+      target.status = 'achieved';
+      await target.save();
+    }
+
+    return res.json({ success: true, target });
+  } catch (error) {
+    return res.status(500).json({ success: false, message: error.message });
+  }
+});
+
+app.patch('/admin/agency-targets/:targetId', requireOfficial, async (req, res) => {
+  try {
+    const target = await AgencyTarget.findById(req.params.targetId);
+    if (!target) return res.status(404).json({ success: false, message: 'Target not found' });
+
+    if (req.body?.targetCoins !== undefined) {
+      const targetCoins = Math.floor(Number(req.body.targetCoins));
+      if (!Number.isFinite(targetCoins) || targetCoins < 0) {
+        return res.status(400).json({ success: false, message: 'Target coins must be zero or greater' });
+      }
+      target.targetCoins = targetCoins;
+    }
+    if (req.body?.commissionRatePercent !== undefined) {
+      const commissionRatePercent = Number(req.body.commissionRatePercent);
+      if (!Number.isFinite(commissionRatePercent) || commissionRatePercent < 0) {
+        return res.status(400).json({ success: false, message: 'Commission rate must be zero or greater' });
+      }
+      target.commissionRatePercent = commissionRatePercent;
+    }
+    if (req.body?.status && ['pending', 'achieved', 'failed'].includes(req.body.status)) {
+      target.status = req.body.status;
+    }
+    if (req.body?.note !== undefined) target.note = String(req.body.note || '').trim();
+
+    if (target.targetCoins > 0 && target.achievedCoins >= target.targetCoins) {
+      target.status = 'achieved';
+    }
+
+    await target.save();
+    await target.populate('agencyId', 'name email glixId agencyCode commissionBalance totalHostCoins');
+    return res.json({ success: true, target });
   } catch (error) {
     return res.status(500).json({ success: false, message: error.message });
   }
