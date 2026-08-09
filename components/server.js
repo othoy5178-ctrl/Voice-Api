@@ -1319,6 +1319,37 @@ io.on('connection', (socket) => {
         activeUsers[userId.toString()] = socket.id;
       }
 
+      const isVideoRoom = stringRoomId.startsWith('glix_');
+      let joinedRoomHostId = '';
+
+      if (isVideoRoom) {
+        const videoRoom = await Room.findOne(getVideoRoomFilter(stringRoomId)).select('hostId').lean();
+        joinedRoomHostId = videoRoom?.hostId?.toString?.() || String(videoRoom?.hostId || '');
+      } else if (mongoose.Types.ObjectId.isValid(stringRoomId)) {
+        const audioRoom = await AudioRoom.findById(stringRoomId).select('hostId').lean();
+        joinedRoomHostId = audioRoom?.hostId?.toString?.() || String(audioRoom?.hostId || '');
+      }
+
+      const isJoiningRoomHost = joinedRoomHostId && String(joinedRoomHostId) === String(userId || '');
+      if (isJoiningRoomHost && roomKeepOpenRooms[stringRoomId]) {
+        delete roomKeepOpenRooms[stringRoomId];
+        delete roomControllers[stringRoomId];
+        clearRoomEmptyAudienceTimer(stringRoomId);
+
+        io.to(stringRoomId).emit('host_control_restored', {
+          roomId: stringRoomId,
+          hostId: joinedRoomHostId,
+          userId,
+          message: `${finalJoinName || 'Host'} is back. Host control restored.`,
+        });
+        io.to(stringRoomId).emit('host_reconnected', {
+          roomId: stringRoomId,
+          hostId: joinedRoomHostId,
+          userId,
+          message: `${finalJoinName || 'Host'} reconnected.`,
+        });
+      }
+
       console.log(`${finalJoinName} joined real-time room channel: ${stringRoomId}`);
 
       const finalEntryVideoUrl = userData?.entryVideoUrl || entryVideoUrl || null;
@@ -1344,7 +1375,6 @@ io.on('connection', (socket) => {
         socket.emit('play_my_own_entry_effect', { entryVideoUrl: finalEntryVideoUrl });
       }
 
-      const isVideoRoom = stringRoomId.startsWith('glix_');
       let completeLayoutMatrix = createCleanSlotsBlueprint();
 
       if (isVideoRoom) {
@@ -1413,6 +1443,18 @@ io.on('connection', (socket) => {
       const isVideoRoom = stringRoomId.startsWith('glix_');
       const normalizedSlotIndex = Number(targetSlotIndex);
       if (!Number.isInteger(normalizedSlotIndex) || normalizedSlotIndex < 0) return;
+      if (process.env.NODE_ENV !== 'production') {
+        console.log('[VoiceRoom SlotChange]', {
+          roomId: stringRoomId,
+          userId,
+          socketUserId: socket.userId,
+          slotIndex: normalizedSlotIndex,
+          numericUid,
+          isClearing: profilePic === null || numericUid === null || numericUid === undefined,
+          locked,
+          slotLocked,
+        });
+      }
       const isLockOnlyRequest = (
         typeof locked === 'boolean' &&
         slotLocked === undefined &&
@@ -1508,6 +1550,36 @@ io.on('connection', (socket) => {
         );
       } else {
         if (!mongoose.Types.ObjectId.isValid(stringRoomId)) return;
+
+        const audioRoomForSlot = await AudioRoom.findById(stringRoomId).select('hostId lockedSlots speakers').lean();
+        const lockedSlots = (audioRoomForSlot?.lockedSlots || []).map(Number);
+        const existingSlotSpeaker = (audioRoomForSlot?.speakers || []).find(s => Number(s?.slotIndex) === normalizedSlotIndex);
+        const isExistingSlotSpeaker = existingSlotSpeaker?.userId && String(existingSlotSpeaker.userId) === String(userId || '');
+        const isHostRefreshingMainSeat = (
+          normalizedSlotIndex === 0 &&
+          audioRoomForSlot?.hostId &&
+          String(audioRoomForSlot.hostId) === String(userId || '')
+        );
+        const isTakingOrUpdatingSeat = profilePic !== null && numericUid !== null && numericUid !== undefined;
+
+        if (
+          isTakingOrUpdatingSeat &&
+          lockedSlots.includes(normalizedSlotIndex) &&
+          !isExistingSlotSpeaker &&
+          !isHostRefreshingMainSeat
+        ) {
+          if (process.env.NODE_ENV !== 'production') {
+            console.log('[VoiceRoom SlotChange] blocked locked slot', {
+              roomId: stringRoomId,
+              userId,
+              slotIndex: normalizedSlotIndex,
+              lockedSlots,
+              roomHostId: audioRoomForSlot?.hostId?.toString?.() || String(audioRoomForSlot?.hostId || ''),
+            });
+          }
+          socket.emit('error_notice', { message: 'This mic slot is locked.' });
+          return;
+        }
 
         if (profilePic === null) {
           await AudioRoom.findOneAndUpdate(queryFilter, {
@@ -3646,6 +3718,9 @@ app.post('/join', async (req, res) => {
 
         isVideoRoom = true;
         channelName = roomObj.channelName;
+        if (String(roomObj.hostId) === String(userId)) {
+          userRole = RtcRole.PUBLISHER;
+        }
         await Room.findByIdAndUpdate(roomObj._id, {
           $set: { isLive: true, lastHeartbeatAt: new Date() }
         });
@@ -3678,10 +3753,35 @@ app.post('/join', async (req, res) => {
 
       if (isRoomOwner) {
         const nonOwnerSpeakers = roomObj.speakers.filter(s => String(s.userId) !== String(userId));
-        roomObj.speakers = [
-          { userId, isMuted: false, slotIndex: 0, numericUid: sanitizedUid },
-          ...nonOwnerSpeakers
-        ];
+        const micSeatCount = Number(roomObj.micSeatCount || 15);
+        const occupiedSlots = new Set(
+          nonOwnerSpeakers
+            .map(s => Number(s?.slotIndex))
+            .filter(index => Number.isInteger(index) && index >= 0 && index < micSeatCount)
+        );
+        const previousOwnerSlot = validSpeakers.find(s => String(s.userId) === String(userId));
+        const previousOwnerSlotIndex = Number(previousOwnerSlot?.slotIndex);
+        const previousOwnerSlotAvailable = (
+          Number.isInteger(previousOwnerSlotIndex) &&
+          previousOwnerSlotIndex >= 0 &&
+          previousOwnerSlotIndex < micSeatCount &&
+          !occupiedSlots.has(previousOwnerSlotIndex)
+        );
+        const slotOneAvailable = !occupiedSlots.has(0);
+        const firstFreeSlotIndex = Array.from({ length: micSeatCount }, (_, index) => index)
+          .find(index => !occupiedSlots.has(index));
+        const ownerSlotIndex = previousOwnerSlotAvailable
+          ? previousOwnerSlotIndex
+          : slotOneAvailable
+            ? 0
+            : firstFreeSlotIndex;
+
+        roomObj.speakers = Number.isInteger(ownerSlotIndex)
+          ? [
+            { userId, isMuted: false, slotIndex: ownerSlotIndex, numericUid: sanitizedUid },
+            ...nonOwnerSpeakers
+          ]
+          : nonOwnerSpeakers;
         userRole = RtcRole.PUBLISHER;
       } else if (isAlreadySpeaker) {
         roomObj.speakers[existingSpeakerIndex].numericUid = sanitizedUid;
@@ -3694,6 +3794,18 @@ app.post('/join', async (req, res) => {
     }
 
     if (!roomObj) return res.status(404).json({ error: "Room not found" });
+
+    if (process.env.NODE_ENV !== 'production') {
+      console.log('[RoomJoin]', {
+        roomId: stringRoomId,
+        channelName,
+        userId,
+        roomHostId: roomObj.hostId?.toString?.() || String(roomObj.hostId || ''),
+        isVideoRoom,
+        userRole: userRole === RtcRole.PUBLISHER ? 'speaker' : 'audience',
+        numericUid: sanitizedUid,
+      });
+    }
 
     const token = RtcTokenBuilder.buildTokenWithUid(
       appId,
