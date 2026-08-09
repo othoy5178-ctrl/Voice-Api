@@ -84,6 +84,13 @@ const CUSTOM_ROOM_THEME_PRICE_COINS = 50000;
 const CUSTOM_ROOM_THEME_DURATION_DAYS = 30;
 const GIFT_QUANTITY_OPTIONS = [1, 5, 10, 20, 50, 100];
 const AGENCY_COMMISSION_RATE_PERCENT = Number(process.env.AGENCY_COMMISSION_RATE_PERCENT || 10);
+const AGENCY_COMMISSION_TIERS = [
+  { min: 0, max: 17000000, rate: 4 },
+  { min: 17000000, max: 70000000, rate: 8 },
+  { min: 70000000, max: 130000000, rate: 12 },
+  { min: 130000000, max: 200000000, rate: 16 },
+  { min: 200000000, max: Infinity, rate: 20 },
+];
 const LUCKY_GIFT_NAMES = new Set([
   'love burst',
   'dream castle',
@@ -4840,7 +4847,7 @@ app.post('/rewards/claim', async (req, res) => {
   }
 });
 
-const PUBLIC_USER_FIELDS = 'name email profilePic glixId googleId createdAt lastLogin followersCount followingCount daimon chang frameUrl entryVideoUrl isVip vipExpiresAt vipBadgeUrl vipItemKey settings blacklistedUsers gender birthday countryRegion voiceSignature signature albumPhotos role accountStatus hostStatus agencyStatus coinSellerStatus';
+const PUBLIC_USER_FIELDS = 'name email profilePic glixId googleId createdAt lastLogin followersCount followingCount daimon chang frameUrl entryVideoUrl isVip vipExpiresAt vipBadgeUrl vipItemKey settings blacklistedUsers gender birthday countryRegion voiceSignature signature albumPhotos role accountStatus hostStatus agencyStatus agencyCode coinSellerStatus';
 
 const sanitizeUserSettings = (settings = {}) => {
   const allowedMessagesFrom = ['everyone', 'following', 'none'];
@@ -6635,6 +6642,45 @@ const buildAgencyHostQuery = (agencyUser) => {
   return query;
 };
 
+app.get('/agency/dashboard', requireAppUser, async (req, res) => {
+  try {
+    const agencyUser = await User.findById(req.authUser._id)
+      .select('_id role agencyStatus agencyCode agencyRegistration totalHostCoins commissionBalance')
+      .lean();
+
+    if (!agencyUser || (agencyUser.role !== 'agency' && agencyUser.agencyStatus !== 'approved')) {
+      return res.status(403).json({ success: false, message: 'Agency account required.' });
+    }
+
+    const hostStats = await User.aggregate([
+      { $match: buildAgencyHostQuery(agencyUser) },
+      {
+        $group: {
+          _id: null,
+          hostsCount: { $sum: 1 },
+          totalHostCoins: { $sum: { $ifNull: ['$totalHostCoins', 0] } },
+        },
+      },
+    ]);
+
+    const month = getCommissionMonthKey();
+    const target = await AgencyTarget.findOne({ agencyId: agencyUser._id, month }).lean();
+    const aggregateHostCoins = hostStats[0]?.totalHostCoins || 0;
+
+    return res.json({
+      success: true,
+      stats: {
+        hostsCount: hostStats[0]?.hostsCount || 0,
+        totalHostCoins: Math.max(agencyUser.totalHostCoins || 0, aggregateHostCoins),
+        commissionBalance: agencyUser.commissionBalance || 0,
+        currentMonthTarget: target || null,
+      },
+    });
+  } catch (error) {
+    return res.status(500).json({ success: false, message: error.message });
+  }
+});
+
 const getCommissionMonthKey = (date = new Date()) => {
   const year = date.getUTCFullYear();
   const month = String(date.getUTCMonth() + 1).padStart(2, '0');
@@ -6646,6 +6692,12 @@ const getCommissionDayKey = (date = new Date()) => {
   const month = String(date.getUTCMonth() + 1).padStart(2, '0');
   const day = String(date.getUTCDate()).padStart(2, '0');
   return `${year}-${month}-${day}`;
+};
+
+const getAgencyCommissionTier = (sourceCoins = 0) => {
+  const total = Number(sourceCoins || 0);
+  return AGENCY_COMMISSION_TIERS.find(tier => total >= tier.min && total < tier.max)
+    || AGENCY_COMMISSION_TIERS[0];
 };
 
 const updateAgencyTargetProgress = async ({ agencyId, month, sourceCoins }) => {
@@ -6674,8 +6726,7 @@ const recordAgencyCommissionForGift = async ({ receiverId, sourceCoins }) => {
   if (!mongoose.Types.ObjectId.isValid(String(receiverId))) return null;
 
   const coins = Number(sourceCoins || 0);
-  const defaultRatePercent = Number.isFinite(AGENCY_COMMISSION_RATE_PERCENT) ? AGENCY_COMMISSION_RATE_PERCENT : 10;
-  if (!Number.isFinite(coins) || coins <= 0 || defaultRatePercent <= 0) return null;
+  if (!Number.isFinite(coins) || coins <= 0) return null;
 
   const host = await User.findById(receiverId)
     .select('hostStatus agencyId agencyCode hostRegistration.agencyCode')
@@ -6703,9 +6754,15 @@ const recordAgencyCommissionForGift = async ({ receiverId, sourceCoins }) => {
 
   const month = getCommissionMonthKey();
   const day = getCommissionDayKey();
-  const activeTarget = await AgencyTarget.findOne({ agencyId, month }).select('commissionRatePercent').lean();
-  const targetRatePercent = Number(activeTarget?.commissionRatePercent || 0);
-  const ratePercent = targetRatePercent > 0 ? targetRatePercent : defaultRatePercent;
+  const agency = await User.findOne({
+    _id: agencyId,
+    $or: [{ role: 'agency' }, { agencyStatus: 'approved' }],
+  }).select('totalHostCoins').lean();
+
+  if (!agency) return null;
+
+  const agencyCoinsAfterGift = Number(agency.totalHostCoins || 0) + coins;
+  const ratePercent = getAgencyCommissionTier(agencyCoinsAfterGift).rate;
   const commissionAmount = Math.floor((coins * ratePercent) / 100);
 
   await Promise.all([
