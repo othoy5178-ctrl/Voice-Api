@@ -30,6 +30,7 @@ const authSessionSchema = new mongoose.Schema({
 }, { timestamps: true });
 
 authSessionSchema.index({ expiresAt: 1 }, { expireAfterSeconds: 0 });
+authSessionSchema.index({ userId: 1, tokenHash: 1, expiresAt: 1 });
 
 authSessionSchema.pre('validate', function requireSessionOwner(next) {
   if (!this.userId && !this.officialUserId) {

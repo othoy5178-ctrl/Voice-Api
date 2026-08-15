@@ -1278,6 +1278,46 @@ const emitRoomStats = async (roomId) => {
     popularityScore
   });
 };
+
+const getUserSocketRoom = (userId) => `user:${String(userId || '').trim()}`;
+
+const joinUserSocketRoom = (socket, userId) => {
+  const cleanUserId = String(userId || '').trim();
+  if (!cleanUserId) return false;
+  activeUsers[cleanUserId] = socket.id;
+  socket.userId = cleanUserId;
+  return true;
+};
+
+const joinAuthenticatedUserSocketRoom = async (socket, payload = {}) => {
+  const cleanUserId = String(payload?.userId || payload?.uid || '').trim();
+  const token = String(payload?.token || payload?.authToken || '').trim();
+  if (!mongoose.Types.ObjectId.isValid(cleanUserId) || !token) return false;
+
+  const session = await AuthSession.findOne({
+    userId: cleanUserId,
+    tokenHash: hashToken(token),
+    expiresAt: { $gt: new Date() },
+  }).select('_id').lean();
+
+  if (!session) return false;
+  socket.join(getUserSocketRoom(cleanUserId));
+  joinUserSocketRoom(socket, cleanUserId);
+  return true;
+};
+
+const emitWalletUpdated = (userId, wallet = {}) => {
+  const cleanUserId = String(userId || '').trim();
+  if (!cleanUserId) return;
+  io.to(getUserSocketRoom(cleanUserId)).emit('wallet_updated', {
+    userId: cleanUserId,
+    chang: Math.max(0, Math.floor(Number(wallet.chang || 0))),
+    daimon: wallet.daimon !== undefined ? Math.max(0, Math.floor(Number(wallet.daimon || 0))) : undefined,
+    source: wallet.source || 'wallet',
+    updatedAt: new Date().toISOString(),
+  });
+};
+
 io.on('connection', (socket) => {
   console.log(`User connected to socket cluster: ${socket.id}`);
 
@@ -1295,7 +1335,7 @@ io.on('connection', (socket) => {
       const stringRoomId = roomId ? roomId.toString() : '';
       socket.join(stringRoomId);
       socket.roomId = stringRoomId;
-      socket.userId = userId;
+      joinUserSocketRoom(socket, userId);
       socket.userName = finalJoinName;
 
       if (clearRoomDisconnectTimer(stringRoomId, userId)) {
@@ -1314,10 +1354,7 @@ io.on('connection', (socket) => {
         role: stringRoomId.startsWith('glix_') ? 'video' : 'audience'
       });
 
-      // Map connection instance to verify host mappings directly on requests
-      if (userId) {
-        activeUsers[userId.toString()] = socket.id;
-      }
+      // Map connection instance to verify host mappings directly on requests.
 
       const isVideoRoom = stringRoomId.startsWith('glix_');
       let joinedRoomHostId = '';
@@ -2556,15 +2593,26 @@ io.on('connection', (socket) => {
   });
 
   socket.on('register_user', (userId) => {
-    if (userId) {
-      socket.join(userId.toString());
-      activeUsers[userId.toString()] = socket.id;
-      socket.userId = userId.toString();
-      console.log(`SUCCESS: User ${userId} joined room: ${userId}`);
+    if (joinUserSocketRoom(socket, userId)) {
+      const cleanUserId = userId.toString();
+      socket.join(cleanUserId);
+      console.log(`SUCCESS: User ${cleanUserId} joined room: ${cleanUserId}`);
       // Send a confirmation back to the client to verify connection
-      socket.emit('system_message', `Successfully joined room: ${userId}`);
+      socket.emit('system_message', `Successfully joined room: ${cleanUserId}`);
     } else {
       console.log("ERROR: Attempted to join room with empty userId");
+    }
+  });
+
+  socket.on('join_user_channel', async (payload = {}) => {
+    try {
+      const joined = await joinAuthenticatedUserSocketRoom(socket, payload);
+      if (!joined) {
+        socket.emit('wallet_channel_error', { message: 'Unable to join wallet channel.' });
+      }
+    } catch (error) {
+      console.log('join_user_channel error:', error.message);
+      socket.emit('wallet_channel_error', { message: 'Unable to join wallet channel.' });
     }
   });
 
@@ -5814,6 +5862,27 @@ const requireAppUser = async (req, res, next) => {
   }
 };
 
+const requireAppRole = (...allowedRoles) => async (req, res, next) => {
+  try {
+    const user = await getAuthenticatedAppUser(req);
+    if (!user) return res.status(401).json({ success: false, message: 'Please login again.' });
+    if ((user.accountStatus || 'active') !== 'active') {
+      return res.status(403).json({ success: false, message: `Your account is ${user.accountStatus}` });
+    }
+
+    const role = String(user.role || 'user').toLowerCase();
+    const normalizedAllowedRoles = allowedRoles.map(item => String(item || '').toLowerCase());
+    if (role !== 'super_admin' && !normalizedAllowedRoles.includes(role)) {
+      return res.status(403).json({ success: false, message: 'You do not have permission for this app dashboard action.' });
+    }
+
+    req.authUser = user;
+    next();
+  } catch (error) {
+    return res.status(401).json({ success: false, message: error.message || 'Auth failed' });
+  }
+};
+
 const serializeCustomRoomTheme = (theme) => {
   const plain = typeof theme?.toObject === 'function' ? theme.toObject() : theme;
   if (!plain) return null;
@@ -6124,6 +6193,10 @@ const handleQuantumCoinUpdate = async (req, res) => {
       roomId,
       balanceAfter,
     });
+    emitWalletUpdated(uid, {
+      chang: balanceAfter,
+      source: type === 1 ? 'game_coin_consume' : 'game_coin_reward',
+    });
 
     return res.json({ errorCode: 0, errorMsg: 'Success', data: { coin: balanceAfter } });
   } catch (error) {
@@ -6176,6 +6249,10 @@ const handleQuantumCoinSupplement = async (req, res) => {
       winId,
       roomId,
       balanceAfter,
+    });
+    emitWalletUpdated(uid, {
+      chang: balanceAfter,
+      source: 'game_coin_supplement',
     });
 
     return res.json({ errorCode: 0, errorMsg: 'Success', data: { coin: balanceAfter } });
@@ -7114,6 +7191,98 @@ app.patch('/agency/requests/:userId', requireOfficial, async (req, res) => {
   }
 });
 
+app.get('/mobile/host/requests', requireAppRole('admin', 'manager'), async (req, res) => {
+  try {
+    const requests = await User.find({ hostStatus: 'pending' }).select('-password -passwordResetOtpHash').sort({ 'hostRegistration.registeredAt': -1, createdAt: -1 }).lean();
+    return res.json({ success: true, requests });
+  } catch (error) {
+    return res.status(500).json({ success: false, message: error.message });
+  }
+});
+
+app.get('/mobile/agency/requests', requireAppRole('admin'), async (req, res) => {
+  try {
+    const requests = await User.find({ agencyStatus: 'pending' }).select('-password -passwordResetOtpHash').sort({ 'agencyRegistration.registeredAt': -1, createdAt: -1 }).lean();
+    return res.json({ success: true, requests });
+  } catch (error) {
+    return res.status(500).json({ success: false, message: error.message });
+  }
+});
+
+app.get('/mobile/admin/agencies', requireAppRole('admin', 'manager'), async (req, res) => {
+  try {
+    const agencies = await User.aggregate([
+      { $match: { $or: [{ role: 'agency' }, { agencyStatus: 'approved' }] } },
+      {
+        $lookup: {
+          from: 'users',
+          let: { agencyUserId: '$_id', code: '$agencyCode' },
+          pipeline: [
+            {
+              $match: {
+                hostStatus: 'approved',
+                $expr: {
+                  $and: [
+                    { $ne: ['$_id', '$$agencyUserId'] },
+                    {
+                      $or: [
+                        { $eq: ['$agencyId', '$$agencyUserId'] },
+                        {
+                          $and: [
+                            { $ne: ['$$code', ''] },
+                            { $ne: ['$$code', 'OFFICIAL'] },
+                            { $eq: ['$agencyCode', '$$code'] },
+                          ],
+                        },
+                        {
+                          $and: [
+                            { $ne: ['$$code', ''] },
+                            { $ne: ['$$code', 'OFFICIAL'] },
+                            { $eq: ['$hostRegistration.agencyCode', '$$code'] },
+                          ],
+                        },
+                      ],
+                    },
+                  ],
+                },
+              },
+            },
+          ],
+          as: 'hosts',
+        },
+      },
+      { $project: { name: 1, email: 1, glixId: 1, agencyCode: 1, totalHostCoins: 1, commissionBalance: 1, hostsCount: { $size: '$hosts' } } },
+      { $sort: { createdAt: -1 } },
+    ]);
+    return res.json({ success: true, agencies });
+  } catch (error) {
+    return res.status(500).json({ success: false, message: error.message });
+  }
+});
+
+app.get('/mobile/admin/agencies/:agencyId/hosts', requireAppRole('admin', 'manager'), async (req, res) => {
+  try {
+    if (!mongoose.Types.ObjectId.isValid(req.params.agencyId)) return res.status(400).json({ success: false, message: 'Invalid agency id' });
+    const agency = await User.findById(req.params.agencyId).select('_id agencyCode agencyRegistration agencyStatus').lean();
+    if (!agency) return res.status(404).json({ success: false, message: 'Agency not found' });
+    const hosts = await User.find(buildAgencyHostQuery(agency)).select('-password -passwordResetOtpHash').sort({ createdAt: -1 }).lean();
+    return res.json({ success: true, hosts });
+  } catch (error) {
+    return res.status(500).json({ success: false, message: error.message });
+  }
+});
+
+app.get('/mobile/admin/withdrawals', requireAppRole('admin', 'manager'), async (req, res) => {
+  try {
+    const status = String(req.query.status || 'pending');
+    const query = status === 'all' ? {} : { status };
+    const withdrawals = await Withdrawal.find(query).populate('userId', 'name email glixId').sort({ createdAt: -1 }).lean();
+    return res.json({ success: true, withdrawals });
+  } catch (error) {
+    return res.status(500).json({ success: false, message: error.message });
+  }
+});
+
 app.get('/admin/access/requests', requireOfficial, async (req, res) => {
   try {
     const status = String(req.query.status || 'pending');
@@ -7187,31 +7356,14 @@ app.patch('/admin/access/requests/:userId', requireOfficial, async (req, res) =>
       'adminAccessRequest.reviewedAt': new Date(),
       'adminAccessRequest.rejectionReason': status === 'rejected' ? String(req.body?.reason || '') : '',
     };
+    if (status === 'approved') {
+      update.role = requestedRole;
+    }
     const user = await User.findByIdAndUpdate(req.params.userId, { $set: update }, { new: true, runValidators: true });
 
     let tempPassword = '';
     if (status === 'approved') {
-      tempPassword = targetUser.password ? '' : crypto.randomBytes(9).toString('base64url');
-      await OfficialUser.findOneAndUpdate(
-        { email: targetUser.email },
-        {
-          $set: {
-            name: targetUser.name || targetUser.email,
-            role: requestedRole,
-            status: 'active',
-            sourceUserId: targetUser._id,
-            note: targetUser.adminAccessRequest?.note || '',
-            rejectionReason: '',
-            reviewedBy: req.officialUser._id,
-            reviewedAt: new Date(),
-          },
-          $setOnInsert: {
-            password: targetUser.password || await bcrypt.hash(tempPassword, 10),
-            createdBy: req.officialUser._id,
-          },
-        },
-        { upsert: true, new: true, runValidators: true }
-      );
+      tempPassword = '';
     }
 
     return res.json({ success: true, user: serializeOfficialUser(user), tempPassword });

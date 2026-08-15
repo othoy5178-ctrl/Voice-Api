@@ -60,4 +60,7 @@ const GameCoinTransactionSchema = new mongoose.Schema({
   }
 });
 
+GameCoinTransactionSchema.index({ userId: 1, createdAt: -1 });
+GameCoinTransactionSchema.index({ gameId: 1, createdAt: -1 });
+
 export default mongoose.model("GameCoinTransaction", GameCoinTransactionSchema);
