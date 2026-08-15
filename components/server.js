@@ -460,6 +460,38 @@ const getVideoRoomFilter = (roomId) => {
   return null;
 };
 
+const resolveAgoraRoomChannel = async (roomId) => {
+  const stringRoomId = roomId ? roomId.toString() : '';
+  if (!stringRoomId) return null;
+
+  const videoFilter = getVideoRoomFilter(stringRoomId);
+  if (videoFilter) {
+    const videoRoom = await Room.findOne(videoFilter).select('_id channelName hostId').lean();
+    if (videoRoom?.channelName) {
+      return {
+        room: videoRoom,
+        roomMode: 'video',
+        channelName: videoRoom.channelName,
+        canonicalRoomId: videoRoom.channelName,
+      };
+    }
+  }
+
+  if (mongoose.Types.ObjectId.isValid(stringRoomId)) {
+    const audioRoom = await AudioRoom.findById(stringRoomId).select('_id hostId').lean();
+    if (audioRoom?._id) {
+      return {
+        room: audioRoom,
+        roomMode: 'audio',
+        channelName: audioRoom._id.toString(),
+        canonicalRoomId: audioRoom._id.toString(),
+      };
+    }
+  }
+
+  return null;
+};
+
 const closeStaleLiveRooms = async () => {
   const cutoff = getLiveRoomFreshCutoff();
   const now = new Date();
@@ -3142,7 +3174,8 @@ app.post('/create-video', async (req, res) => {
     if (!hostId) return res.status(400).json({ success: false, error: 'Host identifier missing' });
     if (!numericUid) return res.status(400).json({ success: false, error: 'Numeric UID missing for token generation' });
 
-    const uniqueChannelName = `glix_${hostId}_${Date.now().toString().slice(-4)}`;
+    const roomObjectId = new mongoose.Types.ObjectId();
+    const uniqueChannelName = `glix_${roomObjectId.toString()}`;
 
     const initialSlots = [
       {
@@ -3161,6 +3194,7 @@ app.post('/create-video', async (req, res) => {
     ];
 
     const newRoom = new Room({
+      _id: roomObjectId,
       channelName: uniqueChannelName,
       hostId,
       title: title || "Glix Live Room",
@@ -4001,10 +4035,18 @@ app.post('/regenerate-token', async (req, res) => {
     if (!roomId || !userId || !numericUid) return res.status(400).json({ error: "Missing required fields" });
 
     const sanitizedUid = parseInt(numericUid, 10) || 0;
-    const stringRoomId = roomId.toString();
 
     const appId = process.env.AGORA_APP_ID;
     const appCertificate = process.env.AGORA_APP_CERTIFICATE;
+    if (!appId || !appCertificate) {
+      return res.status(500).json({ success: false, message: 'Agora credentials are not configured.' });
+    }
+
+    const resolvedRoom = await resolveAgoraRoomChannel(roomId);
+    if (!resolvedRoom?.channelName) {
+      return res.status(404).json({ success: false, message: 'Room not found for token regeneration.' });
+    }
+
     const expirationTimeInSeconds = 3600;
     const currentTimestamp = Math.floor(Date.now() / 1000);
     const privilegeExpiredTs = currentTimestamp + expirationTimeInSeconds;
@@ -4015,7 +4057,7 @@ app.post('/regenerate-token', async (req, res) => {
     const token = RtcTokenBuilder.buildTokenWithUid(
       appId,
       appCertificate,
-      stringRoomId,
+      resolvedRoom.channelName,
       sanitizedUid,
       userRole,
       privilegeExpiredTs
@@ -4024,6 +4066,8 @@ app.post('/regenerate-token', async (req, res) => {
     return res.status(200).json({
       success: true,
       agoraToken: token,
+      channelName: resolvedRoom.channelName,
+      roomMode: resolvedRoom.roomMode,
       userRole: isBecomingSpeaker ? 'speaker' : 'audience'
     });
   } catch (error) {
