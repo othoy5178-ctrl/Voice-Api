@@ -6088,11 +6088,26 @@ const verifyQuantumSign = (providedSign, expectedRawValue) => {
   return !!incoming && incoming === expected;
 };
 
+const verifyQuantumSignAny = (providedSign, expectedRawValues = []) => (
+  expectedRawValues.some(value => verifyQuantumSign(providedSign, value))
+);
+
 const providerError = (res, errorCode, errorMsg, data = null) => res.json({
   errorCode,
   errorMsg,
   data,
 });
+
+const shouldLogQuantumProvider = () => String(process.env.QUANTUM_NEXUS_DEBUG_LOGS || 'true') !== 'false';
+
+const logQuantumProvider = (event, details = {}) => {
+  if (!shouldLogQuantumProvider()) return;
+  const safeDetails = { ...details };
+  delete safeDetails.token;
+  delete safeDetails.sign;
+  delete safeDetails.sharedKey;
+  console.log(`[QuantumProvider] ${event}`, safeDetails);
+};
 
 const validateQuantumUserSession = async (uid, token) => {
   if (!mongoose.Types.ObjectId.isValid(uid)) return null;
@@ -6130,17 +6145,39 @@ const handleQuantumFriendsList = async (req, res) => {
     const token = String(req.body?.token || '').trim();
     const sign = String(req.body?.sign || '').trim();
 
-    if (!sharedKey) return providerError(res, 503, 'Shared key is not configured.', []);
-    if (!uid || !token || !sign) return providerError(res, 400, 'uid, token and sign are required.', []);
-    if (!verifyQuantumSign(sign, `${uid}${token}${sharedKey}`)) return providerError(res, 401, 'Invalid signature.', []);
+    logQuantumProvider('friends_list_request', {
+      uid,
+      hasToken: !!token,
+      signLength: sign.length,
+    });
+
+    if (!sharedKey) {
+      logQuantumProvider('friends_list_response', { uid, errorCode: 503, errorMsg: 'Shared key is not configured.' });
+      return providerError(res, 503, 'Shared key is not configured.', []);
+    }
+    if (!uid || !token || !sign) {
+      logQuantumProvider('friends_list_response', { uid, errorCode: 400, errorMsg: 'uid, token and sign are required.' });
+      return providerError(res, 400, 'uid, token and sign are required.', []);
+    }
+    if (!verifyQuantumSign(sign, `${uid}${token}${sharedKey}`)) {
+      logQuantumProvider('friends_list_response', { uid, errorCode: 401, errorMsg: 'Invalid signature.' });
+      return providerError(res, 401, 'Invalid signature.', []);
+    }
 
     const user = await validateQuantumUserSession(uid, token);
-    if (!user) return providerError(res, 401, 'Invalid user session.', []);
+    if (!user) {
+      logQuantumProvider('friends_list_response', { uid, errorCode: 401, errorMsg: 'Invalid user session.' });
+      return providerError(res, 401, 'Invalid user session.', []);
+    }
 
     const friendIds = await resolveQuantumFriendIds(uid);
-    if (!friendIds.length) return res.json({ errorCode: 0, errorMsg: 'Success', data: [] });
+    if (!friendIds.length) {
+      logQuantumProvider('friends_list_response', { uid, errorCode: 0, friendCount: 0 });
+      return res.json({ errorCode: 0, errorMsg: 'Success', data: [] });
+    }
 
     const friends = await User.find({ _id: { $in: friendIds } }).select('_id name glixId profilePic').lean();
+    logQuantumProvider('friends_list_response', { uid, errorCode: 0, friendCount: friends.length });
     return res.json({
       errorCode: 0,
       errorMsg: 'Success',
@@ -6152,6 +6189,7 @@ const handleQuantumFriendsList = async (req, res) => {
     });
   } catch (error) {
     console.log('Quantum Nexus friend list error:', error.message);
+    logQuantumProvider('friends_list_response', { errorCode: 500, errorMsg: error.message });
     return providerError(res, 500, 'Internal server error.', []);
   }
 };
@@ -6165,16 +6203,41 @@ const handleQuantumUserInfo = async (req, res) => {
     const roomId = normalizeProviderRoomId(req.body);
     const sign = String(req.body?.sign || '').trim();
 
-    if (!sharedKey) return providerError(res, 503, 'Shared key is not configured.', null);
-    if (!gameId || !uid || !token || !sign) return providerError(res, 400, 'gameId, uid, token and sign are required.', null);
-    if (!verifyQuantumSign(sign, `${gameId}${uid}${token}${roomId}${sharedKey}`)) return providerError(res, 401, 'Invalid signature.', null);
+    logQuantumProvider('user_info_request', {
+      gameId,
+      uid,
+      roomId,
+      hasToken: !!token,
+      signLength: sign.length,
+    });
+
+    if (!sharedKey) {
+      logQuantumProvider('user_info_response', { gameId, uid, roomId, errorCode: 503, errorMsg: 'Shared key is not configured.' });
+      return providerError(res, 503, 'Shared key is not configured.', null);
+    }
+    if (!gameId || !uid || !token || !sign) {
+      logQuantumProvider('user_info_response', { gameId, uid, roomId, errorCode: 400, errorMsg: 'gameId, uid, token and sign are required.' });
+      return providerError(res, 400, 'gameId, uid, token and sign are required.', null);
+    }
+    if (!verifyQuantumSignAny(sign, [
+      `${gameId}${uid}${token}${roomId}${sharedKey}`,
+      `${gameId}${uid}${token}${sharedKey}`,
+    ])) {
+      logQuantumProvider('user_info_response', { gameId, uid, roomId, errorCode: 401, errorMsg: 'Invalid signature.' });
+      return providerError(res, 401, 'Invalid signature.', null);
+    }
 
     const user = await validateQuantumUserSession(uid, token);
-    if (!user) return providerError(res, 401, 'Invalid user session.', null);
+    if (!user) {
+      logQuantumProvider('user_info_response', { gameId, uid, roomId, errorCode: 401, errorMsg: 'Invalid user session.' });
+      return providerError(res, 401, 'Invalid user session.', null);
+    }
 
+    logQuantumProvider('user_info_response', { gameId, uid, roomId, errorCode: 0, coin: Math.max(0, Math.floor(Number(user?.chang || 0))) });
     return res.json({ errorCode: 0, errorMsg: 'Success', data: serializeQuantumUser(user) });
   } catch (error) {
     console.log('Quantum Nexus user info error:', error.message);
+    logQuantumProvider('user_info_response', { errorCode: 500, errorMsg: error.message });
     return providerError(res, 500, 'Internal server error.', null);
   }
 };
@@ -6200,11 +6263,30 @@ const handleQuantumCoinUpdate = async (req, res) => {
     const roomId = normalizeProviderRoomId(req.body);
     const sign = String(req.body?.sign || '').trim();
 
-    if (!sharedKey) return providerError(res, 503, 'Shared key is not configured.', null);
+    logQuantumProvider('coin_update_request', {
+      orderId,
+      gameId,
+      roundId,
+      uid,
+      coin,
+      type,
+      rewardType,
+      winId,
+      roomId,
+      hasToken: !!token,
+      signLength: sign.length,
+    });
+
+    if (!sharedKey) {
+      logQuantumProvider('coin_update_response', { orderId, gameId, uid, errorCode: 503, errorMsg: 'Shared key is not configured.' });
+      return providerError(res, 503, 'Shared key is not configured.', null);
+    }
     if (!orderId || !gameId || !roundId || !uid || !token || !sign || !Number.isFinite(coin) || coin < 0 || ![1, 2].includes(type) || !Number.isFinite(rewardType)) {
+      logQuantumProvider('coin_update_response', { orderId, gameId, uid, errorCode: 400, errorMsg: 'Invalid request parameters.' });
       return providerError(res, 400, 'Invalid request parameters.', null);
     }
     if (!verifyQuantumSign(sign, `${orderId}${gameId}${roundId}${uid}${coin}${type}${rewardType}${token}${winId}${sharedKey}`)) {
+      logQuantumProvider('coin_update_response', { orderId, gameId, uid, errorCode: 401, errorMsg: 'Invalid signature.' });
       return providerError(res, 401, 'Invalid signature.', null);
     }
 
@@ -6212,7 +6294,10 @@ const handleQuantumCoinUpdate = async (req, res) => {
     if (duplicateResult) return duplicateResult;
 
     const user = await validateQuantumUserSession(uid, token);
-    if (!user) return providerError(res, 401, 'Invalid user session.', null);
+    if (!user) {
+      logQuantumProvider('coin_update_response', { orderId, gameId, uid, errorCode: 401, errorMsg: 'Invalid user session.' });
+      return providerError(res, 401, 'Invalid user session.', null);
+    }
 
     const update = type === 1
       ? { $inc: { chang: -coin } }
@@ -6222,7 +6307,10 @@ const handleQuantumCoinUpdate = async (req, res) => {
       : { _id: uid };
 
     const updatedUser = await User.findOneAndUpdate(query, update, { new: true }).select('_id chang');
-    if (!updatedUser) return providerError(res, 402, 'Insufficient coins.', null);
+    if (!updatedUser) {
+      logQuantumProvider('coin_update_response', { orderId, gameId, uid, errorCode: 402, errorMsg: 'Insufficient coins.' });
+      return providerError(res, 402, 'Insufficient coins.', null);
+    }
 
     const balanceAfter = Math.max(0, Math.floor(Number(updatedUser.chang || 0)));
     await GameCoinTransaction.create({
@@ -6242,6 +6330,7 @@ const handleQuantumCoinUpdate = async (req, res) => {
       source: type === 1 ? 'game_coin_consume' : 'game_coin_reward',
     });
 
+    logQuantumProvider('coin_update_response', { orderId, gameId, uid, errorCode: 0, coin: balanceAfter });
     return res.json({ errorCode: 0, errorMsg: 'Success', data: { coin: balanceAfter } });
   } catch (error) {
     if (error?.code === 11000 && req.body?.orderId) {
@@ -6249,6 +6338,7 @@ const handleQuantumCoinUpdate = async (req, res) => {
       if (existing) return res.json({ errorCode: 0, errorMsg: 'Success', data: { coin: existing.balanceAfter } });
     }
     console.log('Quantum Nexus coin update error:', error.message);
+    logQuantumProvider('coin_update_response', { errorCode: 500, errorMsg: error.message });
     return providerError(res, 500, 'Internal server error.', null);
   }
 };
@@ -6266,20 +6356,43 @@ const handleQuantumCoinSupplement = async (req, res) => {
     const roomId = normalizeProviderRoomId(req.body);
     const sign = String(req.body?.sign || '').trim();
 
-    if (!sharedKey) return providerError(res, 503, 'Shared key is not configured.', null);
+    logQuantumProvider('coin_supplement_request', {
+      orderId,
+      gameId,
+      roundId,
+      uid,
+      coin,
+      rewardType,
+      winId,
+      roomId,
+      signLength: sign.length,
+    });
+
+    if (!sharedKey) {
+      logQuantumProvider('coin_supplement_response', { orderId, gameId, uid, errorCode: 503, errorMsg: 'Shared key is not configured.' });
+      return providerError(res, 503, 'Shared key is not configured.', null);
+    }
     if (!orderId || !gameId || !roundId || !uid || !sign || !Number.isFinite(coin) || coin < 0 || !Number.isFinite(rewardType)) {
+      logQuantumProvider('coin_supplement_response', { orderId, gameId, uid, errorCode: 400, errorMsg: 'Invalid request parameters.' });
       return providerError(res, 400, 'Invalid request parameters.', null);
     }
     if (!verifyQuantumSign(sign, `${orderId}${gameId}${roundId}${uid}${coin}${rewardType}${winId}${sharedKey}`)) {
+      logQuantumProvider('coin_supplement_response', { orderId, gameId, uid, errorCode: 401, errorMsg: 'Invalid signature.' });
       return providerError(res, 401, 'Invalid signature.', null);
     }
 
     const duplicateResult = await getExistingGameCoinResult(orderId, res);
     if (duplicateResult) return duplicateResult;
 
-    if (!mongoose.Types.ObjectId.isValid(uid)) return providerError(res, 400, 'Invalid uid.', null);
+    if (!mongoose.Types.ObjectId.isValid(uid)) {
+      logQuantumProvider('coin_supplement_response', { orderId, gameId, uid, errorCode: 400, errorMsg: 'Invalid uid.' });
+      return providerError(res, 400, 'Invalid uid.', null);
+    }
     const updatedUser = await User.findByIdAndUpdate(uid, { $inc: { chang: coin } }, { new: true }).select('_id chang');
-    if (!updatedUser) return providerError(res, 404, 'User not found.', null);
+    if (!updatedUser) {
+      logQuantumProvider('coin_supplement_response', { orderId, gameId, uid, errorCode: 404, errorMsg: 'User not found.' });
+      return providerError(res, 404, 'User not found.', null);
+    }
 
     const balanceAfter = Math.max(0, Math.floor(Number(updatedUser.chang || 0)));
     await GameCoinTransaction.create({
@@ -6299,6 +6412,7 @@ const handleQuantumCoinSupplement = async (req, res) => {
       source: 'game_coin_supplement',
     });
 
+    logQuantumProvider('coin_supplement_response', { orderId, gameId, uid, errorCode: 0, coin: balanceAfter });
     return res.json({ errorCode: 0, errorMsg: 'Success', data: { coin: balanceAfter } });
   } catch (error) {
     if (error?.code === 11000 && req.body?.orderId) {
@@ -6306,6 +6420,7 @@ const handleQuantumCoinSupplement = async (req, res) => {
       if (existing) return res.json({ errorCode: 0, errorMsg: 'Success', data: { coin: existing.balanceAfter } });
     }
     console.log('Quantum Nexus coin supplement error:', error.message);
+    logQuantumProvider('coin_supplement_response', { errorCode: 500, errorMsg: error.message });
     return providerError(res, 500, 'Internal server error.', null);
   }
 };
