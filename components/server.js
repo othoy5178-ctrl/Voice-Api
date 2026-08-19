@@ -2154,21 +2154,33 @@ io.on('connection', (socket) => {
   });
 
   // 3. EVENT: Chat Messages
-  socket.on('send_message', ({ roomId, senderName, text, userId, mentions = [] }) => {
+  socket.on('send_message', async ({ roomId, senderName, text, userId, mentions = [] }) => {
     const stringRoomId = roomId ? roomId.toString() : '';
     const normalizedMentions = [...new Set(
       (Array.isArray(mentions) ? mentions : [])
         .map(id => id?.toString?.() || String(id || ''))
         .filter(Boolean)
     )];
+    const stringUserId = userId ? userId.toString() : '';
+    let senderLevel = 1;
+
+    try {
+      if (mongoose.Types.ObjectId.isValid(stringUserId)) {
+        const sender = await User.findById(stringUserId).select('daimon').lean();
+        senderLevel = calculateUserLevelValue(sender?.daimon || 0);
+      }
+    } catch (error) {
+      console.log('Unable to calculate chat sender level:', error.message);
+    }
 
     io.to(stringRoomId).emit('receive_message', {
       id: Date.now().toString() + Math.random().toString(),
       type: 'user',
       sender: senderName,
       text: text,
-      userId: userId,
-      mentions: normalizedMentions
+      userId: stringUserId || userId,
+      mentions: normalizedMentions,
+      level: senderLevel
     });
   });
 
