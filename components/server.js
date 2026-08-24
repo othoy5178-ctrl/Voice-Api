@@ -4529,7 +4529,7 @@ app.post('/register', async (req, res) => {
       email: normalizedEmail,
       password: hashedPassword,
       profilePic: profilePic || '',
-      googleId: googleId || null,
+      ...(googleId ? { googleId } : {}),
       glixId: await createUniqueUserPublicId()
     });
     await newUser.save();

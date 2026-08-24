@@ -100,9 +100,8 @@ const userSchema = new mongoose.Schema({
   }],
   googleId: {
     type: String,
-    default: null,
-    unique: true,
-    sparse: true
+    default: undefined,
+    trim: true
   },
   createdAt: {
     type: Date,
@@ -319,6 +318,16 @@ userSchema.index(
     unique: true,
     partialFilterExpression: {
       agencyCode: { $type: 'string', $ne: '' },
+    },
+  }
+);
+
+userSchema.index(
+  { googleId: 1 },
+  {
+    unique: true,
+    partialFilterExpression: {
+      googleId: { $type: 'string' },
     },
   }
 );
