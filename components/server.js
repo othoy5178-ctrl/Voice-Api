@@ -3165,6 +3165,7 @@ app.get('/Friends/:userId', async (req, res) => {
     // 3. Return the combined data
     res.status(200).json({
       ...user._doc,
+      roles: normalizeUserRoles(user),
       friends: friendCount // This matches your profile UI needs
     });
 
@@ -4517,7 +4518,7 @@ app.post('/register', async (req, res) => {
         success: true,
         message: 'Login successful!',
         token,
-        user: { id: user._id, name: user.name, email: user.email, glixId: user.glixId }
+        user: serializeOfficialUser(user)
       });
     }
 
@@ -4538,7 +4539,7 @@ app.post('/register', async (req, res) => {
       success: true,
       message: 'Registered!',
       token,
-      user: { id: newUser._id, name: newUser.name, email: newUser.email, glixId: newUser.glixId }
+      user: serializeOfficialUser(newUser)
     });
   } catch (error) {
     return res.status(500).json({ message: error.message });
@@ -5063,7 +5064,7 @@ app.post('/rewards/claim', async (req, res) => {
   }
 });
 
-const PUBLIC_USER_FIELDS = 'name email profilePic glixId googleId createdAt lastLogin followersCount followingCount daimon chang frameUrl entryVideoUrl isVip vipExpiresAt vipBadgeUrl vipItemKey settings blacklistedUsers gender birthday countryRegion voiceSignature signature albumPhotos role accountStatus hostStatus agencyStatus agencyCode coinSellerStatus';
+const PUBLIC_USER_FIELDS = 'name email profilePic glixId googleId createdAt lastLogin followersCount followingCount daimon chang frameUrl entryVideoUrl isVip vipExpiresAt vipBadgeUrl vipItemKey settings blacklistedUsers gender birthday countryRegion voiceSignature signature albumPhotos role roles accountStatus hostStatus agencyStatus agencyCode coinSellerStatus adminAccessRequest';
 
 const sanitizeUserSettings = (settings = {}) => {
   const allowedMessagesFrom = ['everyone', 'following', 'none'];
@@ -5654,7 +5655,42 @@ const OFFICIAL_SESSION_MS = OFFICIAL_SESSION_DAYS * 24 * 60 * 60 * 1000;
 
 const hashToken = (token) => crypto.createHash('sha256').update(String(token || '')).digest('hex');
 
-const officialUserProjection = 'name email profilePic glixId role accountStatus createdAt lastLogin chang daimon hostStatus agencyStatus coinSellerStatus sellerBalance sellerTotalSold adminNote';
+const APP_ROLE_VALUES = ['user', 'host', 'agency', 'manager', 'admin', 'coin_seller', 'super_admin'];
+
+const normalizeUserRoles = (user = {}) => {
+  const plain = typeof user.toObject === 'function' ? user.toObject() : user;
+  const roleSet = new Set(['user']);
+  const addRole = (role) => {
+    const clean = String(role || '').toLowerCase();
+    if (APP_ROLE_VALUES.includes(clean)) roleSet.add(clean);
+  };
+
+  (Array.isArray(plain?.roles) ? plain.roles : []).forEach(addRole);
+  addRole(plain?.role);
+  if (plain?.hostStatus === 'approved' || plain?.hostRegistration?.status === 'approved') addRole('host');
+  if (plain?.agencyStatus === 'approved' || plain?.agencyRegistration?.status === 'approved') addRole('agency');
+  if (plain?.coinSellerStatus === 'approved' || plain?.coinSellerRegistration?.status === 'approved') addRole('coin_seller');
+  if (plain?.adminAccessRequest?.status === 'approved') addRole(plain.adminAccessRequest.requestedRole);
+  return Array.from(roleSet);
+};
+
+const hasUserRole = (user, role) => normalizeUserRoles(user).includes(String(role || '').toLowerCase());
+
+const addUserRole = (user, role) => {
+  if (!user) return;
+  const roles = normalizeUserRoles(user);
+  const clean = String(role || '').toLowerCase();
+  if (APP_ROLE_VALUES.includes(clean) && !roles.includes(clean)) roles.push(clean);
+  user.roles = roles;
+};
+
+const removeUserRole = (user, role) => {
+  if (!user) return;
+  const clean = String(role || '').toLowerCase();
+  user.roles = normalizeUserRoles(user).filter(item => item === 'user' || item !== clean);
+};
+
+const officialUserProjection = 'name email profilePic glixId role roles accountStatus createdAt lastLogin chang daimon hostStatus agencyStatus coinSellerStatus sellerBalance sellerTotalSold adminNote';
 const officialAccountProjection = 'name email role status permissions sourceUserId note rejectionReason createdBy reviewedBy reviewedAt createdAt updatedAt lastLogin';
 
 const serializeOfficialUser = (user) => {
@@ -5662,6 +5698,7 @@ const serializeOfficialUser = (user) => {
   const plain = typeof user.toObject === 'function' ? user.toObject() : user;
   const { password, passwordResetOtpHash, passwordResetOtpExpiresAt, passwordResetOtpRequestedAt, passwordResetOtpAttempts, ...safe } = plain;
   if (safe._id && !safe.id) safe.id = safe._id.toString();
+  safe.roles = normalizeUserRoles(safe);
   return safe;
 };
 
@@ -5926,9 +5963,9 @@ const requireAppRole = (...allowedRoles) => async (req, res, next) => {
       return res.status(403).json({ success: false, message: `Your account is ${user.accountStatus}` });
     }
 
-    const role = String(user.role || 'user').toLowerCase();
     const normalizedAllowedRoles = allowedRoles.map(item => String(item || '').toLowerCase());
-    if (role !== 'super_admin' && !normalizedAllowedRoles.includes(role)) {
+    const userRoles = normalizeUserRoles(user);
+    if (!userRoles.includes('super_admin') && !normalizedAllowedRoles.some(role => userRoles.includes(role))) {
       return res.status(403).json({ success: false, message: 'You do not have permission for this app dashboard action.' });
     }
 
@@ -6658,7 +6695,7 @@ app.post('/admin/access/request', async (req, res) => {
 
     const user = await User.findById(userId);
     if (!user) return res.status(404).json({ success: false, message: 'User not found' });
-    if (user.role === requestedRole) {
+    if (hasUserRole(user, requestedRole)) {
       return res.status(400).json({ success: false, message: `You already have ${requestedRole} access` });
     }
     if (user.adminAccessRequest?.status === 'pending' && user.adminAccessRequest?.requestedRole === requestedRole) {
@@ -6676,7 +6713,11 @@ app.post('/admin/access/request', async (req, res) => {
     };
     await user.save();
 
-    return res.json({ success: true, message: 'Request submitted for Super Admin approval.' });
+    return res.json({
+      success: true,
+      message: 'Request submitted for Super Admin approval.',
+      adminAccessRequest: user.adminAccessRequest,
+    });
   } catch (error) {
     return res.status(500).json({ success: false, message: error.message });
   }
@@ -6806,22 +6847,24 @@ app.get('/admin/users', requireOfficial, async (req, res) => {
     const page = Math.max(1, Number(req.query.page || 1));
     const limit = Math.min(100, Math.max(1, Number(req.query.limit || 25)));
     const query = {};
-    if (req.query.role && req.query.role !== 'all') query.role = req.query.role;
+    const andFilters = [];
+    if (req.query.role && req.query.role !== 'all') andFilters.push({ $or: [{ role: req.query.role }, { roles: req.query.role }] });
     if (req.query.accountStatus && req.query.accountStatus !== 'all') query.accountStatus = req.query.accountStatus;
     const search = String(req.query.search || '').trim();
     if (search) {
-      query.$or = [
+      andFilters.push({ $or: [
         { name: { $regex: search, $options: 'i' } },
         { email: { $regex: search, $options: 'i' } },
         { glixId: { $regex: search, $options: 'i' } },
-      ];
+      ] });
     }
+    if (andFilters.length) query.$and = andFilters;
 
     const [total, users] = await Promise.all([
       User.countDocuments(query),
       User.find(query).select(officialUserProjection).sort({ createdAt: -1 }).skip((page - 1) * limit).limit(limit).lean(),
     ]);
-    return res.json({ success: true, users, page, pages: Math.max(1, Math.ceil(total / limit)), total });
+    return res.json({ success: true, users: users.map(serializeOfficialUser), page, pages: Math.max(1, Math.ceil(total / limit)), total });
   } catch (error) {
     return res.status(500).json({ success: false, message: error.message });
   }
@@ -6842,7 +6885,11 @@ app.patch('/admin/users/:userId', requireOfficial, async (req, res) => {
       if (update.accountStatus && update.accountStatus !== 'active') return res.status(400).json({ success: false, message: 'You cannot disable your own Official account' });
     }
 
-    const user = await User.findByIdAndUpdate(req.params.userId, { $set: update }, { new: true, runValidators: true }).select(officialUserProjection);
+    const write = { $set: update };
+    if (update.role && APP_ROLE_VALUES.includes(String(update.role).toLowerCase())) {
+      write.$addToSet = { roles: String(update.role).toLowerCase() };
+    }
+    const user = await User.findByIdAndUpdate(req.params.userId, write, { new: true, runValidators: true }).select(officialUserProjection);
     if (!user) return res.status(404).json({ success: false, message: 'User not found' });
     return res.json({ success: true, user });
   } catch (error) {
@@ -6873,8 +6920,16 @@ app.patch('/host/requests/:userId', requireOfficial, async (req, res) => {
     user.hostRegistration.reviewedAt = new Date();
 
     if (status === 'approved') {
-      user.role = user.agencyStatus === 'approved' || user.role === 'agency' ? 'agency' : 'host';
+      addUserRole(user, 'host');
+      if (user.agencyStatus === 'approved' || hasUserRole(user, 'agency')) {
+        user.role = 'agency';
+        addUserRole(user, 'agency');
+      } else if (!user.role || user.role === 'user') {
+        user.role = 'host';
+      }
       await linkApprovedHostToAgency(user);
+    } else {
+      removeUserRole(user, 'host');
     }
 
     await user.save();
@@ -7005,10 +7060,10 @@ const buildAgencyHostQuery = (agencyUser) => {
 app.get('/agency/dashboard', requireAppUser, async (req, res) => {
   try {
     const agencyUser = await User.findById(req.authUser._id)
-      .select('_id role agencyStatus agencyCode agencyRegistration totalHostCoins commissionBalance')
+      .select('_id role roles agencyStatus agencyCode agencyRegistration totalHostCoins commissionBalance')
       .lean();
 
-    if (!agencyUser || (agencyUser.role !== 'agency' && agencyUser.agencyStatus !== 'approved')) {
+    if (!agencyUser || (!hasUserRole(agencyUser, 'agency') && agencyUser.agencyStatus !== 'approved')) {
       return res.status(403).json({ success: false, message: 'Agency account required.' });
     }
 
@@ -7116,7 +7171,7 @@ const recordAgencyCommissionForGift = async ({ receiverId, sourceCoins }) => {
   const day = getCommissionDayKey();
   const agency = await User.findOne({
     _id: agencyId,
-    $or: [{ role: 'agency' }, { agencyStatus: 'approved' }],
+    $or: [{ role: 'agency' }, { roles: 'agency' }, { agencyStatus: 'approved' }],
   }).select('totalHostCoins').lean();
 
   if (!agency) return null;
@@ -7349,9 +7404,12 @@ app.patch('/agency/requests/:userId', requireOfficial, async (req, res) => {
       if (agencyCodeError) return res.status(400).json({ success: false, message: agencyCodeError });
       const existingAgencyCodeOwner = await findAgencyCodeOwner(agencyCode, user._id);
       if (existingAgencyCodeOwner) return sendDuplicateAgencyCodeResponse(res);
+      addUserRole(user, 'agency');
       user.role = 'agency';
       user.agencyCode = agencyCode;
       user.agencyRegistration.requestedAgencyCode = agencyCode;
+    } else {
+      removeUserRole(user, 'agency');
     }
     await user.save();
     if (status === 'approved') await backfillApprovedHostsForAgency(user);
@@ -7383,7 +7441,7 @@ app.get('/mobile/agency/requests', requireAppRole('admin'), async (req, res) => 
 app.get('/mobile/admin/agencies', requireAppRole('admin', 'manager'), async (req, res) => {
   try {
     const agencies = await User.aggregate([
-      { $match: { $or: [{ role: 'agency' }, { agencyStatus: 'approved' }] } },
+      { $match: { $or: [{ role: 'agency' }, { roles: 'agency' }, { agencyStatus: 'approved' }] } },
       {
         $lookup: {
           from: 'users',
@@ -7479,12 +7537,35 @@ app.get('/admin/access/requests', requireOfficial, async (req, res) => {
         requestedAt: account.createdAt,
       },
     }));
-    const appRows = appRequests.map(user => ({ ...user, requestKind: 'app_user' }));
+    const appRows = appRequests.map(user => {
+      const request = user.adminAccessRequest || {};
+      return {
+        ...user,
+        requestKind: 'app_user',
+        adminAccessRequest: {
+          requestedRole: request.requestedRole || '',
+          status: request.status || 'none',
+          note: request.note || '',
+          rejectionReason: request.rejectionReason || '',
+          reviewedBy: request.reviewedBy || null,
+          reviewedAt: request.reviewedAt || null,
+          requestedAt: request.requestedAt || user.updatedAt || user.createdAt,
+        },
+      };
+    });
     const requests = [...officialRows, ...appRows].sort((a, b) => (
       new Date(b.adminAccessRequest?.requestedAt || b.createdAt || 0) - new Date(a.adminAccessRequest?.requestedAt || a.createdAt || 0)
     ));
 
-    return res.json({ success: true, requests });
+    return res.json({
+      success: true,
+      requests,
+      counts: {
+        total: requests.length,
+        appUsers: appRows.length,
+        officialAccounts: officialRows.length,
+      },
+    });
   } catch (error) {
     return res.status(500).json({ success: false, message: error.message });
   }
@@ -7511,7 +7592,7 @@ app.patch('/admin/access/requests/:userId', requireOfficial, async (req, res) =>
       return res.json({ success: true, user: serializeOfficialAccount(officialUser) });
     }
 
-    const targetUser = await User.findById(req.params.userId).select('name email password adminAccessRequest');
+    const targetUser = await User.findById(req.params.userId).select('name email password role roles adminAccessRequest');
     if (!targetUser) return res.status(404).json({ success: false, message: 'User not found' });
 
     const requestedRole = ['admin', 'manager', 'super_admin'].includes(req.body?.role)
@@ -7527,10 +7608,14 @@ app.patch('/admin/access/requests/:userId', requireOfficial, async (req, res) =>
       'adminAccessRequest.reviewedAt': new Date(),
       'adminAccessRequest.rejectionReason': status === 'rejected' ? String(req.body?.reason || '') : '',
     };
+    const write = { $set: update };
     if (status === 'approved') {
-      update.role = requestedRole;
+      if (!targetUser.role || targetUser.role === 'user') update.role = requestedRole;
+      write.$addToSet = { roles: requestedRole };
+    } else if (['admin', 'manager'].includes(requestedRole)) {
+      write.$pull = { roles: requestedRole };
     }
-    const user = await User.findByIdAndUpdate(req.params.userId, { $set: update }, { new: true, runValidators: true });
+    const user = await User.findByIdAndUpdate(req.params.userId, write, { new: true, runValidators: true });
 
     let tempPassword = '';
     if (status === 'approved') {
@@ -7757,8 +7842,8 @@ app.get('/wallet/exchanges/my/:userId', async (req, res) => {
 const getWithdrawalSourceForUser = (user, requestedSource = '') => {
   const source = String(requestedSource || '').trim();
   if (['daimon', 'commissionBalance', 'revenueBalance'].includes(source)) return source;
-  if (user?.role === 'agency' || user?.agencyStatus === 'approved') return 'commissionBalance';
-  if (['admin', 'manager', 'super_admin'].includes(user?.role)) return 'revenueBalance';
+  if (hasUserRole(user, 'agency') || user?.agencyStatus === 'approved') return 'commissionBalance';
+  if (['admin', 'manager', 'super_admin'].some(role => hasUserRole(user, role))) return 'revenueBalance';
   return 'daimon';
 };
 
@@ -8003,7 +8088,7 @@ app.post('/admin/withdrawals/:withdrawalId/deduct-balance', requireOfficial, asy
 app.get('/admin/agencies', requireOfficial, async (req, res) => {
   try {
     const agencies = await User.aggregate([
-      { $match: { $or: [{ role: 'agency' }, { agencyStatus: 'approved' }] } },
+      { $match: { $or: [{ role: 'agency' }, { roles: 'agency' }, { agencyStatus: 'approved' }] } },
       {
         $lookup: {
           from: 'users',
@@ -8142,12 +8227,13 @@ app.patch('/admin/store/items/:itemId', requireOfficial, async (req, res) => {
 });
 
 
-const sellerProjection = 'name email profilePic glixId role accountStatus coinSellerStatus coinSellerRegistration sellerBalance sellerTotalSold createdAt';
+const sellerProjection = 'name email profilePic glixId role roles accountStatus coinSellerStatus coinSellerRegistration sellerBalance sellerTotalSold createdAt';
 
 const serializeSeller = (user) => {
   if (!user) return null;
   const plain = typeof user.toObject === 'function' ? user.toObject() : user;
   const { password, passwordResetOtpHash, adminAccessRequest, ...safe } = plain;
+  safe.roles = normalizeUserRoles(safe);
   return safe;
 };
 
@@ -8197,7 +8283,7 @@ const requireCoinSeller = async (req, res, next) => {
     if ((seller.accountStatus || 'active') !== 'active') {
       return res.status(403).json({ success: false, message: `Account is ${seller.accountStatus}` });
     }
-    if (seller.coinSellerStatus !== 'approved' && seller.role !== 'coin_seller') {
+    if (seller.coinSellerStatus !== 'approved' && !hasUserRole(seller, 'coin_seller')) {
       return res.status(403).json({ success: false, message: `Coin seller request is ${seller.coinSellerStatus || 'not approved'}` });
     }
 
@@ -8283,12 +8369,13 @@ app.post('/coin-seller/login', async (req, res) => {
     const ok = await bcrypt.compare(password, user.password);
     if (!ok) return res.status(401).json({ success: false, message: 'Invalid email or password' });
     if ((user.accountStatus || 'active') !== 'active') return res.status(403).json({ success: false, message: `Account is ${user.accountStatus}` });
-    if (user.coinSellerStatus !== 'approved' && user.role !== 'coin_seller') {
+    if (user.coinSellerStatus !== 'approved' && !hasUserRole(user, 'coin_seller')) {
       return res.status(403).json({ success: false, message: `Coin seller request is ${user.coinSellerStatus || 'not approved'}` });
     }
 
     user.lastLogin = new Date();
-    user.role = 'coin_seller';
+    if (!user.role || user.role === 'user') user.role = 'coin_seller';
+    addUserRole(user, 'coin_seller');
     user.coinSellerStatus = 'approved';
     user.coinSellerRegistration.status = 'approved';
     await user.save();
@@ -8384,7 +8471,6 @@ app.patch('/admin/coin-seller/requests/:userId', requireOfficial, async (req, re
     const status = ['approved', 'rejected', 'suspended'].includes(req.body?.status) ? req.body.status : null;
     if (!status) return res.status(400).json({ success: false, message: 'Invalid coin seller status' });
     const update = {
-      role: status === 'approved' ? 'coin_seller' : undefined,
       coinSellerStatus: status,
       coinSellerRejectionReason: status === 'rejected' ? String(req.body?.reason || '') : '',
       'coinSellerRegistration.status': status,
@@ -8392,8 +8478,12 @@ app.patch('/admin/coin-seller/requests/:userId', requireOfficial, async (req, re
       'coinSellerRegistration.reviewedBy': req.officialUser._id,
       'coinSellerRegistration.reviewedAt': new Date(),
     };
+    if (status === 'approved') update.role = 'coin_seller';
     Object.keys(update).forEach(key => update[key] === undefined && delete update[key]);
-    const user = await User.findByIdAndUpdate(req.params.userId, { $set: update }, { new: true });
+    const write = { $set: update };
+    if (status === 'approved') write.$addToSet = { roles: 'coin_seller' };
+    if (['rejected', 'suspended'].includes(status)) write.$pull = { roles: 'coin_seller' };
+    const user = await User.findByIdAndUpdate(req.params.userId, write, { new: true });
     if (!user) return res.status(404).json({ success: false, message: 'User not found' });
     return res.json({ success: true, user: serializeOfficialUser(user) });
   } catch (error) {
@@ -8403,8 +8493,8 @@ app.patch('/admin/coin-seller/requests/:userId', requireOfficial, async (req, re
 
 app.get('/admin/coin-sellers', requireOfficial, async (req, res) => {
   try {
-    const sellers = await User.find({ $or: [{ coinSellerStatus: { $in: ['approved', 'suspended'] } }, { role: 'coin_seller' }] })
-      .select('name email glixId role coinSellerStatus coinSellerRegistration sellerBalance sellerTotalSold createdAt')
+    const sellers = await User.find({ $or: [{ coinSellerStatus: { $in: ['approved', 'suspended'] } }, { role: 'coin_seller' }, { roles: 'coin_seller' }] })
+      .select('name email glixId role roles coinSellerStatus coinSellerRegistration sellerBalance sellerTotalSold createdAt')
       .sort({ createdAt: -1 })
       .lean();
     return res.json({ success: true, sellers });
@@ -8518,7 +8608,7 @@ app.post('/admin/agency-targets', requireOfficial, async (req, res) => {
 
     const agency = await User.findOne({
       _id: agencyId,
-      $or: [{ role: 'agency' }, { agencyStatus: 'approved' }],
+      $or: [{ role: 'agency' }, { roles: 'agency' }, { agencyStatus: 'approved' }],
     }).select('_id');
     if (!agency) return res.status(404).json({ success: false, message: 'Approved agency not found' });
 

@@ -153,6 +153,12 @@ const userSchema = new mongoose.Schema({
     default: 'user',
     index: true
   },
+  roles: {
+    type: [String],
+    enum: ['user', 'host', 'agency', 'manager', 'admin', 'coin_seller', 'super_admin'],
+    default: ['user'],
+    index: true
+  },
   agencyId: {
     type: mongoose.Schema.Types.ObjectId,
     ref: 'User',
