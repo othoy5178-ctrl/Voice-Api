@@ -7429,6 +7429,151 @@ app.get('/mobile/host/requests', requireAppRole('admin', 'manager'), async (req,
   }
 });
 
+app.patch('/mobile/host/requests/:userId', requireAppRole('admin', 'manager'), async (req, res) => {
+  try {
+    const status = ['approved', 'rejected'].includes(req.body?.status) ? req.body.status : null;
+    if (!status) return res.status(400).json({ success: false, message: 'Invalid host status' });
+
+    const user = await User.findById(req.params.userId);
+    if (!user) return res.status(404).json({ success: false, message: 'User not found' });
+
+    user.hostStatus = status;
+    user.hostRejectionReason = status === 'rejected' ? String(req.body?.reason || '') : '';
+    user.hostRegistration.status = status;
+    user.hostRegistration.rejectionReason = user.hostRejectionReason;
+    user.hostRegistration.reviewedBy = req.authUser._id;
+    user.hostRegistration.reviewedAt = new Date();
+
+    if (status === 'approved') {
+      addUserRole(user, 'host');
+      if (!user.role || user.role === 'user') user.role = 'host';
+      await linkApprovedHostToAgency(user);
+    } else {
+      removeUserRole(user, 'host');
+    }
+
+    await user.save();
+    return res.json({ success: true, user: serializeOfficialUser(user) });
+  } catch (error) {
+    return res.status(500).json({ success: false, message: error.message });
+  }
+});
+
+app.get('/mobile/admin-access/requests', requireAppRole('manager'), async (req, res) => {
+  try {
+    const requests = await User.find({
+      'adminAccessRequest.status': 'pending',
+      'adminAccessRequest.requestedRole': 'admin',
+    }).select('-password -passwordResetOtpHash').sort({ 'adminAccessRequest.requestedAt': -1, createdAt: -1 }).lean();
+    return res.json({ success: true, requests });
+  } catch (error) {
+    return res.status(500).json({ success: false, message: error.message });
+  }
+});
+
+app.patch('/mobile/admin-access/requests/:userId', requireAppRole('manager'), async (req, res) => {
+  try {
+    const status = ['approved', 'rejected'].includes(req.body?.status) ? req.body.status : null;
+    if (!status) return res.status(400).json({ success: false, message: 'Invalid request status' });
+
+    const targetUser = await User.findById(req.params.userId).select('name email role roles adminAccessRequest');
+    if (!targetUser) return res.status(404).json({ success: false, message: 'User not found' });
+    if (targetUser.adminAccessRequest?.requestedRole !== 'admin') {
+      return res.status(403).json({ success: false, message: 'Manager can only review admin access requests.' });
+    }
+
+    targetUser.adminAccessRequest.status = status;
+    targetUser.adminAccessRequest.reviewedBy = req.authUser._id;
+    targetUser.adminAccessRequest.reviewedAt = new Date();
+    targetUser.adminAccessRequest.rejectionReason = status === 'rejected' ? String(req.body?.reason || '') : '';
+
+    if (status === 'approved') {
+      addUserRole(targetUser, 'admin');
+      if (!targetUser.role || targetUser.role === 'user') targetUser.role = 'admin';
+    } else {
+      removeUserRole(targetUser, 'admin');
+    }
+
+    await targetUser.save();
+    return res.json({ success: true, user: serializeOfficialUser(targetUser) });
+  } catch (error) {
+    return res.status(500).json({ success: false, message: error.message });
+  }
+});
+
+app.get('/mobile/team/belows', requireAppRole('admin', 'manager', 'agency', 'coin_seller'), async (req, res) => {
+  try {
+    const authUser = req.authUser;
+    const roles = normalizeUserRoles(authUser);
+    const userProjection = 'name email profilePic glixId role roles hostStatus agencyStatus coinSellerStatus daimon chang totalHostCoins commissionBalance revenueBalance createdAt hostRegistration adminAccessRequest';
+    const result = {
+      admins: [],
+      hosts: [],
+      agencyHosts: [],
+      buyers: [],
+      counts: { admins: 0, hosts: 0, agencyHosts: 0, buyers: 0 },
+    };
+
+    if (roles.includes('manager')) {
+      result.admins = await User.find({
+        'adminAccessRequest.status': 'approved',
+        'adminAccessRequest.requestedRole': 'admin',
+        'adminAccessRequest.reviewedBy': authUser._id,
+      }).select(userProjection).sort({ 'adminAccessRequest.reviewedAt': -1 }).lean();
+      result.hosts = await User.find({
+        hostStatus: 'approved',
+        'hostRegistration.reviewedBy': authUser._id,
+      }).select(userProjection).sort({ 'hostRegistration.reviewedAt': -1 }).lean();
+    } else if (roles.includes('admin')) {
+      result.hosts = await User.find({
+        hostStatus: 'approved',
+        'hostRegistration.reviewedBy': authUser._id,
+      }).select(userProjection).sort({ 'hostRegistration.reviewedAt': -1 }).lean();
+    }
+
+    if (roles.includes('agency')) {
+      result.agencyHosts = await User.find(buildAgencyHostQuery(authUser))
+        .select(userProjection)
+        .sort({ createdAt: -1 })
+        .lean();
+    }
+
+    if (roles.includes('coin_seller')) {
+      const transactions = await CoinSellerTransaction.find({ sellerId: authUser._id })
+        .populate('buyerId', 'name email profilePic glixId chang createdAt')
+        .sort({ createdAt: -1 })
+        .limit(100)
+        .lean();
+      const buyerMap = new Map();
+      transactions.forEach((transaction) => {
+        const buyer = transaction.buyerId || {};
+        const buyerId = buyer._id?.toString?.() || transaction.buyerGlixId;
+        if (!buyerId || buyerMap.has(buyerId)) return;
+        buyerMap.set(buyerId, {
+          ...buyer,
+          lastCoins: transaction.coins || 0,
+          lastSoldAt: transaction.createdAt,
+        });
+      });
+      result.buyers = Array.from(buyerMap.values());
+    }
+
+    result.admins = result.admins.map(serializeOfficialUser);
+    result.hosts = result.hosts.map(serializeOfficialUser);
+    result.agencyHosts = result.agencyHosts.map(serializeOfficialUser);
+    result.counts = {
+      admins: result.admins.length,
+      hosts: result.hosts.length,
+      agencyHosts: result.agencyHosts.length,
+      buyers: result.buyers.length,
+    };
+
+    return res.json({ success: true, ...result });
+  } catch (error) {
+    return res.status(500).json({ success: false, message: error.message });
+  }
+});
+
 app.get('/mobile/agency/requests', requireAppRole('admin'), async (req, res) => {
   try {
     const requests = await User.find({ agencyStatus: 'pending' }).select('-password -passwordResetOtpHash').sort({ 'agencyRegistration.registeredAt': -1, createdAt: -1 }).lean();
@@ -7438,7 +7583,7 @@ app.get('/mobile/agency/requests', requireAppRole('admin'), async (req, res) => 
   }
 });
 
-app.get('/mobile/admin/agencies', requireAppRole('admin', 'manager'), async (req, res) => {
+app.get('/mobile/admin/agencies', requireAppRole('admin'), async (req, res) => {
   try {
     const agencies = await User.aggregate([
       { $match: { $or: [{ role: 'agency' }, { roles: 'agency' }, { agencyStatus: 'approved' }] } },
@@ -7489,7 +7634,7 @@ app.get('/mobile/admin/agencies', requireAppRole('admin', 'manager'), async (req
   }
 });
 
-app.get('/mobile/admin/agencies/:agencyId/hosts', requireAppRole('admin', 'manager'), async (req, res) => {
+app.get('/mobile/admin/agencies/:agencyId/hosts', requireAppRole('admin'), async (req, res) => {
   try {
     if (!mongoose.Types.ObjectId.isValid(req.params.agencyId)) return res.status(400).json({ success: false, message: 'Invalid agency id' });
     const agency = await User.findById(req.params.agencyId).select('_id agencyCode agencyRegistration agencyStatus').lean();
