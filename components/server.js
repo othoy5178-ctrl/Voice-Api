@@ -5976,6 +5976,111 @@ const requireAppRole = (...allowedRoles) => async (req, res, next) => {
   }
 };
 
+const TOPLINER_ROLE_OPTIONS = {
+  host: ['official', 'agency', 'admin', 'manager'],
+  admin: ['manager'],
+  manager: ['super_admin'],
+};
+
+const buildToplinerUser = (user, roleOverride = '') => ({
+  _id: user._id?.toString?.() || String(user._id || ''),
+  id: user._id?.toString?.() || String(user._id || ''),
+  name: user.name || roleOverride || 'Topliner',
+  glixId: user.glixId || '',
+  profilePic: user.profilePic || '',
+  role: roleOverride || normalizeUserRoles(user).find(role => role !== 'user') || user.role || 'user',
+  agencyCode: user.agencyCode || user.agencyRegistration?.requestedAgencyCode || '',
+});
+
+const getToplinerSelection = async ({ toplinerId, toplinerRole, allowedRoles = [] }) => {
+  const cleanRole = String(toplinerRole || '').trim().toLowerCase();
+  const cleanId = String(toplinerId || '').trim();
+
+  if (!cleanId && (!cleanRole || cleanRole === 'official') && allowedRoles.includes('official')) {
+    return {
+      id: null,
+      role: cleanRole || 'official',
+      name: 'Official',
+      glixId: 'OFFICIAL',
+      agencyCode: 'OFFICIAL',
+    };
+  }
+
+  if (!cleanId) {
+    throw new Error('Please select a valid topliner.');
+  }
+
+  if (!mongoose.Types.ObjectId.isValid(cleanId)) {
+    throw new Error('Please select a valid topliner.');
+  }
+
+  const user = await User.findById(cleanId).select('name profilePic glixId role roles agencyStatus agencyCode agencyRegistration adminAccessRequest accountStatus');
+  if (!user) throw new Error('Selected topliner was not found.');
+  if ((user.accountStatus || 'active') !== 'active') throw new Error('Selected topliner account is not active.');
+
+  const roles = normalizeUserRoles(user);
+  const matchedRole = allowedRoles.find(role => roles.includes(role));
+  if (!matchedRole || (cleanRole && cleanRole !== matchedRole && !roles.includes(cleanRole))) {
+    throw new Error('Selected topliner does not have the required role.');
+  }
+
+  const finalRole = cleanRole && allowedRoles.includes(cleanRole) ? cleanRole : matchedRole;
+  return {
+    id: user._id,
+    role: finalRole,
+    name: user.name || finalRole,
+    glixId: user.glixId || '',
+    agencyCode: user.agencyCode || user.agencyRegistration?.requestedAgencyCode || '',
+  };
+};
+
+app.get('/mobile/topliners', requireAppUser, async (req, res) => {
+  try {
+    const forRole = String(req.query.forRole || '').trim().toLowerCase();
+    const allowedRoles = TOPLINER_ROLE_OPTIONS[forRole] || [];
+    if (!allowedRoles.length) return res.status(400).json({ success: false, message: 'Invalid topliner target role.' });
+
+    const queries = allowedRoles.map(role => {
+      if (role === 'agency') return { $or: [{ role }, { roles: role }, { agencyStatus: 'approved' }] };
+      if (role === 'super_admin') return { $or: [{ role }, { roles: role }] };
+      return { $or: [{ role }, { roles: role }, { 'adminAccessRequest.requestedRole': role, 'adminAccessRequest.status': 'approved' }] };
+    });
+
+    const users = await User.find({
+      accountStatus: { $ne: 'banned' },
+      $or: queries,
+    })
+      .select('name profilePic glixId role roles agencyStatus agencyCode agencyRegistration adminAccessRequest')
+      .sort({ role: 1, name: 1 })
+      .limit(100)
+      .lean();
+
+    const topliners = [];
+    if (forRole === 'host') {
+      topliners.push({
+        _id: '',
+        id: '',
+        name: 'Official',
+        glixId: 'OFFICIAL',
+        profilePic: '',
+        role: 'official',
+        agencyCode: 'OFFICIAL',
+      });
+    }
+
+    users.forEach(user => {
+      const roles = normalizeUserRoles(user);
+      const role = allowedRoles.find(item => roles.includes(item));
+      if (!role) return;
+      topliners.push(buildToplinerUser(user, role));
+    });
+
+    return res.json({ success: true, topliners });
+  } catch (error) {
+    return res.status(500).json({ success: false, message: error.message || 'Unable to load topliners.' });
+  }
+});
+
 const serializeCustomRoomTheme = (theme) => {
   const plain = typeof theme?.toObject === 'function' ? theme.toObject() : theme;
   if (!plain) return null;
@@ -6685,6 +6790,8 @@ app.post('/admin/access/request', async (req, res) => {
     const userId = String(req.body?.userId || '').trim();
     const requestedRole = String(req.body?.requestedRole || '').trim();
     const note = String(req.body?.note || '').trim();
+    const toplinerId = String(req.body?.toplinerId || '').trim();
+    const toplinerRole = String(req.body?.toplinerRole || '').trim().toLowerCase();
 
     if (!mongoose.Types.ObjectId.isValid(userId)) {
       return res.status(400).json({ success: false, message: 'Invalid user id' });
@@ -6702,10 +6809,20 @@ app.post('/admin/access/request', async (req, res) => {
       return res.status(409).json({ success: false, message: 'This request is already pending' });
     }
 
+    const topliner = await getToplinerSelection({
+      toplinerId,
+      toplinerRole,
+      allowedRoles: TOPLINER_ROLE_OPTIONS[requestedRole] || [],
+    });
+
     user.adminAccessRequest = {
       requestedRole,
       status: 'pending',
       note,
+      toplinerId: topliner.id,
+      toplinerRole: topliner.role,
+      toplinerName: topliner.name,
+      toplinerGlixId: topliner.glixId,
       rejectionReason: '',
       reviewedBy: null,
       reviewedAt: null,
@@ -6715,7 +6832,7 @@ app.post('/admin/access/request', async (req, res) => {
 
     return res.json({
       success: true,
-      message: 'Request submitted for Super Admin approval.',
+      message: `Request submitted for ${topliner.name || 'topliner'} approval.`,
       adminAccessRequest: user.adminAccessRequest,
     });
   } catch (error) {
@@ -7336,6 +7453,8 @@ app.post('/host/register', async (req, res) => {
     const hostType = ['Video Live Host', 'Voice Live Host'].includes(req.body?.hostType) ? req.body.hostType : '';
     const agencySelection = ['Official', 'Other Agency'].includes(req.body?.agencySelection) ? req.body.agencySelection : '';
     const agencyCode = String(req.body?.agencyCode || '').trim().toUpperCase();
+    const toplinerId = String(req.body?.toplinerId || '').trim();
+    const toplinerRole = String(req.body?.toplinerRole || '').trim().toLowerCase();
     const phoneCountryCode = String(req.body?.phoneCountryCode || '').trim();
     const phoneNumber = String(req.body?.phoneNumber || '').trim();
     const acceptedTerms = req.body?.acceptedTerms === true;
@@ -7346,6 +7465,16 @@ app.post('/host/register', async (req, res) => {
     if (!acceptedTerms) return res.status(400).json({ success: false, message: 'Please accept host terms.' });
     if (!verificationImages?.selfiePhoto?.base64) return res.status(400).json({ success: false, message: 'Selfie verification photo is required.' });
 
+    const topliner = await getToplinerSelection({
+      toplinerId,
+      toplinerRole: toplinerRole || (agencySelection === 'Official' ? 'official' : ''),
+      allowedRoles: TOPLINER_ROLE_OPTIONS.host,
+    });
+    const finalAgencySelection = topliner.role === 'agency' ? 'Other Agency' : agencySelection;
+    const finalAgencyCode = topliner.role === 'agency'
+      ? normalizeAgencyCode(topliner.agencyCode)
+      : normalizeAgencyCode(agencyCode || (finalAgencySelection === 'Official' ? 'OFFICIAL' : ''));
+
     const selfiePhotoUrl = await uploadUserImage(userId, verificationImages.selfiePhoto, 'host-selfie');
 
     user.hostStatus = 'pending';
@@ -7354,8 +7483,12 @@ app.post('/host/register', async (req, res) => {
       fullName,
       gender,
       hostType,
-      agencySelection,
-      agencyCode,
+      agencySelection: finalAgencySelection,
+      agencyCode: finalAgencyCode,
+      toplinerId: topliner.id,
+      toplinerRole: topliner.role,
+      toplinerName: topliner.name,
+      toplinerGlixId: topliner.glixId,
       phoneCountryCode,
       phoneNumber,
       profilePhotoUrl: '',
@@ -7420,22 +7553,46 @@ app.patch('/agency/requests/:userId', requireOfficial, async (req, res) => {
   }
 });
 
-app.get('/mobile/host/requests', requireAppRole('admin', 'manager'), async (req, res) => {
+app.get('/mobile/host/requests', requireAppRole('admin', 'manager', 'agency'), async (req, res) => {
   try {
-    const requests = await User.find({ hostStatus: 'pending' }).select('-password -passwordResetOtpHash').sort({ 'hostRegistration.registeredAt': -1, createdAt: -1 }).lean();
+    const authRoles = normalizeUserRoles(req.authUser);
+    const isSuperAdmin = authRoles.includes('super_admin');
+    const query = { hostStatus: 'pending' };
+
+    if (!isSuperAdmin) {
+      const assignedToMe = { 'hostRegistration.toplinerId': req.authUser._id };
+      if (authRoles.includes('admin') || authRoles.includes('manager')) {
+        query.$or = [
+          assignedToMe,
+          { 'hostRegistration.toplinerId': null },
+          { 'hostRegistration.toplinerId': { $exists: false } },
+        ];
+      } else {
+        query.$or = [assignedToMe];
+      }
+    }
+
+    const requests = await User.find(query).select('-password -passwordResetOtpHash').sort({ 'hostRegistration.registeredAt': -1, createdAt: -1 }).lean();
     return res.json({ success: true, requests });
   } catch (error) {
     return res.status(500).json({ success: false, message: error.message });
   }
 });
 
-app.patch('/mobile/host/requests/:userId', requireAppRole('admin', 'manager'), async (req, res) => {
+app.patch('/mobile/host/requests/:userId', requireAppRole('admin', 'manager', 'agency'), async (req, res) => {
   try {
     const status = ['approved', 'rejected'].includes(req.body?.status) ? req.body.status : null;
     if (!status) return res.status(400).json({ success: false, message: 'Invalid host status' });
 
     const user = await User.findById(req.params.userId);
     if (!user) return res.status(404).json({ success: false, message: 'User not found' });
+    const authRoles = normalizeUserRoles(req.authUser);
+    const assignedToplinerId = user.hostRegistration?.toplinerId;
+    const isAssignedToRequester = assignedToplinerId && String(assignedToplinerId) === String(req.authUser._id);
+    const isLegacyUnassigned = !assignedToplinerId && (authRoles.includes('admin') || authRoles.includes('manager') || authRoles.includes('super_admin'));
+    if (!isAssignedToRequester && !isLegacyUnassigned && !authRoles.includes('super_admin')) {
+      return res.status(403).json({ success: false, message: 'This host request is assigned to another topliner.' });
+    }
 
     user.hostStatus = status;
     user.hostRejectionReason = status === 'rejected' ? String(req.body?.reason || '') : '';
@@ -7461,10 +7618,21 @@ app.patch('/mobile/host/requests/:userId', requireAppRole('admin', 'manager'), a
 
 app.get('/mobile/admin-access/requests', requireAppRole('manager'), async (req, res) => {
   try {
-    const requests = await User.find({
+    const authRoles = normalizeUserRoles(req.authUser);
+    const query = {
       'adminAccessRequest.status': 'pending',
-      'adminAccessRequest.requestedRole': 'admin',
-    }).select('-password -passwordResetOtpHash').sort({ 'adminAccessRequest.requestedAt': -1, createdAt: -1 }).lean();
+      'adminAccessRequest.requestedRole': authRoles.includes('super_admin') ? { $in: ['admin', 'manager'] } : 'admin',
+    };
+
+    if (!authRoles.includes('super_admin')) {
+      query.$or = [
+        { 'adminAccessRequest.toplinerId': req.authUser._id },
+        { 'adminAccessRequest.toplinerId': null },
+        { 'adminAccessRequest.toplinerId': { $exists: false } },
+      ];
+    }
+
+    const requests = await User.find(query).select('-password -passwordResetOtpHash').sort({ 'adminAccessRequest.requestedAt': -1, createdAt: -1 }).lean();
     return res.json({ success: true, requests });
   } catch (error) {
     return res.status(500).json({ success: false, message: error.message });
@@ -7476,10 +7644,19 @@ app.patch('/mobile/admin-access/requests/:userId', requireAppRole('manager'), as
     const status = ['approved', 'rejected'].includes(req.body?.status) ? req.body.status : null;
     if (!status) return res.status(400).json({ success: false, message: 'Invalid request status' });
 
+    const authRoles = normalizeUserRoles(req.authUser);
     const targetUser = await User.findById(req.params.userId).select('name email role roles adminAccessRequest');
     if (!targetUser) return res.status(404).json({ success: false, message: 'User not found' });
-    if (targetUser.adminAccessRequest?.requestedRole !== 'admin') {
+    const requestedRole = targetUser.adminAccessRequest?.requestedRole;
+    if (!authRoles.includes('super_admin') && requestedRole !== 'admin') {
       return res.status(403).json({ success: false, message: 'Manager can only review admin access requests.' });
+    }
+    if (authRoles.includes('super_admin') && !['admin', 'manager'].includes(requestedRole)) {
+      return res.status(403).json({ success: false, message: 'Invalid app access request role.' });
+    }
+    const assignedToplinerId = targetUser.adminAccessRequest?.toplinerId;
+    if (assignedToplinerId && String(assignedToplinerId) !== String(req.authUser._id) && !authRoles.includes('super_admin')) {
+      return res.status(403).json({ success: false, message: 'This admin request is assigned to another manager.' });
     }
 
     targetUser.adminAccessRequest.status = status;
@@ -7488,10 +7665,10 @@ app.patch('/mobile/admin-access/requests/:userId', requireAppRole('manager'), as
     targetUser.adminAccessRequest.rejectionReason = status === 'rejected' ? String(req.body?.reason || '') : '';
 
     if (status === 'approved') {
-      addUserRole(targetUser, 'admin');
-      if (!targetUser.role || targetUser.role === 'user') targetUser.role = 'admin';
+      addUserRole(targetUser, requestedRole);
+      if (!targetUser.role || targetUser.role === 'user') targetUser.role = requestedRole;
     } else {
-      removeUserRole(targetUser, 'admin');
+      removeUserRole(targetUser, requestedRole);
     }
 
     await targetUser.save();

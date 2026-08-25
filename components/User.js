@@ -188,6 +188,18 @@ const userSchema = new mongoose.Schema({
       index: true
     },
     note: { type: String, trim: true, default: '' },
+    toplinerId: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: 'User',
+      default: null
+    },
+    toplinerRole: {
+      type: String,
+      enum: ['manager', 'admin', 'super_admin', 'agency', 'official', ''],
+      default: ''
+    },
+    toplinerName: { type: String, trim: true, default: '' },
+    toplinerGlixId: { type: String, trim: true, default: '' },
     rejectionReason: { type: String, trim: true, default: '' },
     reviewedBy: {
       type: mongoose.Schema.Types.ObjectId,
@@ -254,6 +266,18 @@ const userSchema = new mongoose.Schema({
       default: ''
     },
     agencyCode: { type: String, trim: true, uppercase: true, default: '' },
+    toplinerId: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: 'User',
+      default: null
+    },
+    toplinerRole: {
+      type: String,
+      enum: ['manager', 'admin', 'agency', 'official', ''],
+      default: ''
+    },
+    toplinerName: { type: String, trim: true, default: '' },
+    toplinerGlixId: { type: String, trim: true, default: '' },
     phoneCountryCode: { type: String, trim: true, default: '' },
     phoneNumber: { type: String, trim: true, default: '' },
     profilePhotoUrl: { type: String, default: '' },
