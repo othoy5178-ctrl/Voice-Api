@@ -83,7 +83,9 @@ const COIN_BAG_ACTIVE_MS = 10000;
 const CUSTOM_ROOM_THEME_PRICE_COINS = 50000;
 const CUSTOM_ROOM_THEME_DURATION_DAYS = 30;
 const GIFT_QUANTITY_OPTIONS = [1, 5, 10, 20, 50, 100];
+const HOST_GIFT_SHARE_PERCENT = Number(process.env.HOST_GIFT_SHARE_PERCENT || 65);
 const AGENCY_COMMISSION_RATE_PERCENT = Number(process.env.AGENCY_COMMISSION_RATE_PERCENT || 10);
+const MANAGER_COMMISSION_RATE_PERCENT = Number(process.env.MANAGER_COMMISSION_RATE_PERCENT || 3);
 const AGENCY_COMMISSION_TIERS = [
   { min: 0, max: 17000000, rate: 4 },
   { min: 17000000, max: 70000000, rate: 8 },
@@ -311,6 +313,7 @@ const buildRoomMemberPayload = (userId, fallback = {}) => ({
   profilePic: fallback.profilePic || fallback.avatar || '',
   glixId: fallback.glixId || '',
   daimon: fallback.daimon || 0,
+  sentGiftCoins: fallback.sentGiftCoins || 0,
   isVip: !!fallback.isVip,
   vipExpiresAt: fallback.vipExpiresAt || null,
   vipBadgeUrl: fallback.vipBadgeUrl || '',
@@ -343,7 +346,7 @@ const upsertRoomPresence = async ({ roomId, userId, socketId, name, profilePic, 
 
   if (mongoose.Types.ObjectId.isValid(userKey)) {
     dbUser = await User.findById(userKey)
-      .select('name profilePic glixId daimon isVip vipExpiresAt vipBadgeUrl')
+      .select('name profilePic glixId daimon sentGiftCoins isVip vipExpiresAt vipBadgeUrl')
       .lean();
   }
 
@@ -355,6 +358,7 @@ const upsertRoomPresence = async ({ roomId, userId, socketId, name, profilePic, 
     profilePic: dbUser?.profilePic || profilePic || existing.profilePic || '',
     glixId: dbUser?.glixId || existing.glixId || '',
     daimon: dbUser?.daimon ?? existing.daimon ?? 0,
+    sentGiftCoins: dbUser?.sentGiftCoins ?? existing.sentGiftCoins ?? 0,
     isVip: dbUser?.isVip ?? existing.isVip ?? false,
     vipExpiresAt: dbUser?.vipExpiresAt || existing.vipExpiresAt || null,
     vipBadgeUrl: dbUser?.vipBadgeUrl || existing.vipBadgeUrl || '',
@@ -1357,12 +1361,12 @@ io.on('connection', (socket) => {
   socket.on('join_audio_room', async ({ roomId, userId, name, profilePic, entryVideoUrl }) => {
     try {
       await clearExpiredStoreItems(userId);
-      const userData = await User.findById(userId).select('name profilePic frameUrl entryVideoUrl daimon');
+      const userData = await User.findById(userId).select('name profilePic frameUrl entryVideoUrl daimon sentGiftCoins');
       const finalJoinName = userData?.name || name || 'User';
       const finalJoinProfilePic = userData?.profilePic || profilePic || '';
       const frameUrl = userData?.frameUrl || null;
-      const joinerDaimon = Number(userData?.daimon || 0);
-      const joinerLevel = calculateUserLevelValue(joinerDaimon);
+      const joinerSentGiftCoins = Number(userData?.sentGiftCoins || 0);
+      const joinerLevel = calculateUserLevelValue(joinerSentGiftCoins);
 
       const stringRoomId = roomId ? roomId.toString() : '';
       socket.join(stringRoomId);
@@ -2166,8 +2170,8 @@ io.on('connection', (socket) => {
 
     try {
       if (mongoose.Types.ObjectId.isValid(stringUserId)) {
-        const sender = await User.findById(stringUserId).select('daimon').lean();
-        senderLevel = calculateUserLevelValue(sender?.daimon || 0);
+        const sender = await User.findById(stringUserId).select('sentGiftCoins').lean();
+        senderLevel = calculateUserLevelValue(sender?.sentGiftCoins || 0);
       }
     } catch (error) {
       console.log('Unable to calculate chat sender level:', error.message);
@@ -2354,7 +2358,7 @@ io.on('connection', (socket) => {
     try {
       const sender = await User.findOneAndUpdate(
         { _id: userId, chang: { $gte: totalCost } },
-        { $inc: { chang: -totalCost } },
+        { $inc: { chang: -totalCost, sentGiftCoins: totalCost } },
         { new: true, session }
       );
 
@@ -5064,7 +5068,7 @@ app.post('/rewards/claim', async (req, res) => {
   }
 });
 
-const PUBLIC_USER_FIELDS = 'name email profilePic glixId googleId createdAt lastLogin followersCount followingCount daimon chang frameUrl entryVideoUrl isVip vipExpiresAt vipBadgeUrl vipItemKey settings blacklistedUsers gender birthday countryRegion voiceSignature signature albumPhotos role roles accountStatus hostStatus agencyStatus agencyCode coinSellerStatus adminAccessRequest';
+const PUBLIC_USER_FIELDS = 'name email profilePic glixId googleId createdAt lastLogin followersCount followingCount daimon chang sentGiftCoins frameUrl entryVideoUrl isVip vipExpiresAt vipBadgeUrl vipItemKey settings blacklistedUsers gender birthday countryRegion voiceSignature signature albumPhotos role roles accountStatus hostStatus agencyStatus agencyCode coinSellerStatus adminAccessRequest';
 
 const sanitizeUserSettings = (settings = {}) => {
   const allowedMessagesFrom = ['everyone', 'following', 'none'];
@@ -5402,7 +5406,7 @@ app.get('/profile/:userId/fans', async (req, res) => {
     }
 
     const rows = await Follow.find({ followingId: userId })
-      .populate('followerId', 'name profilePic glixId daimon countryRegion')
+      .populate('followerId', 'name profilePic glixId daimon sentGiftCoins countryRegion')
       .sort({ createdAt: -1 })
       .limit(limit)
       .lean();
@@ -5415,6 +5419,7 @@ app.get('/profile/:userId/fans', async (req, res) => {
         profilePic: row.followerId.profilePic || '',
         glixId: row.followerId.glixId || '',
         daimon: row.followerId.daimon || 0,
+        sentGiftCoins: row.followerId.sentGiftCoins || 0,
         countryRegion: row.followerId.countryRegion || '',
         followedAt: row.createdAt
       }));
@@ -5432,6 +5437,7 @@ const serializeProfileListUser = (user, viewerFollowingIds = new Set(), extra = 
   profilePic: user?.profilePic || '',
   glixId: user?.glixId || '',
   daimon: Number(user?.daimon || 0),
+  sentGiftCoins: Number(user?.sentGiftCoins || 0),
   countryRegion: user?.countryRegion || '',
   isFollowing: viewerFollowingIds.has(String(user?._id || user?.id || '')),
   ...extra,
@@ -5488,7 +5494,7 @@ app.get('/profile/:userId/visitors', async (req, res) => {
 
     const [rows, totalVisitors, viewerFollowingIds] = await Promise.all([
       ProfileVisit.find({ profileUserId: userId })
-        .populate('visitorId', 'name profilePic glixId daimon countryRegion')
+        .populate('visitorId', 'name profilePic glixId daimon sentGiftCoins countryRegion')
         .sort({ visitedAt: -1 })
         .limit(limit)
         .lean(),
@@ -5521,7 +5527,7 @@ app.get('/profile/:userId/following', async (req, res) => {
 
     const [rows, viewerFollowingIds] = await Promise.all([
       Follow.find({ followerId: userId })
-        .populate('followingId', 'name profilePic glixId daimon countryRegion')
+        .populate('followingId', 'name profilePic glixId daimon sentGiftCoins countryRegion')
         .sort({ createdAt: -1 })
         .limit(limit)
         .lean(),
@@ -5550,7 +5556,7 @@ app.get('/profile/:userId/followers', async (req, res) => {
 
     const [rows, viewerFollowingIds] = await Promise.all([
       Follow.find({ followingId: userId })
-        .populate('followerId', 'name profilePic glixId daimon countryRegion')
+        .populate('followerId', 'name profilePic glixId daimon sentGiftCoins countryRegion')
         .sort({ createdAt: -1 })
         .limit(limit)
         .lean(),
@@ -5690,7 +5696,7 @@ const removeUserRole = (user, role) => {
   user.roles = normalizeUserRoles(user).filter(item => item === 'user' || item !== clean);
 };
 
-const officialUserProjection = 'name email profilePic glixId role roles accountStatus createdAt lastLogin chang daimon hostStatus agencyStatus coinSellerStatus sellerBalance sellerTotalSold adminNote';
+const officialUserProjection = 'name email profilePic glixId role roles accountStatus createdAt lastLogin chang daimon sentGiftCoins hostStatus agencyStatus coinSellerStatus sellerBalance sellerTotalSold adminNote';
 const officialAccountProjection = 'name email role status permissions sourceUserId note rejectionReason createdBy reviewedBy reviewedAt createdAt updatedAt lastLogin';
 
 const serializeOfficialUser = (user) => {
@@ -6600,7 +6606,7 @@ app.get('/users/search', async (req, res) => {
         { email: { $regex: escaped, $options: 'i' } },
       ],
     })
-      .select('name profilePic glixId daimon countryRegion')
+      .select('name profilePic glixId daimon sentGiftCoins countryRegion')
       .limit(20)
       .lean();
 
@@ -6612,6 +6618,7 @@ app.get('/users/search', async (req, res) => {
         profilePic: user.profilePic || '',
         glixId: user.glixId || '',
         daimon: user.daimon || 0,
+        sentGiftCoins: user.sentGiftCoins || 0,
         countryRegion: user.countryRegion || '',
       })),
     });

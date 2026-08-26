@@ -79,6 +79,12 @@ const GiftTransactionSchema = new mongoose.Schema({
   perReceiverCost: Number,
   totalCost: Number,
   batchTotalCost: Number,
+  hostShare: { type: Number, default: 0 },
+  agencyCommission: { type: Number, default: 0 },
+  managerCommission: { type: Number, default: 0 },
+  platformCommission: { type: Number, default: 0 },
+  commissionMonth: { type: String, trim: true, default: '', index: true },
+  commissionDay: { type: String, trim: true, default: '', index: true },
   luckyGift: {
     eligible: { type: Boolean, default: false },
     won: { type: Boolean, default: false },

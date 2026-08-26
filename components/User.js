@@ -142,6 +142,7 @@ const userSchema = new mongoose.Schema({
   followingCount: { type: Number, default: 0 },
   daimon: { type: Number, default: 0 },
   chang: { type: Number, default: 0 },
+  sentGiftCoins: { type: Number, default: 0, index: true },
   isVip: { type: Boolean, default: false, index: true },
   vipExpiresAt: { type: Date, default: null, index: true },
   vipBadgeUrl: { type: String, default: '' },
