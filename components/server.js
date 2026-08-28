@@ -7702,17 +7702,17 @@ app.get('/mobile/team/belows', requireAppRole('admin', 'manager', 'agency', 'coi
       result.admins = await User.find({
         'adminAccessRequest.status': 'approved',
         'adminAccessRequest.requestedRole': 'admin',
-        'adminAccessRequest.reviewedBy': authUser._id,
-      }).select(userProjection).sort({ 'adminAccessRequest.reviewedAt': -1 }).lean();
+        'adminAccessRequest.toplinerId': authUser._id,
+      }).select(userProjection).sort({ 'adminAccessRequest.reviewedAt': -1, 'adminAccessRequest.requestedAt': -1, createdAt: -1 }).lean();
       result.hosts = await User.find({
         hostStatus: 'approved',
-        'hostRegistration.reviewedBy': authUser._id,
-      }).select(userProjection).sort({ 'hostRegistration.reviewedAt': -1 }).lean();
+        'hostRegistration.toplinerId': authUser._id,
+      }).select(userProjection).sort({ 'hostRegistration.reviewedAt': -1, 'hostRegistration.registeredAt': -1, createdAt: -1 }).lean();
     } else if (roles.includes('admin')) {
       result.hosts = await User.find({
         hostStatus: 'approved',
-        'hostRegistration.reviewedBy': authUser._id,
-      }).select(userProjection).sort({ 'hostRegistration.reviewedAt': -1 }).lean();
+        'hostRegistration.toplinerId': authUser._id,
+      }).select(userProjection).sort({ 'hostRegistration.reviewedAt': -1, 'hostRegistration.registeredAt': -1, createdAt: -1 }).lean();
     }
 
     if (roles.includes('agency')) {
