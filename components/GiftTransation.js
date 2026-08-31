@@ -79,8 +79,27 @@ const GiftTransactionSchema = new mongoose.Schema({
   perReceiverCost: Number,
   totalCost: Number,
   batchTotalCost: Number,
+  agencyId: {
+    type: mongoose.Schema.Types.ObjectId,
+    ref: "User",
+    default: null,
+    index: true
+  },
+  adminId: {
+    type: mongoose.Schema.Types.ObjectId,
+    ref: "User",
+    default: null,
+    index: true
+  },
+  managerId: {
+    type: mongoose.Schema.Types.ObjectId,
+    ref: "User",
+    default: null,
+    index: true
+  },
   hostShare: { type: Number, default: 0 },
   agencyCommission: { type: Number, default: 0 },
+  adminCommission: { type: Number, default: 0 },
   managerCommission: { type: Number, default: 0 },
   platformCommission: { type: Number, default: 0 },
   commissionMonth: { type: String, trim: true, default: '', index: true },

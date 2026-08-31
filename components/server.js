@@ -83,9 +83,15 @@ const COIN_BAG_ACTIVE_MS = 10000;
 const CUSTOM_ROOM_THEME_PRICE_COINS = 50000;
 const CUSTOM_ROOM_THEME_DURATION_DAYS = 30;
 const GIFT_QUANTITY_OPTIONS = [1, 5, 10, 20, 50, 100];
-const HOST_GIFT_SHARE_PERCENT = Number(process.env.HOST_GIFT_SHARE_PERCENT || 65);
-const AGENCY_COMMISSION_RATE_PERCENT = Number(process.env.AGENCY_COMMISSION_RATE_PERCENT || 10);
-const MANAGER_COMMISSION_RATE_PERCENT = Number(process.env.MANAGER_COMMISSION_RATE_PERCENT || 3);
+const clampPercent = (value, fallback, max = 100) => {
+  const rate = Number(value);
+  if (!Number.isFinite(rate)) return fallback;
+  return Math.min(Math.max(rate, 0), max);
+};
+const HOST_GIFT_SHARE_PERCENT = 70;
+const AGENCY_COMMISSION_RATE_PERCENT = clampPercent(process.env.AGENCY_COMMISSION_RATE_PERCENT, 4, 20);
+const ADMIN_COMMISSION_RATE_PERCENT = clampPercent(process.env.ADMIN_COMMISSION_RATE_PERCENT, 3, 3);
+const MANAGER_COMMISSION_RATE_PERCENT = clampPercent(process.env.MANAGER_COMMISSION_RATE_PERCENT, 3, 3);
 const AGENCY_COMMISSION_TIERS = [
   { min: 0, max: 17000000, rate: 4 },
   { min: 17000000, max: 70000000, rate: 8 },
@@ -553,7 +559,7 @@ const buildRoomSlotsSnapshot = async (roomId) => {
   if (!mongoose.Types.ObjectId.isValid(stringRoomId)) return slots;
 
   const audioRoomDoc = await AudioRoom.findById(stringRoomId)
-    .populate('speakers.userId', 'name profilePic')
+    .populate('speakers.userId', 'name profilePic frameUrl')
     .select('speakers micSeatCount micLayoutType backgroundThemeId backgroundThemeUrl lockedSlots')
     .lean();
 
@@ -570,7 +576,7 @@ const buildRoomSlotsSnapshot = async (roomId) => {
         uid: speaker.numericUid || null,
         username: speaker.userId?.name || 'Broadcaster',
         avatar: speaker.userId?.profilePic || null,
-        frameUrl: speaker.frameUrl || null,
+        frameUrl: speaker.frameUrl || speaker.userId?.frameUrl || null,
         isMuted: !!speaker.isMuted,
       };
     }
@@ -591,6 +597,115 @@ const emitRoomSlotsSnapshot = async (roomId) => {
 
   const snapshot = await buildRoomSlotsSnapshot(stringRoomId);
   if (snapshot) io.to(stringRoomId).emit('room_slots_updated', snapshot);
+};
+
+const getAudioMicSlotFailure = async (roomId, userId, slotIndex) => {
+  const room = await AudioRoom.findById(roomId).select('isLive micSeatCount lockedSlots speakers').lean();
+  if (!room || !room.isLive) return { status: 404, message: 'Audio room is not available.' };
+  if (slotIndex >= Number(room.micSeatCount || 15)) {
+    return { status: 400, message: 'Mic slot is outside this room layout.' };
+  }
+
+  const lockedSlots = (room.lockedSlots || []).map(Number);
+  const existingSlotSpeaker = (room.speakers || []).find(speaker => Number(speaker?.slotIndex) === slotIndex);
+  const isSameSpeaker = existingSlotSpeaker?.userId && String(existingSlotSpeaker.userId) === String(userId);
+
+  if (lockedSlots.includes(slotIndex) && !isSameSpeaker) {
+    return { status: 423, message: 'This mic slot is locked.' };
+  }
+  if (existingSlotSpeaker?.userId && !isSameSpeaker) {
+    return { status: 409, message: 'This mic slot is already occupied.' };
+  }
+  return { status: 409, message: 'Mic slot could not be reserved. Please try again.' };
+};
+
+const reserveAudioMicSlot = async ({ roomId, userId, slotIndex, numericUid, isMuted = false, frameUrl = null }) => {
+  const normalizedSlotIndex = Number(slotIndex);
+  const sanitizedUid = parseInt(numericUid, 10) || 0;
+  if (!mongoose.Types.ObjectId.isValid(roomId) || !mongoose.Types.ObjectId.isValid(userId)) {
+    return { ok: false, status: 400, message: 'Invalid mic slot request.' };
+  }
+  if (!Number.isInteger(normalizedSlotIndex) || normalizedSlotIndex < 0 || !sanitizedUid) {
+    return { ok: false, status: 400, message: 'Invalid mic slot selected.' };
+  }
+
+  const roomObjectId = new mongoose.Types.ObjectId(roomId);
+  const userObjectId = new mongoose.Types.ObjectId(userId);
+  const now = new Date();
+
+  const room = await AudioRoom.findOneAndUpdate(
+    {
+      _id: roomObjectId,
+      isLive: true,
+      micSeatCount: { $gt: normalizedSlotIndex },
+      $and: [
+        {
+          $or: [
+            { lockedSlots: { $ne: normalizedSlotIndex } },
+            { speakers: { $elemMatch: { slotIndex: normalizedSlotIndex, userId: userObjectId } } },
+            ...(normalizedSlotIndex === 0 ? [{ hostId: userObjectId }] : [])
+          ]
+        },
+        {
+          speakers: {
+            $not: {
+              $elemMatch: {
+                slotIndex: normalizedSlotIndex,
+                userId: { $ne: userObjectId }
+              }
+            }
+          }
+        }
+      ]
+    },
+    [
+      {
+        $set: {
+          speakers: {
+            $concatArrays: [
+              {
+                $filter: {
+                  input: { $ifNull: ['$speakers', []] },
+                  as: 'speaker',
+                  cond: { $ne: ['$$speaker.userId', userObjectId] }
+                }
+              },
+              [{
+                userId: userObjectId,
+                slotIndex: normalizedSlotIndex,
+                numericUid: sanitizedUid,
+                isMuted: !!isMuted,
+                frameUrl: frameUrl || null
+              }]
+            ]
+          },
+          audience: {
+            $filter: {
+              input: { $ifNull: ['$audience', []] },
+              as: 'audienceUserId',
+              cond: { $ne: ['$$audienceUserId', userObjectId] }
+            }
+          },
+          lastHeartbeatAt: now
+        }
+      }
+    ],
+    {
+      new: true,
+      projection: 'lockedSlots speakers hostId micSeatCount'
+    }
+  ).lean();
+
+  if (!room) {
+    const failure = await getAudioMicSlotFailure(roomObjectId, userObjectId, normalizedSlotIndex);
+    return { ok: false, ...failure };
+  }
+
+  return {
+    ok: true,
+    room,
+    locked: (room.lockedSlots || []).map(Number).includes(normalizedSlotIndex)
+  };
 };
 
 
@@ -1457,7 +1572,7 @@ io.on('connection', (socket) => {
         }
       } else {
         if (mongoose.Types.ObjectId.isValid(stringRoomId)) {
-          const audioRoomDoc = await AudioRoom.findById(stringRoomId).populate('speakers.userId', 'name profilePic');
+          const audioRoomDoc = await AudioRoom.findById(stringRoomId).populate('speakers.userId', 'name profilePic frameUrl');
           if (audioRoomDoc && audioRoomDoc.speakers) {
             audioRoomDoc.speakers.filter(speaker => speaker && speaker.userId).forEach(speaker => {
               const index = speaker.slotIndex;
@@ -1468,7 +1583,7 @@ io.on('connection', (socket) => {
                   uid: speaker.numericUid || null,
                   username: speaker.userId?.name || "Broadcaster",
                   avatar: speaker.userId?.profilePic || null,
-                  frameUrl: speaker.frameUrl || null,
+                  frameUrl: speaker.frameUrl || speaker.userId?.frameUrl || null,
                   isMuted: speaker.isMuted || false
                 };
               }
@@ -1515,6 +1630,7 @@ io.on('connection', (socket) => {
       const stringRoomId = roomId ? roomId.toString() : '';
       const isVideoRoom = stringRoomId.startsWith('glix_');
       const normalizedSlotIndex = Number(targetSlotIndex);
+      const isClearingSlotPayload = profilePic === null || numericUid === null || numericUid === undefined;
       if (!Number.isInteger(normalizedSlotIndex) || normalizedSlotIndex < 0) return;
       if (process.env.NODE_ENV !== 'production') {
         console.log('[VoiceRoom SlotChange]', {
@@ -1523,7 +1639,7 @@ io.on('connection', (socket) => {
           socketUserId: socket.userId,
           slotIndex: normalizedSlotIndex,
           numericUid,
-          isClearing: profilePic === null || numericUid === null || numericUid === undefined,
+          isClearing: isClearingSlotPayload,
           locked,
           slotLocked,
         });
@@ -1589,7 +1705,7 @@ io.on('connection', (socket) => {
 
         if (normalizedSlotIndex === 0) {
           const isRoomHost = String(userId || '') === String(videoRoom.hostId || '');
-          const isClearingHostSlot = profilePic === null || numericUid === null || numericUid === undefined;
+          const isClearingHostSlot = isClearingSlotPayload;
 
           if (!isRoomHost || isClearingHostSlot) {
             socket.emit('error_notice', { message: 'The first video slot is reserved for the room creator.' });
@@ -1624,63 +1740,47 @@ io.on('connection', (socket) => {
       } else {
         if (!mongoose.Types.ObjectId.isValid(stringRoomId)) return;
 
-        const audioRoomForSlot = await AudioRoom.findById(stringRoomId).select('hostId lockedSlots speakers').lean();
-        const lockedSlots = (audioRoomForSlot?.lockedSlots || []).map(Number);
-        const existingSlotSpeaker = (audioRoomForSlot?.speakers || []).find(s => Number(s?.slotIndex) === normalizedSlotIndex);
-        const isExistingSlotSpeaker = existingSlotSpeaker?.userId && String(existingSlotSpeaker.userId) === String(userId || '');
-        const isHostRefreshingMainSeat = (
-          normalizedSlotIndex === 0 &&
-          audioRoomForSlot?.hostId &&
-          String(audioRoomForSlot.hostId) === String(userId || '')
-        );
         const isTakingOrUpdatingSeat = profilePic !== null && numericUid !== null && numericUid !== undefined;
 
-        if (
-          isTakingOrUpdatingSeat &&
-          lockedSlots.includes(normalizedSlotIndex) &&
-          !isExistingSlotSpeaker &&
-          !isHostRefreshingMainSeat
-        ) {
-          if (process.env.NODE_ENV !== 'production') {
-            console.log('[VoiceRoom SlotChange] blocked locked slot', {
-              roomId: stringRoomId,
-              userId,
-              slotIndex: normalizedSlotIndex,
-              lockedSlots,
-              roomHostId: audioRoomForSlot?.hostId?.toString?.() || String(audioRoomForSlot?.hostId || ''),
-            });
-          }
-          socket.emit('error_notice', { message: 'This mic slot is locked.' });
-          return;
-        }
-
-        if (profilePic === null) {
-          await AudioRoom.findOneAndUpdate(queryFilter, {
-            $pull: { speakers: { slotIndex: targetSlotIndex } }
-          });
+        if (!isTakingOrUpdatingSeat) {
+          const latestAudioRoom = await AudioRoom.findOneAndUpdate(
+            queryFilter,
+            {
+              $pull: { speakers: { slotIndex: normalizedSlotIndex } },
+              $set: { lastHeartbeatAt: new Date() }
+            },
+            { new: true, projection: 'lockedSlots' }
+          ).lean();
+          emittedSlotLocked = (latestAudioRoom?.lockedSlots || []).map(Number).includes(normalizedSlotIndex);
         } else {
-          await AudioRoom.findOneAndUpdate(queryFilter, {
-            $pull: { speakers: { userId: userId } }
+          const reservation = await reserveAudioMicSlot({
+            roomId: stringRoomId,
+            userId,
+            slotIndex: normalizedSlotIndex,
+            numericUid,
+            isMuted,
+            frameUrl: finalFrameUrl
           });
 
-          await AudioRoom.findOneAndUpdate(queryFilter, {
-            $push: {
-              speakers: {
-                userId: userId,
-                slotIndex: targetSlotIndex,
-                numericUid: parseInt(numericUid, 10),
-                isMuted: isMuted || false,
-                frameUrl: frameUrl
-              }
+          if (!reservation.ok) {
+            if (process.env.NODE_ENV !== 'production') {
+              console.log('[VoiceRoom SlotChange] reservation blocked', {
+                roomId: stringRoomId,
+                userId,
+                slotIndex: normalizedSlotIndex,
+                status: reservation.status,
+                message: reservation.message,
+              });
             }
-          });
+            socket.emit('error_notice', { message: reservation.message });
+            await emitRoomSlotsSnapshot(stringRoomId);
+            return;
+          }
+          emittedSlotLocked = reservation.locked;
         }
-
-        const latestAudioRoom = await AudioRoom.findById(stringRoomId).select('lockedSlots').lean();
-        emittedSlotLocked = (latestAudioRoom?.lockedSlots || []).map(Number).includes(normalizedSlotIndex);
       }
 
-      if (profilePic !== null) {
+      if (!isClearingSlotPayload) {
         await upsertRoomPresence({
           roomId: stringRoomId,
           userId,
@@ -1695,12 +1795,12 @@ io.on('connection', (socket) => {
       io.to(stringRoomId).emit('slot_state_changed', {
         slotIndex: normalizedSlotIndex,
         user: {
-          uid: numericUid ? parseInt(numericUid, 10) : null,
-          userId,
-          username: name,
-          avatar: profilePic,
-          frameUrl: finalFrameUrl,
-          isMuted: isMuted || false,
+          uid: !isClearingSlotPayload && numericUid ? parseInt(numericUid, 10) : null,
+          userId: !isClearingSlotPayload ? userId : null,
+          username: !isClearingSlotPayload ? name : null,
+          avatar: !isClearingSlotPayload ? profilePic : null,
+          frameUrl: !isClearingSlotPayload ? finalFrameUrl : null,
+          isMuted: !isClearingSlotPayload ? isMuted || false : false,
           locked: emittedSlotLocked,
           cameraOn: !!cameraOn
         }
@@ -2081,7 +2181,7 @@ io.on('connection', (socket) => {
       const nextBackgroundThemeId = backgroundThemeId ? String(backgroundThemeId) : null;
       let nextBackgroundThemeUrl = backgroundThemeUrl ? String(backgroundThemeUrl) : null;
 
-      const audioRoom = await AudioRoom.findById(stringRoomId).populate('speakers.userId', 'name profilePic');
+      const audioRoom = await AudioRoom.findById(stringRoomId).populate('speakers.userId', 'name profilePic frameUrl');
       if (!audioRoom) {
         socket.emit('error_notice', { message: 'Audio room not found.' });
         return;
@@ -2137,7 +2237,7 @@ io.on('connection', (socket) => {
             userId: speaker.userId?._id?.toString?.() || speaker.userId?.toString?.() || null,
             username: speaker.userId?.name || 'Broadcaster',
             avatar: speaker.userId?.profilePic || null,
-            frameUrl: speaker.frameUrl || null,
+            frameUrl: speaker.frameUrl || speaker.userId?.frameUrl || null,
             isMuted: speaker.isMuted || false,
           };
         }
@@ -2352,6 +2452,7 @@ io.on('connection', (socket) => {
       });
     }
 
+    let hostShareByReceiverId = {};
     const session = await mongoose.startSession();
     session.startTransaction();
 
@@ -2379,16 +2480,6 @@ io.on('connection', (socket) => {
         return map;
       }, {});
 
-      const receiverUpdate = await User.updateMany(
-        { _id: { $in: receiverObjectIds } },
-        { $inc: { daimon: perReceiverCost } },
-        { session }
-      );
-
-      if ((receiverUpdate.matchedCount ?? 0) !== normalizedReceiverIds.length) {
-        throw new Error('One or more gift receivers were not found.');
-      }
-
       let luckySenderDaimonAfter = 0;
       if (luckyRewardDiamonds > 0) {
         const luckySender = await User.findByIdAndUpdate(
@@ -2399,53 +2490,94 @@ io.on('connection', (socket) => {
         luckySenderDaimonAfter = luckySender?.daimon || 0;
       }
 
+      const commissionByReceiverId = {};
+      await Promise.all(
+        normalizedReceiverIds.map(async (receiverId) => {
+          commissionByReceiverId[receiverId] = await recordGiftHierarchyCommission({
+            receiverId,
+            sourceCoins: perReceiverCost,
+            session,
+          });
+        })
+      );
+      hostShareByReceiverId = normalizedReceiverIds.reduce((map, receiverId) => {
+        const commission = commissionByReceiverId[receiverId] || {};
+        const hostShare = Number.isFinite(Number(commission.hostShare))
+          ? Number(commission.hostShare)
+          : getCommissionAmount(perReceiverCost, HOST_GIFT_SHARE_PERCENT);
+        map[receiverId] = Math.max(0, Math.floor(hostShare));
+        return map;
+      }, {});
+
+      const receiverWalletUpdates = normalizedReceiverIds.map(receiverId => {
+        return {
+          updateOne: {
+            filter: { _id: new mongoose.Types.ObjectId(receiverId) },
+            update: { $inc: { daimon: hostShareByReceiverId[receiverId] || 0 } },
+          },
+        };
+      });
+
+      const receiverUpdate = await User.bulkWrite(receiverWalletUpdates, { session });
+      if ((receiverUpdate.matchedCount ?? 0) !== normalizedReceiverIds.length) {
+        throw new Error('One or more gift receivers were not found.');
+      }
+
       await GiftTransaction.create(
-        normalizedReceiverIds.map(receiverId => ({
-          roomId: stringRoomId,
-          roomMode,
-          senderId: userId,
-          senderName: sender.name || senderName || 'User',
-          senderAvatar: sender.profilePic || avatar || '',
-          senderGlixId: sender.glixId || '',
-          receiverId,
-          receiverName: receiverById[receiverId]?.name || 'User',
-          receiverAvatar: receiverById[receiverId]?.profilePic || '',
-          receiverGlixId: receiverById[receiverId]?.glixId || '',
-          receiverIds: receiverObjectIds,
-          receiverCount: normalizedReceiverIds.length,
-          giftName: resolvedGiftName,
-          giftCatalogId: catalogGift?._id || null,
-          giftImage: resolvedGiftAnimation,
-          giftThumbnail: resolvedGiftThumbnail || '',
-          giftMediaType: resolvedGiftMediaType,
-          coinPrice,
-          quantity: giftQuantity,
-          perReceiverCost,
-          totalCost: perReceiverCost,
-          batchTotalCost: totalCost,
-          luckyGift: luckyGiftResult,
-          status: 'completed',
-          audit: {
-            senderBalanceAfter: sender.chang || 0,
-            receiverBalanceAfter: Number(receiverById[receiverId]?.daimon || 0) + perReceiverCost,
-            luckySenderDaimonAfter,
-            clientSenderName: senderName || '',
-            roomHostId: new mongoose.Types.ObjectId(finalRoomHostId)
-          }
-        })),
+        normalizedReceiverIds.map(receiverId => {
+          const commission = commissionByReceiverId[receiverId] || {};
+          const creditedHostShare = hostShareByReceiverId[receiverId] ?? perReceiverCost;
+          return {
+            roomId: stringRoomId,
+            roomMode,
+            senderId: userId,
+            senderName: sender.name || senderName || 'User',
+            senderAvatar: sender.profilePic || avatar || '',
+            senderGlixId: sender.glixId || '',
+            receiverId,
+            receiverName: receiverById[receiverId]?.name || 'User',
+            receiverAvatar: receiverById[receiverId]?.profilePic || '',
+            receiverGlixId: receiverById[receiverId]?.glixId || '',
+            receiverIds: receiverObjectIds,
+            receiverCount: normalizedReceiverIds.length,
+            giftName: resolvedGiftName,
+            giftCatalogId: catalogGift?._id || null,
+            giftImage: resolvedGiftAnimation,
+            giftThumbnail: resolvedGiftThumbnail || '',
+            giftMediaType: resolvedGiftMediaType,
+            coinPrice,
+            quantity: giftQuantity,
+            perReceiverCost,
+            totalCost: perReceiverCost,
+            batchTotalCost: totalCost,
+            agencyId: commission.agencyId || null,
+            adminId: commission.adminId || null,
+            managerId: commission.managerId || null,
+            hostShare: creditedHostShare,
+            agencyCommission: commission.agencyCommission || 0,
+            adminCommission: commission.adminCommission || 0,
+            managerCommission: commission.managerCommission || 0,
+            platformCommission: Number.isFinite(Number(commission.platformCommission))
+              ? Math.max(0, Math.floor(Number(commission.platformCommission)))
+              : Math.max(0, perReceiverCost - creditedHostShare),
+            commissionMonth: commission.commissionMonth || getCommissionMonthKey(),
+            commissionDay: commission.commissionDay || getCommissionDayKey(),
+            luckyGift: luckyGiftResult,
+            status: 'completed',
+            audit: {
+              senderBalanceAfter: sender.chang || 0,
+              receiverBalanceAfter: Number(receiverById[receiverId]?.daimon || 0) + creditedHostShare,
+              luckySenderDaimonAfter,
+              clientSenderName: senderName || '',
+              roomHostId: new mongoose.Types.ObjectId(finalRoomHostId)
+            }
+          };
+        }),
         { session }
       );
 
       await session.commitTransaction();
       await recordRewardActivity(userId, 'send_gift', { roomId: stringRoomId, totalCost, receiverIds: normalizedReceiverIds });
-      Promise.all(
-        normalizedReceiverIds.map(receiverId => recordAgencyCommissionForGift({
-          receiverId,
-          sourceCoins: perReceiverCost,
-        }))
-      ).catch(error => {
-        console.log('Agency commission recording failed:', error);
-      });
 
     } catch (error) {
       await session.abortTransaction();
@@ -2470,6 +2602,8 @@ io.on('connection', (socket) => {
       coins: coinPrice,
       totalCost,
       perReceiverCost,
+      perReceiverHostShare: getCommissionAmount(perReceiverCost, HOST_GIFT_SHARE_PERCENT),
+      hostShareByReceiverId,
       receiverIds: normalizedReceiverIds,
       roomHostId: finalRoomHostId,
       luckyGift: luckyGiftResult,
@@ -3000,6 +3134,61 @@ io.on('connection', (socket) => {
 
             const latestRoom = await AudioRoom.findById(roomId);
             if (!latestRoom || latestRoom.hostId?.toString() !== currentUserId) return;
+
+            const remainingSpeakers = (Array.isArray(latestRoom.speakers) ? latestRoom.speakers : [])
+              .filter(speaker => speaker?.userId && String(speaker.userId) !== currentUserId);
+
+            if (remainingSpeakers.length > 0) {
+              const transferSpeaker = remainingSpeakers[remainingSpeakers.length - 1];
+              const controllerUserId = transferSpeaker.userId?.toString?.() || String(transferSpeaker.userId || '');
+              const controllerUid = transferSpeaker.numericUid ?? transferSpeaker.uid ?? null;
+              const controllerProfile = controllerUserId
+                ? await User.findById(controllerUserId).select('name profilePic frameUrl').lean()
+                : null;
+              const controller = {
+                userId: controllerUserId || null,
+                uid: controllerUid,
+                username: controllerProfile?.name || 'Mic user',
+                name: controllerProfile?.name || 'Mic user',
+                avatar: controllerProfile?.profilePic || null,
+                profilePic: controllerProfile?.profilePic || null,
+                frameUrl: controllerProfile?.frameUrl || transferSpeaker.frameUrl || null,
+              };
+
+              latestRoom.isLive = true;
+              latestRoom.speakers = remainingSpeakers;
+              latestRoom.lastHeartbeatAt = new Date();
+              latestRoom.endedAt = null;
+              await latestRoom.save();
+
+              roomKeepOpenRooms[roomId] = {
+                userId: currentUserId,
+                controllerUserId,
+                controllerUid,
+                roomMode: 'audio',
+                updatedAt: Date.now(),
+              };
+              roomControllers[roomId] = controller;
+
+              const transferPayload = {
+                roomId,
+                hostId: latestRoom.hostId?.toString?.() || currentUserId,
+                fromUserId: currentUserId,
+                transferToUserId: controllerUserId,
+                transferToUid: controllerUid,
+                controller,
+                message: 'Room is staying open. Control moved to another room user.',
+              };
+
+              io.to(roomId).emit('host_left_room', transferPayload);
+              io.to(roomId).emit('room_control_transferred', transferPayload);
+              io.to(roomId).emit('room_controller_changed', transferPayload);
+              await emitRoomSlotsSnapshot(roomId);
+              await emitRoomStats(roomId);
+              scheduleKeptOpenAudioRoomEmptyCheck(roomId, 'host_disconnected_mic_users_remaining');
+              console.log(`Audio room kept open after host disconnect because mic users remain: ${roomId}`);
+              return;
+            }
 
             latestRoom.isLive = false;
             latestRoom.speakers = [];
@@ -3754,12 +3943,15 @@ app.post('/create', async (req, res) => {
   try {
     const { title, hostId, numericUid } = req.body;
     const sanitizedUid = parseInt(numericUid, 10) || 0;
+    const hostUser = mongoose.Types.ObjectId.isValid(hostId)
+      ? await User.findById(hostId).select('frameUrl').lean()
+      : null;
 
     const newRoom = new AudioRoom({
       title: title || "Live Audio Room",
       hostId,
       isLive: true,
-      speakers: [{ userId: hostId, isMuted: false, slotIndex: 0, numericUid: sanitizedUid }],
+      speakers: [{ userId: hostId, isMuted: false, slotIndex: 0, numericUid: sanitizedUid, frameUrl: hostUser?.frameUrl || null }],
       audience: [],
       lockedSlots: [3, 12, 19]
     });
@@ -3844,6 +4036,7 @@ app.post('/join', async (req, res) => {
       const validSpeakers = currentSpeakers.filter(s => s && s.userId);
       const validAudience = currentAudience.filter(Boolean);
       const isRoomOwner = String(roomObj.hostId) === String(userId);
+      const joiningUser = await User.findById(userId).select('frameUrl').lean();
       const existingSpeakerIndex = validSpeakers.findIndex(s => String(s.userId) === String(userId));
       const isAlreadySpeaker = existingSpeakerIndex !== -1;
       roomObj.speakers = validSpeakers;
@@ -3877,13 +4070,20 @@ app.post('/join', async (req, res) => {
 
         roomObj.speakers = Number.isInteger(ownerSlotIndex)
           ? [
-            { userId, isMuted: false, slotIndex: ownerSlotIndex, numericUid: sanitizedUid },
+            {
+              userId,
+              isMuted: false,
+              slotIndex: ownerSlotIndex,
+              numericUid: sanitizedUid,
+              frameUrl: joiningUser?.frameUrl || previousOwnerSlot?.frameUrl || null
+            },
             ...nonOwnerSpeakers
           ]
           : nonOwnerSpeakers;
         userRole = RtcRole.PUBLISHER;
       } else if (isAlreadySpeaker) {
         roomObj.speakers[existingSpeakerIndex].numericUid = sanitizedUid;
+        roomObj.speakers[existingSpeakerIndex].frameUrl = joiningUser?.frameUrl || roomObj.speakers[existingSpeakerIndex].frameUrl || null;
         userRole = RtcRole.PUBLISHER;
       } else {
         roomObj.audience.push(userId);
@@ -3957,23 +4157,6 @@ app.post('/audio-room/join-mic-slot', async (req, res) => {
       return res.status(400).json({ success: false, message: 'Invalid mic slot selected.' });
     }
 
-    const room = await AudioRoom.findById(stringRoomId);
-    if (!room || !room.isLive) return res.status(404).json({ success: false, message: 'Audio room is not available.' });
-    if (slotIndex >= (room.micSeatCount || 15)) {
-      return res.status(400).json({ success: false, message: 'Mic slot is outside this room layout.' });
-    }
-    if ((room.lockedSlots || []).map(Number).includes(slotIndex)) {
-      return res.status(423).json({ success: false, message: 'This mic slot is locked.' });
-    }
-
-    const currentSpeakers = Array.isArray(room.speakers) ? room.speakers : [];
-    const occupiedByOther = currentSpeakers.some(s => (
-      Number(s?.slotIndex) === slotIndex &&
-      s?.userId &&
-      String(s.userId) !== String(userId)
-    ));
-    if (occupiedByOther) return res.status(409).json({ success: false, message: 'This mic slot is already occupied.' });
-
     const user = await User.findById(userId).select('name profilePic frameUrl');
     if (!user) return res.status(404).json({ success: false, message: 'User not found.' });
 
@@ -3983,17 +4166,21 @@ app.post('/audio-room/join-mic-slot', async (req, res) => {
       return res.status(500).json({ success: false, message: 'Agora credentials are not configured.' });
     }
 
-    room.speakers = currentSpeakers.filter(s => s?.userId && String(s.userId) !== String(userId));
-    room.speakers.push({
+    const reservation = await reserveAudioMicSlot({
+      roomId: stringRoomId,
       userId,
       slotIndex,
       numericUid: sanitizedUid,
       isMuted: !!isMuted,
       frameUrl: user.frameUrl || null,
     });
-    room.audience = (room.audience || []).filter(id => String(id) !== String(userId));
-    room.lastHeartbeatAt = new Date();
-    await room.save();
+
+    if (!reservation.ok) {
+      return res.status(reservation.status || 409).json({
+        success: false,
+        message: reservation.message || 'Mic slot could not be reserved. Please try again.'
+      });
+    }
 
     const privilegeExpiredTs = Math.floor(Date.now() / 1000) + 3600;
     const agoraToken = RtcTokenBuilder.buildTokenWithUid(
@@ -4322,8 +4509,8 @@ app.get('/rooms/:roomId', async (req, res) => {
     if (!mongoose.Types.ObjectId.isValid(roomId)) return res.status(400).json({ error: "Malformed Object reference ID" });
 
     const room = await AudioRoom.findById(roomId)
-      .populate('hostId', 'name profilePic username')
-      .populate('speakers.userId', 'name profilePic username')
+      .populate('hostId', 'name profilePic username frameUrl')
+      .populate('speakers.userId', 'name profilePic username frameUrl')
       .populate('audience', 'name profilePic username');
 
     if (!room) return res.status(404).json({ error: "Room not found" });
@@ -7239,13 +7426,260 @@ const getAgencyCommissionTier = (sourceCoins = 0) => {
     || AGENCY_COMMISSION_TIERS[0];
 };
 
-const updateAgencyTargetProgress = async ({ agencyId, month, sourceCoins }) => {
+const getCommissionAmount = (sourceCoins = 0, ratePercent = 0) => {
+  const coins = Number(sourceCoins || 0);
+  const rate = Number(ratePercent || 0);
+  if (!Number.isFinite(coins) || coins <= 0 || !Number.isFinite(rate) || rate <= 0) return 0;
+  return Math.floor((coins * rate) / 100);
+};
+
+const findApprovedAgencyForCommission = async ({ agencyId = null, agencyCode = '', excludeUserId = null, session = null }) => {
+  const cleanCode = normalizeAgencyCode(agencyCode);
+  const query = {
+    agencyStatus: 'approved',
+    $or: [],
+  };
+
+  if (agencyId && mongoose.Types.ObjectId.isValid(String(agencyId))) {
+    query.$or.push({ _id: agencyId });
+  }
+
+  if (!isOfficialAgencyCode(cleanCode)) {
+    query.$or.push(
+      { agencyCode: cleanCode },
+      { 'agencyRegistration.requestedAgencyCode': cleanCode }
+    );
+  }
+
+  if (!query.$or.length) return null;
+
+  if (excludeUserId && mongoose.Types.ObjectId.isValid(String(excludeUserId))) {
+    query._id = { $ne: excludeUserId };
+  }
+
+  const request = User.findOne(query).select('_id agencyCode agencyStatus role roles totalHostCoins');
+  if (session) request.session(session);
+  return request.lean();
+};
+
+const findApprovedRoleUserForCommission = async ({ userId, role, session = null }) => {
+  if (!mongoose.Types.ObjectId.isValid(String(userId || ''))) return null;
+
+  const statusField = role === 'agency'
+    ? 'agencyStatus'
+    : role === 'host'
+      ? 'hostStatus'
+      : '';
+  const query = User.findById(userId).select('_id role roles agencyStatus hostStatus adminAccessRequest accountStatus totalHostCoins');
+  if (session) query.session(session);
+  const user = await query.lean();
+  if (!user || (user.accountStatus || 'active') !== 'active') return null;
+
+  const roles = normalizeUserRoles(user);
+  const hasRole = roles.includes(role)
+    || user.role === role
+    || (statusField && user[statusField] === 'approved');
+
+  return hasRole ? user : null;
+};
+
+const updateCommissionLedger = async ({ beneficiaryId, beneficiaryRole, hostId, sourceCoins, commissionAmount, ratePercent, month, day, session = null }) => {
+  if (!beneficiaryId || !hostId || !commissionAmount) return;
+
+  const balanceField = beneficiaryRole === 'admin' ? 'revenueBalance' : 'commissionBalance';
+
+  await Promise.all([
+    MonthlyCommission.findOneAndUpdate(
+      {
+        beneficiaryId,
+        beneficiaryRole,
+        hostId,
+        month,
+      },
+      {
+        $inc: {
+          sourceCoins,
+          commissionAmount,
+        },
+        $set: {
+          ratePercent,
+          status: 'pending',
+        },
+      },
+      { upsert: true, new: true, setDefaultsOnInsert: true, session }
+    ),
+    DailyCommission.findOneAndUpdate(
+      {
+        beneficiaryId,
+        beneficiaryRole,
+        hostId,
+        day,
+      },
+      {
+        $inc: {
+          sourceCoins,
+          commissionAmount,
+        },
+        $set: {
+          ratePercent,
+          status: 'pending',
+        },
+      },
+      { upsert: true, new: true, setDefaultsOnInsert: true, session }
+    ),
+    User.findByIdAndUpdate(
+      beneficiaryId,
+      { $inc: { [balanceField]: commissionAmount } },
+      { session }
+    ),
+  ]);
+};
+
+const recordGiftHierarchyCommission = async ({ receiverId, sourceCoins, session = null }) => {
+  if (!mongoose.Types.ObjectId.isValid(String(receiverId))) return null;
+
+  const coins = Number(sourceCoins || 0);
+  if (!Number.isFinite(coins) || coins <= 0) return null;
+
+  const hostQuery = User.findById(receiverId)
+    .select('hostStatus agencyId agencyCode hostRegistration.agencyCode hostRegistration.toplinerId hostRegistration.toplinerRole');
+  if (session) hostQuery.session(session);
+  const host = await hostQuery.lean();
+
+  if (!host || host.hostStatus !== 'approved') return null;
+
+  const month = getCommissionMonthKey();
+  const day = getCommissionDayKey();
+  const hostId = host._id;
+  const toplinerId = host.hostRegistration?.toplinerId || null;
+  const toplinerRole = String(host.hostRegistration?.toplinerRole || '').toLowerCase();
+  const commission = {
+    agencyId: null,
+    adminId: null,
+    managerId: null,
+    hostShare: getCommissionAmount(coins, HOST_GIFT_SHARE_PERCENT),
+    agencyCommission: 0,
+    adminCommission: 0,
+    managerCommission: 0,
+    platformCommission: 0,
+    agencyRatePercent: 0,
+    adminRatePercent: ADMIN_COMMISSION_RATE_PERCENT,
+    managerRatePercent: MANAGER_COMMISSION_RATE_PERCENT,
+    commissionMonth: month,
+    commissionDay: day,
+  };
+  let agencyTotalAfterGift = coins;
+
+  if (toplinerId && mongoose.Types.ObjectId.isValid(String(toplinerId))) {
+    if (toplinerRole === 'admin') {
+      const admin = await findApprovedRoleUserForCommission({ userId: toplinerId, role: 'admin', session });
+      if (admin) {
+        commission.adminId = admin._id;
+        const managerId = admin.adminAccessRequest?.toplinerId || null;
+        const manager = await findApprovedRoleUserForCommission({ userId: managerId, role: 'manager', session });
+        if (manager) commission.managerId = manager._id;
+      }
+    } else if (toplinerRole === 'manager') {
+      const manager = await findApprovedRoleUserForCommission({ userId: toplinerId, role: 'manager', session });
+      if (manager) commission.managerId = manager._id;
+    } else if (toplinerRole === 'agency') {
+      const agency = await findApprovedRoleUserForCommission({ userId: toplinerId, role: 'agency', session });
+      if (agency) {
+        commission.agencyId = agency._id;
+        agencyTotalAfterGift = Number(agency.totalHostCoins || 0) + coins;
+      }
+    }
+  }
+
+  if (!commission.agencyId) {
+    const agency = await findApprovedAgencyForCommission({
+      agencyId: host.agencyId,
+      agencyCode: host.agencyCode || host.hostRegistration?.agencyCode || '',
+      excludeUserId: hostId,
+      session,
+    });
+    if (agency) {
+      commission.agencyId = agency._id;
+      agencyTotalAfterGift = Number(agency.totalHostCoins || 0) + coins;
+    }
+  }
+
+  commission.agencyRatePercent = commission.agencyId
+    ? getAgencyCommissionTier(agencyTotalAfterGift).rate
+    : 0;
+  commission.agencyCommission = commission.agencyId
+    ? getCommissionAmount(coins, commission.agencyRatePercent)
+    : 0;
+  commission.adminCommission = commission.adminId
+    ? getCommissionAmount(coins, ADMIN_COMMISSION_RATE_PERCENT)
+    : 0;
+  commission.managerCommission = commission.managerId
+    ? getCommissionAmount(coins, MANAGER_COMMISSION_RATE_PERCENT)
+    : 0;
+  commission.platformCommission = Math.max(
+    0,
+    coins - commission.hostShare - commission.agencyCommission - commission.adminCommission - commission.managerCommission
+  );
+
+  const ledgerUpdates = [
+    commission.agencyId && updateCommissionLedger({
+      beneficiaryId: commission.agencyId,
+      beneficiaryRole: 'agency',
+      hostId,
+      sourceCoins: coins,
+      commissionAmount: commission.agencyCommission,
+      ratePercent: commission.agencyRatePercent,
+      month,
+      day,
+      session,
+    }),
+    commission.adminId && updateCommissionLedger({
+      beneficiaryId: commission.adminId,
+      beneficiaryRole: 'admin',
+      hostId,
+      sourceCoins: coins,
+      commissionAmount: commission.adminCommission,
+      ratePercent: ADMIN_COMMISSION_RATE_PERCENT,
+      month,
+      day,
+      session,
+    }),
+    commission.managerId && updateCommissionLedger({
+      beneficiaryId: commission.managerId,
+      beneficiaryRole: 'manager',
+      hostId,
+      sourceCoins: coins,
+      commissionAmount: commission.managerCommission,
+      ratePercent: MANAGER_COMMISSION_RATE_PERCENT,
+      month,
+      day,
+      session,
+    }),
+    commission.agencyId && updateAgencyTargetProgress({
+      agencyId: commission.agencyId,
+      month,
+      sourceCoins: coins,
+      session,
+    }),
+    commission.agencyId && User.findByIdAndUpdate(
+      commission.agencyId,
+      { $inc: { totalHostCoins: coins } },
+      { session }
+    ),
+  ].filter(Boolean);
+
+  await Promise.all(ledgerUpdates);
+
+  return commission;
+};
+
+const updateAgencyTargetProgress = async ({ agencyId, month, sourceCoins, session = null }) => {
   if (!agencyId || !month || !Number.isFinite(sourceCoins) || sourceCoins <= 0) return null;
 
   const target = await AgencyTarget.findOneAndUpdate(
     { agencyId, month },
     { $inc: { achievedCoins: sourceCoins } },
-    { new: true }
+    { new: true, session }
   );
 
   if (
@@ -7255,6 +7689,7 @@ const updateAgencyTargetProgress = async ({ agencyId, month, sourceCoins }) => {
     target.status !== 'achieved'
   ) {
     target.status = 'achieved';
+    if (session) target.$session(session);
     await target.save();
   }
 
@@ -8172,7 +8607,8 @@ const getWithdrawalSourceForUser = (user, requestedSource = '') => {
   const source = String(requestedSource || '').trim();
   if (['daimon', 'commissionBalance', 'revenueBalance'].includes(source)) return source;
   if (hasUserRole(user, 'agency') || user?.agencyStatus === 'approved') return 'commissionBalance';
-  if (['admin', 'manager', 'super_admin'].some(role => hasUserRole(user, role))) return 'revenueBalance';
+  if (hasUserRole(user, 'manager')) return 'commissionBalance';
+  if (['admin', 'super_admin'].some(role => hasUserRole(user, role))) return 'revenueBalance';
   return 'daimon';
 };
 
