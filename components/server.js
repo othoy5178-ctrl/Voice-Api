@@ -1460,13 +1460,45 @@ const joinAuthenticatedUserSocketRoom = async (socket, payload = {}) => {
 const emitWalletUpdated = (userId, wallet = {}) => {
   const cleanUserId = String(userId || '').trim();
   if (!cleanUserId) return;
-  io.to(getUserSocketRoom(cleanUserId)).emit('wallet_updated', {
+  const payload = {
     userId: cleanUserId,
-    chang: Math.max(0, Math.floor(Number(wallet.chang || 0))),
-    daimon: wallet.daimon !== undefined ? Math.max(0, Math.floor(Number(wallet.daimon || 0))) : undefined,
     source: wallet.source || 'wallet',
     updatedAt: new Date().toISOString(),
-  });
+  };
+  if (wallet.chang !== undefined) payload.chang = Math.max(0, Math.floor(Number(wallet.chang || 0)));
+  if (wallet.daimon !== undefined) payload.daimon = Math.max(0, Math.floor(Number(wallet.daimon || 0)));
+  if (wallet.commissionBalance !== undefined) payload.commissionBalance = Math.max(0, Math.floor(Number(wallet.commissionBalance || 0)));
+  if (wallet.revenueBalance !== undefined) payload.revenueBalance = Math.max(0, Math.floor(Number(wallet.revenueBalance || 0)));
+  io.to(getUserSocketRoom(cleanUserId)).emit('wallet_updated', payload);
+};
+
+const emitCommissionUpdated = async (beneficiaryId, payload = {}) => {
+  const cleanUserId = String(beneficiaryId || '').trim();
+  if (!cleanUserId || !mongoose.Types.ObjectId.isValid(cleanUserId)) return;
+
+  const user = await User.findById(cleanUserId)
+    .select('commissionBalance revenueBalance totalHostCoins')
+    .lean();
+  if (!user) return;
+
+  const eventPayload = {
+    userId: cleanUserId,
+    beneficiaryRole: payload.beneficiaryRole || payload.role || '',
+    hostId: payload.hostId ? String(payload.hostId) : '',
+    sourceCoins: Math.max(0, Math.floor(Number(payload.sourceCoins || 0))),
+    commissionAmount: Math.max(0, Math.floor(Number(payload.commissionAmount || 0))),
+    ratePercent: Number(payload.ratePercent || 0),
+    month: payload.month || getCommissionMonthKey(),
+    day: payload.day || getCommissionDayKey(),
+    commissionBalance: Math.max(0, Math.floor(Number(user.commissionBalance || 0))),
+    revenueBalance: Math.max(0, Math.floor(Number(user.revenueBalance || 0))),
+    totalHostCoins: Math.max(0, Math.floor(Number(user.totalHostCoins || 0))),
+    source: 'commission',
+    updatedAt: new Date().toISOString(),
+  };
+
+  io.to(getUserSocketRoom(cleanUserId)).emit('commission_updated', eventPayload);
+  emitWalletUpdated(cleanUserId, eventPayload);
 };
 
 io.on('connection', (socket) => {
@@ -2453,6 +2485,8 @@ io.on('connection', (socket) => {
     }
 
     let hostShareByReceiverId = {};
+    let commissionRealtimeEvents = [];
+    let giftCommitted = false;
     const session = await mongoose.startSession();
     session.startTransaction();
 
@@ -2508,6 +2542,41 @@ io.on('connection', (socket) => {
         map[receiverId] = Math.max(0, Math.floor(hostShare));
         return map;
       }, {});
+      commissionRealtimeEvents = Object.values(commissionByReceiverId)
+        .filter(Boolean)
+        .flatMap(commission => ([
+          commission.agencyId && {
+            beneficiaryId: commission.agencyId,
+            beneficiaryRole: 'agency',
+            hostId: commission.hostId,
+            sourceCoins: perReceiverCost,
+            commissionAmount: commission.agencyCommission,
+            ratePercent: commission.agencyRatePercent,
+            month: commission.commissionMonth,
+            day: commission.commissionDay,
+          },
+          commission.adminId && {
+            beneficiaryId: commission.adminId,
+            beneficiaryRole: 'admin',
+            hostId: commission.hostId,
+            sourceCoins: perReceiverCost,
+            commissionAmount: commission.adminCommission,
+            ratePercent: commission.adminRatePercent,
+            month: commission.commissionMonth,
+            day: commission.commissionDay,
+          },
+          commission.managerId && {
+            beneficiaryId: commission.managerId,
+            beneficiaryRole: 'manager',
+            hostId: commission.hostId,
+            sourceCoins: perReceiverCost,
+            commissionAmount: commission.managerCommission,
+            ratePercent: commission.managerRatePercent,
+            month: commission.commissionMonth,
+            day: commission.commissionDay,
+          },
+        ]))
+        .filter(event => event && event.commissionAmount > 0);
 
       const receiverWalletUpdates = normalizedReceiverIds.map(receiverId => {
         return {
@@ -2577,15 +2646,24 @@ io.on('connection', (socket) => {
       );
 
       await session.commitTransaction();
-      await recordRewardActivity(userId, 'send_gift', { roomId: stringRoomId, totalCost, receiverIds: normalizedReceiverIds });
+      giftCommitted = true;
 
     } catch (error) {
-      await session.abortTransaction();
+      if (!giftCommitted) await session.abortTransaction();
       socket.emit('gift_error', { message: error.message });
       return;
     } finally {
       session.endSession();
     }
+
+    recordRewardActivity(userId, 'send_gift', { roomId: stringRoomId, totalCost, receiverIds: normalizedReceiverIds }).catch(error => {
+      console.warn('Unable to record send gift reward activity:', error.message);
+    });
+    Promise.all(
+      commissionRealtimeEvents.map(event => emitCommissionUpdated(event.beneficiaryId, event))
+    ).catch(error => {
+      console.warn('Unable to emit real-time commission update:', error.message);
+    });
 
     io.to(stringRoomId).emit('receive_gift', {
       id: Date.now().toString() + Math.random().toString(),
@@ -6170,7 +6248,8 @@ const requireAppRole = (...allowedRoles) => async (req, res, next) => {
 };
 
 const TOPLINER_ROLE_OPTIONS = {
-  host: ['official', 'agency', 'admin', 'manager'],
+  host: ['agency'],
+  agency: ['admin'],
   admin: ['manager'],
   manager: ['super_admin'],
 };
@@ -6249,7 +6328,7 @@ app.get('/mobile/topliners', requireAppUser, async (req, res) => {
       .lean();
 
     const topliners = [];
-    if (forRole === 'host') {
+    if (forRole === 'host' && allowedRoles.includes('official')) {
       topliners.push({
         _id: '',
         id: '',
@@ -7457,7 +7536,7 @@ const findApprovedAgencyForCommission = async ({ agencyId = null, agencyCode = '
     query._id = { $ne: excludeUserId };
   }
 
-  const request = User.findOne(query).select('_id agencyCode agencyStatus role roles totalHostCoins');
+  const request = User.findOne(query).select('_id agencyCode agencyStatus role roles agencyRegistration totalHostCoins');
   if (session) request.session(session);
   return request.lean();
 };
@@ -7470,7 +7549,7 @@ const findApprovedRoleUserForCommission = async ({ userId, role, session = null 
     : role === 'host'
       ? 'hostStatus'
       : '';
-  const query = User.findById(userId).select('_id role roles agencyStatus hostStatus adminAccessRequest accountStatus totalHostCoins');
+  const query = User.findById(userId).select('_id role roles agencyStatus hostStatus agencyRegistration adminAccessRequest accountStatus totalHostCoins');
   if (session) query.session(session);
   const user = await query.lean();
   if (!user || (user.accountStatus || 'active') !== 'active') return null;
@@ -7554,6 +7633,7 @@ const recordGiftHierarchyCommission = async ({ receiverId, sourceCoins, session 
   const toplinerId = host.hostRegistration?.toplinerId || null;
   const toplinerRole = String(host.hostRegistration?.toplinerRole || '').toLowerCase();
   const commission = {
+    hostId,
     agencyId: null,
     adminId: null,
     managerId: null,
@@ -7587,6 +7667,14 @@ const recordGiftHierarchyCommission = async ({ receiverId, sourceCoins, session 
       if (agency) {
         commission.agencyId = agency._id;
         agencyTotalAfterGift = Number(agency.totalHostCoins || 0) + coins;
+        const adminId = agency.agencyRegistration?.toplinerId || null;
+        const admin = await findApprovedRoleUserForCommission({ userId: adminId, role: 'admin', session });
+        if (admin) {
+          commission.adminId = admin._id;
+          const managerId = admin.adminAccessRequest?.toplinerId || null;
+          const manager = await findApprovedRoleUserForCommission({ userId: managerId, role: 'manager', session });
+          if (manager) commission.managerId = manager._id;
+        }
       }
     }
   }
@@ -7601,6 +7689,14 @@ const recordGiftHierarchyCommission = async ({ receiverId, sourceCoins, session 
     if (agency) {
       commission.agencyId = agency._id;
       agencyTotalAfterGift = Number(agency.totalHostCoins || 0) + coins;
+      const adminId = agency.agencyRegistration?.toplinerId || null;
+      const admin = await findApprovedRoleUserForCommission({ userId: adminId, role: 'admin', session });
+      if (admin) {
+        commission.adminId = admin._id;
+        const managerId = admin.adminAccessRequest?.toplinerId || null;
+        const manager = await findApprovedRoleUserForCommission({ userId: managerId, role: 'manager', session });
+        if (manager) commission.managerId = manager._id;
+      }
     }
   }
 
@@ -7823,6 +7919,8 @@ app.post('/agency/register', async (req, res) => {
     const city = String(req.body?.city || '').trim();
     const expectedHosts = Math.max(0, Number(req.body?.expectedHosts) || 0);
     const experience = String(req.body?.experience || '').trim();
+    const toplinerId = String(req.body?.toplinerId || '').trim();
+    const toplinerRole = String(req.body?.toplinerRole || '').trim().toLowerCase();
     const acceptedTerms = req.body?.acceptedTerms === true;
     const verificationImages = req.body?.verificationImages || {};
 
@@ -7837,6 +7935,12 @@ app.post('/agency/register', async (req, res) => {
     const requiredPhotos = ['profilePhoto', 'idFront', 'idBack', 'selfiePhoto'];
     const missingPhoto = requiredPhotos.find(key => !verificationImages?.[key]?.base64);
     if (missingPhoto) return res.status(400).json({ success: false, message: `${missingPhoto} photo is required.` });
+
+    const topliner = await getToplinerSelection({
+      toplinerId,
+      toplinerRole,
+      allowedRoles: TOPLINER_ROLE_OPTIONS.agency,
+    });
 
     const existingAgencyCodeOwner = await findAgencyCodeOwner(requestedAgencyCode, user._id);
     if (existingAgencyCodeOwner) return sendDuplicateAgencyCodeResponse(res);
@@ -7854,6 +7958,10 @@ app.post('/agency/register', async (req, res) => {
       agencyName,
       ownerName,
       requestedAgencyCode,
+      toplinerId: topliner.id,
+      toplinerRole: topliner.role,
+      toplinerName: topliner.name,
+      toplinerGlixId: topliner.glixId,
       phoneCountryCode,
       phoneNumber,
       city,
@@ -7909,13 +8017,12 @@ app.post('/host/register', async (req, res) => {
 
     const topliner = await getToplinerSelection({
       toplinerId,
-      toplinerRole: toplinerRole || (agencySelection === 'Official' ? 'official' : ''),
+      toplinerRole,
       allowedRoles: TOPLINER_ROLE_OPTIONS.host,
     });
-    const finalAgencySelection = topliner.role === 'agency' ? 'Other Agency' : agencySelection;
-    const finalAgencyCode = topliner.role === 'agency'
-      ? normalizeAgencyCode(topliner.agencyCode)
-      : normalizeAgencyCode(agencyCode || (finalAgencySelection === 'Official' ? 'OFFICIAL' : ''));
+    const finalAgencySelection = 'Other Agency';
+    const finalAgencyCode = normalizeAgencyCode(topliner.agencyCode || agencyCode);
+    if (!finalAgencyCode) return res.status(400).json({ success: false, message: 'Selected agency does not have a valid agency code.' });
 
     const selfiePhotoUrl = await uploadUserImage(userId, verificationImages.selfiePhoto, 'host-selfie');
 
@@ -8195,9 +8302,60 @@ app.get('/mobile/team/belows', requireAppRole('admin', 'manager', 'agency', 'coi
 
 app.get('/mobile/agency/requests', requireAppRole('admin'), async (req, res) => {
   try {
-    const requests = await User.find({ agencyStatus: 'pending' }).select('-password -passwordResetOtpHash').sort({ 'agencyRegistration.registeredAt': -1, createdAt: -1 }).lean();
+    const authRoles = normalizeUserRoles(req.authUser);
+    const query = { agencyStatus: 'pending' };
+    if (!authRoles.includes('super_admin')) {
+      query['agencyRegistration.toplinerId'] = req.authUser._id;
+    }
+
+    const requests = await User.find(query).select('-password -passwordResetOtpHash').sort({ 'agencyRegistration.registeredAt': -1, createdAt: -1 }).lean();
     return res.json({ success: true, requests });
   } catch (error) {
+    return res.status(500).json({ success: false, message: error.message });
+  }
+});
+
+app.patch('/mobile/agency/requests/:userId', requireAppRole('admin'), async (req, res) => {
+  try {
+    const status = ['approved', 'rejected'].includes(req.body?.status) ? req.body.status : null;
+    if (!status) return res.status(400).json({ success: false, message: 'Invalid agency status' });
+
+    const user = await User.findById(req.params.userId);
+    if (!user) return res.status(404).json({ success: false, message: 'User not found' });
+
+    const authRoles = normalizeUserRoles(req.authUser);
+    const assignedToplinerId = user.agencyRegistration?.toplinerId;
+    const isAssignedToRequester = assignedToplinerId && String(assignedToplinerId) === String(req.authUser._id);
+    if (!isAssignedToRequester && !authRoles.includes('super_admin')) {
+      return res.status(403).json({ success: false, message: 'This agency request is assigned to another admin.' });
+    }
+
+    user.agencyStatus = status;
+    user.agencyRejectionReason = status === 'rejected' ? String(req.body?.reason || '') : '';
+    user.agencyRegistration.status = status;
+    user.agencyRegistration.rejectionReason = user.agencyRejectionReason;
+    user.agencyRegistration.reviewedBy = req.authUser._id;
+    user.agencyRegistration.reviewedAt = new Date();
+
+    if (status === 'approved') {
+      const agencyCode = normalizeAgencyCode(user.agencyRegistration?.requestedAgencyCode || user.agencyCode || `AG${String(user.glixId || user._id).slice(-5)}`);
+      const agencyCodeError = validateAgencyCode(agencyCode);
+      if (agencyCodeError) return res.status(400).json({ success: false, message: agencyCodeError });
+      const existingAgencyCodeOwner = await findAgencyCodeOwner(agencyCode, user._id);
+      if (existingAgencyCodeOwner) return sendDuplicateAgencyCodeResponse(res);
+      addUserRole(user, 'agency');
+      if (!user.role || user.role === 'user') user.role = 'agency';
+      user.agencyCode = agencyCode;
+      user.agencyRegistration.requestedAgencyCode = agencyCode;
+    } else {
+      removeUserRole(user, 'agency');
+    }
+
+    await user.save();
+    if (status === 'approved') await backfillApprovedHostsForAgency(user);
+    return res.json({ success: true, user: serializeOfficialUser(user) });
+  } catch (error) {
+    if (isDuplicateAgencyCodeError(error)) return sendDuplicateAgencyCodeResponse(res);
     return res.status(500).json({ success: false, message: error.message });
   }
 });

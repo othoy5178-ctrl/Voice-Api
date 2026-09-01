@@ -311,6 +311,18 @@ const userSchema = new mongoose.Schema({
     agencyName: { type: String, trim: true, default: '' },
     ownerName: { type: String, trim: true, default: '' },
     requestedAgencyCode: { type: String, trim: true, uppercase: true, default: '' },
+    toplinerId: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: 'User',
+      default: null
+    },
+    toplinerRole: {
+      type: String,
+      enum: ['admin', 'manager', 'super_admin', ''],
+      default: ''
+    },
+    toplinerName: { type: String, trim: true, default: '' },
+    toplinerGlixId: { type: String, trim: true, default: '' },
     phoneCountryCode: { type: String, trim: true, default: '' },
     phoneNumber: { type: String, trim: true, default: '' },
     city: { type: String, trim: true, default: '' },
