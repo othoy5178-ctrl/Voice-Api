@@ -8109,16 +8109,7 @@ app.get('/mobile/host/requests', requireAppRole('admin', 'manager', 'agency'), a
     const query = { hostStatus: 'pending' };
 
     if (!isSuperAdmin) {
-      const assignedToMe = { 'hostRegistration.toplinerId': req.authUser._id };
-      if (authRoles.includes('admin') || authRoles.includes('manager')) {
-        query.$or = [
-          assignedToMe,
-          { 'hostRegistration.toplinerId': null },
-          { 'hostRegistration.toplinerId': { $exists: false } },
-        ];
-      } else {
-        query.$or = [assignedToMe];
-      }
+      query['hostRegistration.toplinerId'] = req.authUser._id;
     }
 
     const requests = await User.find(query).select('-password -passwordResetOtpHash').sort({ 'hostRegistration.registeredAt': -1, createdAt: -1 }).lean();
@@ -8138,8 +8129,7 @@ app.patch('/mobile/host/requests/:userId', requireAppRole('admin', 'manager', 'a
     const authRoles = normalizeUserRoles(req.authUser);
     const assignedToplinerId = user.hostRegistration?.toplinerId;
     const isAssignedToRequester = assignedToplinerId && String(assignedToplinerId) === String(req.authUser._id);
-    const isLegacyUnassigned = !assignedToplinerId && (authRoles.includes('admin') || authRoles.includes('manager') || authRoles.includes('super_admin'));
-    if (!isAssignedToRequester && !isLegacyUnassigned && !authRoles.includes('super_admin')) {
+    if (!isAssignedToRequester && !authRoles.includes('super_admin')) {
       return res.status(403).json({ success: false, message: 'This host request is assigned to another topliner.' });
     }
 
@@ -8174,11 +8164,7 @@ app.get('/mobile/admin-access/requests', requireAppRole('manager'), async (req, 
     };
 
     if (!authRoles.includes('super_admin')) {
-      query.$or = [
-        { 'adminAccessRequest.toplinerId': req.authUser._id },
-        { 'adminAccessRequest.toplinerId': null },
-        { 'adminAccessRequest.toplinerId': { $exists: false } },
-      ];
+      query['adminAccessRequest.toplinerId'] = req.authUser._id;
     }
 
     const requests = await User.find(query).select('-password -passwordResetOtpHash').sort({ 'adminAccessRequest.requestedAt': -1, createdAt: -1 }).lean();
@@ -8204,7 +8190,8 @@ app.patch('/mobile/admin-access/requests/:userId', requireAppRole('manager'), as
       return res.status(403).json({ success: false, message: 'Invalid app access request role.' });
     }
     const assignedToplinerId = targetUser.adminAccessRequest?.toplinerId;
-    if (assignedToplinerId && String(assignedToplinerId) !== String(req.authUser._id) && !authRoles.includes('super_admin')) {
+    const isAssignedToRequester = assignedToplinerId && String(assignedToplinerId) === String(req.authUser._id);
+    if (!isAssignedToRequester && !authRoles.includes('super_admin')) {
       return res.status(403).json({ success: false, message: 'This admin request is assigned to another manager.' });
     }
 
@@ -8362,8 +8349,14 @@ app.patch('/mobile/agency/requests/:userId', requireAppRole('admin'), async (req
 
 app.get('/mobile/admin/agencies', requireAppRole('admin'), async (req, res) => {
   try {
+    const authRoles = normalizeUserRoles(req.authUser);
+    const match = { $or: [{ role: 'agency' }, { roles: 'agency' }, { agencyStatus: 'approved' }] };
+    if (!authRoles.includes('super_admin')) {
+      match['agencyRegistration.toplinerId'] = req.authUser._id;
+    }
+
     const agencies = await User.aggregate([
-      { $match: { $or: [{ role: 'agency' }, { roles: 'agency' }, { agencyStatus: 'approved' }] } },
+      { $match: match },
       {
         $lookup: {
           from: 'users',
@@ -8416,6 +8409,13 @@ app.get('/mobile/admin/agencies/:agencyId/hosts', requireAppRole('admin'), async
     if (!mongoose.Types.ObjectId.isValid(req.params.agencyId)) return res.status(400).json({ success: false, message: 'Invalid agency id' });
     const agency = await User.findById(req.params.agencyId).select('_id agencyCode agencyRegistration agencyStatus').lean();
     if (!agency) return res.status(404).json({ success: false, message: 'Agency not found' });
+    const authRoles = normalizeUserRoles(req.authUser);
+    const assignedToplinerId = agency.agencyRegistration?.toplinerId;
+    const isAssignedToRequester = assignedToplinerId && String(assignedToplinerId) === String(req.authUser._id);
+    if (!isAssignedToRequester && !authRoles.includes('super_admin')) {
+      return res.status(403).json({ success: false, message: 'This agency is assigned to another admin.' });
+    }
+
     const hosts = await User.find(buildAgencyHostQuery(agency)).select('-password -passwordResetOtpHash').sort({ createdAt: -1 }).lean();
     return res.json({ success: true, hosts });
   } catch (error) {
