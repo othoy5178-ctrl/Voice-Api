@@ -1640,6 +1640,9 @@ io.on('connection', (socket) => {
       } else {
         socket.emit('initialize_room_slots', completeLayoutMatrix);
       }
+      if (!isVideoRoom && mongoose.Types.ObjectId.isValid(stringRoomId)) {
+        await emitRoomSlotsSnapshot(stringRoomId);
+      }
       await emitRoomStats(stringRoomId);
 
     } catch (err) {
@@ -1662,7 +1665,7 @@ io.on('connection', (socket) => {
       const stringRoomId = roomId ? roomId.toString() : '';
       const isVideoRoom = stringRoomId.startsWith('glix_');
       const normalizedSlotIndex = Number(targetSlotIndex);
-      const isClearingSlotPayload = profilePic === null || numericUid === null || numericUid === undefined;
+      const isClearingSlotPayload = numericUid === null || numericUid === undefined;
       if (!Number.isInteger(normalizedSlotIndex) || normalizedSlotIndex < 0) return;
       if (process.env.NODE_ENV !== 'production') {
         console.log('[VoiceRoom SlotChange]', {
@@ -1745,7 +1748,7 @@ io.on('connection', (socket) => {
           }
         }
 
-        const updateData = profilePic === null
+        const updateData = isClearingSlotPayload
           ? {
             "slots.$.userId": null,
             "slots.$.uid": null,
@@ -1772,7 +1775,7 @@ io.on('connection', (socket) => {
       } else {
         if (!mongoose.Types.ObjectId.isValid(stringRoomId)) return;
 
-        const isTakingOrUpdatingSeat = profilePic !== null && numericUid !== null && numericUid !== undefined;
+        const isTakingOrUpdatingSeat = !isClearingSlotPayload && !!userId;
 
         if (!isTakingOrUpdatingSeat) {
           const latestAudioRoom = await AudioRoom.findOneAndUpdate(
@@ -2208,7 +2211,7 @@ io.on('connection', (socket) => {
       const stringRoomId = roomId ? roomId.toString() : '';
       if (!mongoose.Types.ObjectId.isValid(stringRoomId)) return;
 
-      const nextSeatCount = [5, 10, 15, 24].includes(Number(micSeatCount)) ? Number(micSeatCount) : 15;
+      const requestedSeatCount = Number(micSeatCount);
       const nextLayoutType = ['chatroom', 'dating', 'party', 'birthday'].includes(micLayoutType) ? micLayoutType : 'chatroom';
       const nextBackgroundThemeId = backgroundThemeId ? String(backgroundThemeId) : null;
       let nextBackgroundThemeUrl = backgroundThemeUrl ? String(backgroundThemeUrl) : null;
@@ -2218,6 +2221,10 @@ io.on('connection', (socket) => {
         socket.emit('error_notice', { message: 'Audio room not found.' });
         return;
       }
+
+      const nextSeatCount = [5, 10, 15, 24].includes(requestedSeatCount)
+        ? requestedSeatCount
+        : Number(audioRoom.micSeatCount || 15);
 
       const canUpdateLayout = String(audioRoom.hostId || '') === String(requesterId || '') || String(audioRoom.hostId || '') === String(socket.userId || '');
       if (!canUpdateLayout) {
@@ -4168,6 +4175,7 @@ app.post('/join', async (req, res) => {
       }
 
       await roomObj.save();
+      await emitRoomSlotsSnapshot(stringRoomId);
     }
 
     if (!roomObj) return res.status(404).json({ error: "Room not found" });
@@ -4817,14 +4825,31 @@ app.post('/register', async (req, res) => {
 
 
 
-const getCurrentWeekPeriodMatch = (period) => {
-  if (!['weekday', 'weekend'].includes(period)) return null;
-
+const getRankPeriodMatch = (period) => {
   const now = new Date();
+  const normalizedPeriod = String(period || 'all').toLowerCase();
+
+  if (['day', 'daily', 'today', '1day', '1d', '24h'].includes(normalizedPeriod)) {
+    const startOfDay = new Date(now);
+    startOfDay.setHours(0, 0, 0, 0);
+    return { createdAt: { $gte: startOfDay, $lte: now } };
+  }
+
   const day = now.getDay();
   const monday = new Date(now);
   monday.setDate(now.getDate() - ((day + 6) % 7));
   monday.setHours(0, 0, 0, 0);
+
+  if (['week', 'weekly', '1week', '1w', '7d'].includes(normalizedPeriod)) {
+    return { createdAt: { $gte: monday, $lte: now } };
+  }
+
+  if (['month', 'monthly', '1month', '1m', '30d'].includes(normalizedPeriod)) {
+    const startOfMonth = new Date(now.getFullYear(), now.getMonth(), 1);
+    return { createdAt: { $gte: startOfMonth, $lte: now } };
+  }
+
+  if (!['weekday', 'weekend'].includes(normalizedPeriod)) return null;
 
   const friday = new Date(monday);
   friday.setDate(monday.getDate() + 4);
@@ -4832,7 +4857,7 @@ const getCurrentWeekPeriodMatch = (period) => {
   const nextMonday = new Date(monday);
   nextMonday.setDate(monday.getDate() + 7);
 
-  return period === 'weekday'
+  return normalizedPeriod === 'weekday'
     ? { createdAt: { $gte: monday, $lt: friday } }
     : { createdAt: { $gte: friday, $lt: nextMonday } };
 };
@@ -4854,8 +4879,8 @@ const getUserRankRows = async ({ sortField, limit }) => {
   }));
 };
 
-const getGiftRankRows = async ({ groupField, limit, period }) => {
-  const periodMatch = getCurrentWeekPeriodMatch(period);
+const getGiftRankRows = async ({ groupField, limit, period, scoreField = 'totalCost' }) => {
+  const periodMatch = getRankPeriodMatch(period);
   const pipeline = [];
   if (periodMatch) pipeline.push({ $match: periodMatch });
 
@@ -4863,7 +4888,7 @@ const getGiftRankRows = async ({ groupField, limit, period }) => {
     {
       $group: {
         _id: `$${groupField}`,
-        score: { $sum: '$totalCost' },
+        score: { $sum: `$${scoreField}` },
         totalGifts: { $sum: '$quantity' },
         totalTransactions: { $sum: 1 }
       }
@@ -4898,7 +4923,7 @@ const getGiftRankRows = async ({ groupField, limit, period }) => {
 };
 
 const getActivityRankRows = async ({ types, limit, period }) => {
-  const periodMatch = getCurrentWeekPeriodMatch(period);
+  const periodMatch = getRankPeriodMatch(period);
   const match = { type: { $in: types } };
   if (periodMatch) Object.assign(match, periodMatch);
 
@@ -5141,8 +5166,8 @@ app.get('/rank/:type', async (req, res) => {
 
     const rankConfig = {
       host: { title: 'Top hosts by gifts received', unit: 'Diamonds' },
-      rich: { title: 'Rich users by diamond balance', unit: 'Diamonds' },
-      gift: { title: 'Top gifters by gifts sent', unit: 'Diamonds' },
+      rich: { title: 'Rich users by gifts sent', unit: 'Diamonds' },
+      gift: { title: 'Top gifters by gift count', unit: 'Gifts' },
       video: { title: 'Top video room activity', unit: 'Lives' }
     };
 
@@ -5162,8 +5187,8 @@ app.get('/rank/:type', async (req, res) => {
       title = 'Rocket host ranking by live rooms created';
     } else {
       if (type === 'host') ranks = await getGiftRankRows({ groupField: 'receiverId', limit, period });
-      if (type === 'rich') ranks = await getUserRankRows({ sortField: 'daimon', limit });
-      if (type === 'gift') ranks = await getGiftRankRows({ groupField: 'senderId', limit, period });
+      if (type === 'rich') ranks = await getGiftRankRows({ groupField: 'senderId', limit, period });
+      if (type === 'gift') ranks = await getGiftRankRows({ groupField: 'senderId', limit, period, scoreField: 'quantity' });
       if (type === 'video') {
         ranks = await getActivityRankRows({
           types: ['create_video_room', 'join_video_room'],
