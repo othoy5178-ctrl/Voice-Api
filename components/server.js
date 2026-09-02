@@ -75,6 +75,7 @@ const roomKeepOpenRooms = {};
 const roomDisconnectTimers = new Map();
 const roomEmptyAudienceTimers = new Map();
 const ROOM_RECONNECT_GRACE_MS = Number(process.env.ROOM_RECONNECT_GRACE_MS || 60000);
+const MIC_SLOT_RECONNECT_GRACE_MS = Number(process.env.MIC_SLOT_RECONNECT_GRACE_MS || 5000);
 const KEPT_OPEN_EMPTY_AUDIENCE_GRACE_MS = Number(process.env.KEPT_OPEN_EMPTY_AUDIENCE_GRACE_MS || 30000);
 const COIN_BAG_ALLOWED_AMOUNTS = [10000, 30000, 50000, 100000];
 const COIN_BAG_ALLOWED_CLAIM_LIMITS = [10, 20, 50];
@@ -88,7 +89,7 @@ const clampPercent = (value, fallback, max = 100) => {
   if (!Number.isFinite(rate)) return fallback;
   return Math.min(Math.max(rate, 0), max);
 };
-const HOST_GIFT_SHARE_PERCENT = 70;
+const HOST_GIFT_SHARE_PERCENT = 100;
 const AGENCY_COMMISSION_RATE_PERCENT = clampPercent(process.env.AGENCY_COMMISSION_RATE_PERCENT, 4, 20);
 const ADMIN_COMMISSION_RATE_PERCENT = clampPercent(process.env.ADMIN_COMMISSION_RATE_PERCENT, 3, 3);
 const MANAGER_COMMISSION_RATE_PERCENT = clampPercent(process.env.MANAGER_COMMISSION_RATE_PERCENT, 3, 3);
@@ -1520,13 +1521,7 @@ io.on('connection', (socket) => {
       socket.roomId = stringRoomId;
       joinUserSocketRoom(socket, userId);
       socket.userName = finalJoinName;
-
-      if (clearRoomDisconnectTimer(stringRoomId, userId)) {
-        io.to(stringRoomId).emit('host_reconnected', {
-          userId,
-          message: `${finalJoinName || 'Host'} reconnected.`
-        });
-      }
+      const hadReconnectTimer = clearRoomDisconnectTimer(stringRoomId, userId);
 
       await upsertRoomPresence({
         roomId: stringRoomId,
@@ -1551,6 +1546,13 @@ io.on('connection', (socket) => {
       }
 
       const isJoiningRoomHost = joinedRoomHostId && String(joinedRoomHostId) === String(userId || '');
+      if (hadReconnectTimer && isJoiningRoomHost) {
+        io.to(stringRoomId).emit('host_reconnected', {
+          userId,
+          message: `${finalJoinName || 'Host'} reconnected.`
+        });
+      }
+
       if (isJoiningRoomHost && roomKeepOpenRooms[stringRoomId]) {
         delete roomKeepOpenRooms[stringRoomId];
         delete roomControllers[stringRoomId];
@@ -1641,7 +1643,11 @@ io.on('connection', (socket) => {
         socket.emit('initialize_room_slots', completeLayoutMatrix);
       }
       if (!isVideoRoom && mongoose.Types.ObjectId.isValid(stringRoomId)) {
-        await emitRoomSlotsSnapshot(stringRoomId);
+        const authoritativeSnapshot = await buildRoomSlotsSnapshot(stringRoomId);
+        if (authoritativeSnapshot) {
+          socket.emit('room_slots_updated', authoritativeSnapshot);
+          socket.to(stringRoomId).emit('room_slots_updated', authoritativeSnapshot);
+        }
       }
       await emitRoomStats(stringRoomId);
 
@@ -3092,7 +3098,7 @@ io.on('connection', (socket) => {
     });
   });
 
-  socket.on('room_app_foreground', ({ roomId, userId, roomMode }) => {
+  socket.on('room_app_foreground', async ({ roomId, userId, roomMode }) => {
     const stringRoomId = roomId ? roomId.toString() : '';
     if (!stringRoomId || !userId) return;
 
@@ -3102,11 +3108,27 @@ io.on('connection', (socket) => {
     clearRoomEmptyAudienceTimer(stringRoomId);
 
     if (clearRoomDisconnectTimer(stringRoomId, userId)) {
-      io.to(stringRoomId).emit('host_reconnected', {
-        userId,
-        roomMode: roomMode || (stringRoomId.startsWith('glix_') ? 'video' : 'audio'),
-        message: 'Host reconnected.'
-      });
+      try {
+        const resolvedRoomMode = roomMode || (stringRoomId.startsWith('glix_') ? 'video' : 'audio');
+        let roomHostId = '';
+        if (stringRoomId.startsWith('glix_')) {
+          const videoRoom = await Room.findOne(getVideoRoomFilter(stringRoomId)).select('hostId').lean();
+          roomHostId = videoRoom?.hostId?.toString?.() || String(videoRoom?.hostId || '');
+        } else if (mongoose.Types.ObjectId.isValid(stringRoomId)) {
+          const audioRoom = await AudioRoom.findById(stringRoomId).select('hostId').lean();
+          roomHostId = audioRoom?.hostId?.toString?.() || String(audioRoom?.hostId || '');
+        }
+
+        if (roomHostId && String(roomHostId) === String(userId)) {
+          io.to(stringRoomId).emit('host_reconnected', {
+            userId,
+            roomMode: resolvedRoomMode,
+            message: 'Host reconnected.'
+          });
+        }
+      } catch (error) {
+        console.log('Room foreground reconnect check error:', error);
+      }
     }
   });
 
@@ -3306,6 +3328,58 @@ io.on('connection', (socket) => {
       );
 
       const oldSlotIndex = speaker?.slotIndex;
+
+      if (oldSlotIndex !== undefined) {
+        removeRoomPresence({ roomId, userId: currentUserId, socketId: socket.id });
+
+        const timerKey = getRoomDisconnectTimerKey(roomId, currentUserId);
+        if (roomDisconnectTimers.has(timerKey)) clearTimeout(roomDisconnectTimers.get(timerKey));
+
+        const timer = setTimeout(async () => {
+          try {
+            roomDisconnectTimers.delete(timerKey);
+
+            const hasReconnectedSocket = activeUsers[currentUserId] && activeUsers[currentUserId] !== socket.id;
+            const hasReconnectedPresence = !!roomPresence[roomId]?.[currentUserId];
+            if (hasReconnectedSocket || hasReconnectedPresence) return;
+
+            const latestRoom = await AudioRoom.findById(roomId).select('speakers');
+            const latestSpeaker = latestRoom?.speakers?.find(
+              s => String(s.userId) === currentUserId
+            );
+            const latestSlotIndex = latestSpeaker?.slotIndex;
+
+            await AudioRoom.findByIdAndUpdate(roomId, {
+              $pull: {
+                speakers: { userId: currentUserId },
+                audience: currentUserId
+              }
+            });
+
+            scheduleKeptOpenAudioRoomEmptyCheck(roomId, 'last_audience_left');
+
+            if (latestSlotIndex !== undefined) {
+              io.to(roomId).emit("slot_state_changed", {
+                slotIndex: latestSlotIndex,
+                user: {
+                  uid: null,
+                  userId: null,
+                  username: "",
+                  avatar: null,
+                  frameUrl: null,
+                  isMuted: false
+                }
+              });
+              await emitRoomSlotsSnapshot(roomId);
+            }
+          } catch (error) {
+            console.log('Audio mic user delayed disconnect cleanup error:', error);
+          }
+        }, MIC_SLOT_RECONNECT_GRACE_MS);
+
+        roomDisconnectTimers.set(timerKey, timer);
+        return;
+      }
 
       await AudioRoom.findByIdAndUpdate(roomId, {
         $pull: {
