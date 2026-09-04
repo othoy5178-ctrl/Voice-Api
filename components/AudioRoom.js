@@ -7,6 +7,8 @@ const audioRoomSchema = new mongoose.Schema({
   // Define fixed slots for speakers (e.g., 5 or 8 slots)
   speakers: [{
     userId: { type: mongoose.Schema.Types.ObjectId, ref: 'User' },
+    username: { type: String, default: '' },
+    avatar: { type: String, default: '' },
     isMuted: { type: Boolean, default: false },
     slotIndex: { type: Number },
     numericUid: { type: Number },
@@ -15,6 +17,13 @@ const audioRoomSchema = new mongoose.Schema({
 
   // Track everyone currently listening
   audience: [{ type: mongoose.Schema.Types.ObjectId, ref: 'User' }],
+
+  activeGamePlayers: [{
+    userId: { type: mongoose.Schema.Types.ObjectId, ref: 'User' },
+    gameId: { type: String, default: '' },
+    joinedAt: { type: Date, default: Date.now },
+    lastHeartbeatAt: { type: Date, default: Date.now }
+  }],
 
   micSeatCount: {
     type: Number,

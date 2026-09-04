@@ -72,11 +72,13 @@ const activeUsers = {};
 const roomPresence = {};
 const roomControllers = {};
 const roomKeepOpenRooms = {};
+const roomGamePlayers = {};
 const roomDisconnectTimers = new Map();
 const roomEmptyAudienceTimers = new Map();
 const ROOM_RECONNECT_GRACE_MS = Number(process.env.ROOM_RECONNECT_GRACE_MS || 60000);
 const MIC_SLOT_RECONNECT_GRACE_MS = Number(process.env.MIC_SLOT_RECONNECT_GRACE_MS || 5000);
 const KEPT_OPEN_EMPTY_AUDIENCE_GRACE_MS = Number(process.env.KEPT_OPEN_EMPTY_AUDIENCE_GRACE_MS || 30000);
+const ROOM_GAME_PLAYER_STALE_MS = Number(process.env.ROOM_GAME_PLAYER_STALE_MS || 45000);
 const COIN_BAG_ALLOWED_AMOUNTS = [10000, 30000, 50000, 100000];
 const COIN_BAG_ALLOWED_CLAIM_LIMITS = [10, 20, 50];
 const COIN_BAG_PLATFORM_FEE_RATE = 0.03;
@@ -311,6 +313,38 @@ const clearRoomEmptyAudienceTimer = (roomId) => {
   return true;
 };
 
+const getFreshRoomGamePlayers = (roomId) => {
+  const stringRoomId = getStringRoomId(roomId);
+  if (!stringRoomId || !roomGamePlayers[stringRoomId]) return [];
+
+  const staleBefore = Date.now() - ROOM_GAME_PLAYER_STALE_MS;
+  Object.entries(roomGamePlayers[stringRoomId]).forEach(([userId, player]) => {
+    if (!player?.lastHeartbeatAt || player.lastHeartbeatAt < staleBefore) {
+      delete roomGamePlayers[stringRoomId][userId];
+    }
+  });
+
+  const players = Object.values(roomGamePlayers[stringRoomId]);
+  if (!players.length) delete roomGamePlayers[stringRoomId];
+  return players;
+};
+
+const hasFreshAudioRoomGamePlayers = async (roomId) => {
+  const stringRoomId = getStringRoomId(roomId);
+  if (!stringRoomId || !mongoose.Types.ObjectId.isValid(stringRoomId)) return false;
+  if (getFreshRoomGamePlayers(stringRoomId).length) return true;
+
+  const cutoff = new Date(Date.now() - ROOM_GAME_PLAYER_STALE_MS);
+  const activeGameRoom = await AudioRoom.exists({
+    _id: stringRoomId,
+    activeGamePlayers: {
+      $elemMatch: { lastHeartbeatAt: { $gte: cutoff } }
+    }
+  });
+
+  return !!activeGameRoom;
+};
+
 const buildRoomMemberPayload = (userId, fallback = {}) => ({
   userId: userId?.toString?.() || String(userId || ''),
   id: userId?.toString?.() || String(userId || ''),
@@ -415,8 +449,9 @@ const closeKeptOpenAudioRoomIfNoAudience = async (roomId, reason = 'empty_audien
   const dbSpeakers = Array.isArray(room.speakers)
     ? room.speakers.filter(speaker => speaker?.userId && String(speaker.userId) !== hostId)
     : [];
+  const hasGamePlayers = await hasFreshAudioRoomGamePlayers(stringRoomId);
 
-  if (livePresenceUsers.length || dbAudience.length || dbSpeakers.length) return false;
+  if (livePresenceUsers.length || dbAudience.length || dbSpeakers.length || hasGamePlayers) return false;
 
   room.isLive = false;
   room.speakers = [];
@@ -459,6 +494,77 @@ const scheduleKeptOpenAudioRoomEmptyCheck = (roomId, reason = 'empty_audience') 
   return true;
 };
 
+const closeKeptOpenAudioRoomIfNoMicOrGame = async (roomId, reason = 'empty_mic_and_game') => {
+  const stringRoomId = getStringRoomId(roomId);
+  if (!stringRoomId || stringRoomId.startsWith('glix_') || !roomKeepOpenRooms[stringRoomId]) return false;
+  if (!mongoose.Types.ObjectId.isValid(stringRoomId)) return false;
+
+  const room = await AudioRoom.findById(stringRoomId).select('hostId isLive speakers audience createdAt');
+  if (!room || !room.isLive) return false;
+
+  const hostId = room.hostId ? room.hostId.toString() : '';
+  const dbSpeakers = Array.isArray(room.speakers)
+    ? room.speakers.filter(speaker => speaker?.userId && String(speaker.userId) !== hostId)
+    : [];
+  const hasGamePlayers = await hasFreshAudioRoomGamePlayers(stringRoomId);
+
+  if (dbSpeakers.length || hasGamePlayers) return false;
+
+  await recordHostLiveSessionActivity({
+    hostId: room.hostId,
+    roomId: stringRoomId,
+    roomMode: 'audio',
+    startedAt: room.createdAt,
+    endedAt: new Date()
+  });
+
+  room.isLive = false;
+  room.speakers = [];
+  room.audience = [];
+  room.endedAt = new Date();
+  await room.save();
+
+  clearRoomEmptyAudienceTimer(stringRoomId);
+  delete roomKeepOpenRooms[stringRoomId];
+  delete roomControllers[stringRoomId];
+  delete roomPresence[stringRoomId];
+
+  io.to(stringRoomId).emit('room_members_updated', []);
+  io.to(stringRoomId).emit('audio_room_ended', {
+    reason,
+    message: 'The voice room closed because no mic users or game players are left.'
+  });
+
+  console.log(`Kept-open audio room closed because no mic users or game players remain: ${stringRoomId}`);
+  return true;
+};
+
+const scheduleKeptOpenAudioRoomMicGameCheck = (roomId, reason = 'empty_mic_and_game') => {
+  const stringRoomId = getStringRoomId(roomId);
+  if (!stringRoomId || stringRoomId.startsWith('glix_') || !roomKeepOpenRooms[stringRoomId]) return false;
+  if (!mongoose.Types.ObjectId.isValid(stringRoomId)) return false;
+
+  clearRoomEmptyAudienceTimer(stringRoomId);
+
+  const timer = setTimeout(async () => {
+    roomEmptyAudienceTimers.delete(stringRoomId);
+    try {
+      await closeKeptOpenAudioRoomIfNoMicOrGame(stringRoomId, reason);
+    } catch (error) {
+      console.log('Delayed kept-open audio room mic/game check error:', error);
+    }
+  }, KEPT_OPEN_EMPTY_AUDIENCE_GRACE_MS);
+
+  roomEmptyAudienceTimers.set(stringRoomId, timer);
+  return true;
+};
+
+const scheduleKeptOpenAudioRoomCloseCheck = (roomId, reason = 'empty_room') => (
+  roomKeepOpenRooms[getStringRoomId(roomId)]?.closeWhen === 'no_mic_or_game'
+    ? scheduleKeptOpenAudioRoomMicGameCheck(roomId, reason)
+    : scheduleKeptOpenAudioRoomEmptyCheck(roomId, reason)
+);
+
 const LIVE_ROOM_STALE_MS = 5 * 60 * 1000;
 
 const getLiveRoomFreshCutoff = () => new Date(Date.now() - LIVE_ROOM_STALE_MS);
@@ -469,6 +575,205 @@ const getVideoRoomFilter = (roomId) => {
   if (stringRoomId.startsWith('glix_')) return { channelName: stringRoomId };
   if (mongoose.Types.ObjectId.isValid(stringRoomId)) return { _id: stringRoomId };
   return null;
+};
+
+const hasFreshVideoRoomGamePlayers = async (roomId) => {
+  const stringRoomId = getStringRoomId(roomId);
+  if (!stringRoomId) return false;
+  if (getFreshRoomGamePlayers(stringRoomId).length) return true;
+
+  const videoFilter = getVideoRoomFilter(stringRoomId);
+  if (!videoFilter) return false;
+
+  const cutoff = new Date(Date.now() - ROOM_GAME_PLAYER_STALE_MS);
+  const activeGameRoom = await Room.exists({
+    ...videoFilter,
+    activeGamePlayers: {
+      $elemMatch: { lastHeartbeatAt: { $gte: cutoff } }
+    }
+  });
+
+  return !!activeGameRoom;
+};
+
+const getRoomPresenceUserIds = (roomId, hostId) => {
+  const stringRoomId = getStringRoomId(roomId);
+  const hostKey = hostId ? hostId.toString() : '';
+
+  return Object.values(roomPresence[stringRoomId] || {})
+    .map(member => member?.id?.toString?.() || String(member?.id || ''))
+    .filter(userId => userId && userId !== hostKey);
+};
+
+const getAudioRoomOccupancy = async (room, roomId, hostId) => {
+  const hostKey = hostId ? hostId.toString() : '';
+  const speakers = Array.isArray(room?.speakers)
+    ? room.speakers.filter(speaker => {
+      const speakerUserId = speaker?.userId?.toString?.() || String(speaker?.userId || '');
+      return speakerUserId && speakerUserId !== hostKey;
+    })
+    : [];
+  const audience = Array.isArray(room?.audience)
+    ? room.audience.filter(userId => {
+      const audienceUserId = userId?.toString?.() || String(userId || '');
+      return audienceUserId && audienceUserId !== hostKey;
+    })
+    : [];
+  const presenceUsers = getRoomPresenceUserIds(roomId, hostId);
+  const hasGamePlayers = await hasFreshAudioRoomGamePlayers(roomId);
+
+  return {
+    hasUsersInside: !!(speakers.length || audience.length || presenceUsers.length || hasGamePlayers),
+    speakers,
+    audience,
+    presenceUsers,
+    hasGamePlayers,
+  };
+};
+
+const getVideoRoomOccupancy = async (room, roomId, hostId) => {
+  const hostKey = hostId ? hostId.toString() : '';
+  const occupiedSlots = Array.isArray(room?.slots)
+    ? room.slots.filter(slot => {
+      const slotUserId = slot?.userId?.toString?.() || String(slot?.userId || '');
+      return slotUserId && slotUserId !== hostKey;
+    })
+    : [];
+  const presenceUsers = getRoomPresenceUserIds(roomId, hostId);
+  const hasGamePlayers = await hasFreshVideoRoomGamePlayers(roomId);
+
+  return {
+    hasUsersInside: !!(occupiedSlots.length || presenceUsers.length || hasGamePlayers),
+    occupiedSlots,
+    presenceUsers,
+    hasGamePlayers,
+  };
+};
+
+const updateRoomGamePlayerPresence = async (payload = {}, socketContext = {}, action = 'heartbeat') => {
+  const socketRoomId = getStringRoomId(socketContext.roomId);
+  const payloadRoomId = getStringRoomId(payload.roomId);
+  const stringRoomId = socketRoomId || payloadRoomId;
+  const socketUserId = socketContext.userId ? socketContext.userId.toString() : '';
+  const payloadUserId = payload.userId ? payload.userId.toString() : '';
+  const userId = socketUserId || payloadUserId;
+  if (!stringRoomId || !userId || !socketRoomId || !socketUserId) return;
+  if (payloadRoomId && payloadRoomId !== socketRoomId) return;
+  if (payloadUserId && payloadUserId !== socketUserId) return;
+
+  const isVideoRoom = payload.roomMode === 'video' || stringRoomId.startsWith('glix_');
+  const gameId = payload.gameId ? String(payload.gameId) : '';
+
+  if (action === 'left') {
+    if (roomGamePlayers[stringRoomId]) {
+      delete roomGamePlayers[stringRoomId][userId];
+      if (!Object.keys(roomGamePlayers[stringRoomId]).length) {
+        delete roomGamePlayers[stringRoomId];
+      }
+    }
+
+    if (isVideoRoom) {
+      const videoFilter = getVideoRoomFilter(stringRoomId);
+      if (videoFilter) {
+        await Room.updateOne({ ...videoFilter, isLive: true }, { $pull: { activeGamePlayers: { userId } } });
+      }
+    } else if (mongoose.Types.ObjectId.isValid(stringRoomId)) {
+      await AudioRoom.updateOne(
+        { _id: stringRoomId, isLive: true },
+        { $pull: { activeGamePlayers: { userId } } }
+      );
+      if (roomKeepOpenRooms[stringRoomId]) {
+        scheduleKeptOpenAudioRoomCloseCheck(stringRoomId, 'game_player_left');
+      }
+    }
+    return;
+  }
+
+  const now = new Date();
+  const nowMs = now.getTime();
+
+  if (!roomGamePlayers[stringRoomId]) roomGamePlayers[stringRoomId] = {};
+  roomGamePlayers[stringRoomId][userId] = {
+    userId,
+    gameId,
+    socketId: socketContext.socketId || null,
+    roomMode: isVideoRoom ? 'video' : 'audio',
+    lastHeartbeatAt: nowMs,
+  };
+
+  clearRoomEmptyAudienceTimer(stringRoomId);
+
+  if (isVideoRoom) {
+    const videoFilter = getVideoRoomFilter(stringRoomId);
+    if (!videoFilter) return;
+
+    const existingUpdate = await Room.updateOne(
+      { ...videoFilter, isLive: true, 'activeGamePlayers.userId': userId },
+      {
+        $set: {
+          lastHeartbeatAt: now,
+          'activeGamePlayers.$.gameId': gameId,
+          'activeGamePlayers.$.lastHeartbeatAt': now,
+        }
+      }
+    );
+
+    const matched = existingUpdate?.matchedCount ?? existingUpdate?.n ?? 0;
+    if (!matched) {
+      await Room.updateOne({ ...videoFilter, isLive: true }, {
+        $pull: { activeGamePlayers: { userId } },
+        $set: { lastHeartbeatAt: now }
+      });
+      await Room.updateOne({ ...videoFilter, isLive: true }, {
+        $push: {
+          activeGamePlayers: {
+            userId,
+            gameId,
+            joinedAt: now,
+            lastHeartbeatAt: now,
+          }
+        }
+      });
+    }
+    return;
+  }
+
+  if (!mongoose.Types.ObjectId.isValid(stringRoomId) || !mongoose.Types.ObjectId.isValid(userId)) return;
+
+  const existingUpdate = await AudioRoom.updateOne(
+    { _id: stringRoomId, isLive: true, 'activeGamePlayers.userId': userId },
+    {
+      $set: {
+        lastHeartbeatAt: now,
+        'activeGamePlayers.$.gameId': gameId,
+        'activeGamePlayers.$.lastHeartbeatAt': now,
+      }
+    }
+  );
+
+  const matched = existingUpdate?.matchedCount ?? existingUpdate?.n ?? 0;
+  if (!matched) {
+    await AudioRoom.updateOne(
+      { _id: stringRoomId, isLive: true },
+      {
+        $pull: { activeGamePlayers: { userId } },
+        $set: { lastHeartbeatAt: now }
+      }
+    );
+    await AudioRoom.updateOne(
+      { _id: stringRoomId, isLive: true },
+      {
+        $push: {
+          activeGamePlayers: {
+            userId,
+            gameId,
+            joinedAt: now,
+            lastHeartbeatAt: now,
+          }
+        }
+      }
+    );
+  }
 };
 
 const resolveAgoraRoomChannel = async (roomId) => {
@@ -505,9 +810,15 @@ const resolveAgoraRoomChannel = async (roomId) => {
 
 const closeStaleLiveRooms = async () => {
   const cutoff = getLiveRoomFreshCutoff();
+  const gameCutoff = new Date(Date.now() - ROOM_GAME_PLAYER_STALE_MS);
   const now = new Date();
   const staleFilter = {
     isLive: true,
+    activeGamePlayers: {
+      $not: {
+        $elemMatch: { lastHeartbeatAt: { $gte: gameCutoff } }
+      }
+    },
     $or: [
       { lastHeartbeatAt: { $lt: cutoff } },
       { lastHeartbeatAt: { $exists: false }, createdAt: { $lt: cutoff } }
@@ -572,11 +883,11 @@ const buildRoomSlotsSnapshot = async (roomId) => {
     if (index >= 0 && index < slots.length) {
       slots[index] = {
         ...slots[index],
-        locked: lockedSlots.has(index),
+        locked: false,
         userId: speaker.userId?._id?.toString?.() || speaker.userId?.toString?.() || null,
         uid: speaker.numericUid || null,
-        username: speaker.userId?.name || 'Broadcaster',
-        avatar: speaker.userId?.profilePic || null,
+        username: speaker.userId?.name || speaker.username || 'Broadcaster',
+        avatar: speaker.userId?.profilePic || speaker.avatar || null,
         frameUrl: speaker.frameUrl || speaker.userId?.frameUrl || null,
         isMuted: !!speaker.isMuted,
       };
@@ -584,7 +895,10 @@ const buildRoomSlotsSnapshot = async (roomId) => {
   });
 
   return {
-    slots: slots.map((slot, index) => ({ ...slot, locked: lockedSlots.has(index) })),
+    slots: slots.map((slot, index) => {
+      const hasSpeaker = !!slot?.userId || (slot?.uid !== null && slot?.uid !== undefined);
+      return { ...slot, locked: hasSpeaker ? false : lockedSlots.has(index) };
+    }),
     micSeatCount: audioRoomDoc.micSeatCount || 15,
     micLayoutType: audioRoomDoc.micLayoutType || 'chatroom',
     backgroundThemeId: audioRoomDoc.backgroundThemeId || null,
@@ -601,7 +915,7 @@ const emitRoomSlotsSnapshot = async (roomId) => {
 };
 
 const getAudioMicSlotFailure = async (roomId, userId, slotIndex) => {
-  const room = await AudioRoom.findById(roomId).select('isLive micSeatCount lockedSlots speakers').lean();
+  const room = await AudioRoom.findById(roomId).select('hostId isLive micSeatCount lockedSlots speakers').lean();
   if (!room || !room.isLive) return { status: 404, message: 'Audio room is not available.' };
   if (slotIndex >= Number(room.micSeatCount || 15)) {
     return { status: 400, message: 'Mic slot is outside this room layout.' };
@@ -610,8 +924,12 @@ const getAudioMicSlotFailure = async (roomId, userId, slotIndex) => {
   const lockedSlots = (room.lockedSlots || []).map(Number);
   const existingSlotSpeaker = (room.speakers || []).find(speaker => Number(speaker?.slotIndex) === slotIndex);
   const isSameSpeaker = existingSlotSpeaker?.userId && String(existingSlotSpeaker.userId) === String(userId);
+  const isHostSlotOwner = slotIndex === 0 && room.hostId && String(room.hostId) === String(userId);
 
-  if (lockedSlots.includes(slotIndex) && !isSameSpeaker) {
+  if (slotIndex === 0 && !isHostSlotOwner) {
+    return { status: 403, message: 'The first mic slot is reserved for the host.' };
+  }
+  if (lockedSlots.includes(slotIndex) && !isSameSpeaker && !isHostSlotOwner) {
     return { status: 423, message: 'This mic slot is locked.' };
   }
   if (existingSlotSpeaker?.userId && !isSameSpeaker) {
@@ -620,7 +938,7 @@ const getAudioMicSlotFailure = async (roomId, userId, slotIndex) => {
   return { status: 409, message: 'Mic slot could not be reserved. Please try again.' };
 };
 
-const reserveAudioMicSlot = async ({ roomId, userId, slotIndex, numericUid, isMuted = false, frameUrl = null }) => {
+const reserveAudioMicSlot = async ({ roomId, userId, slotIndex, numericUid, isMuted = false, frameUrl = null, username = '', avatar = '' }) => {
   const normalizedSlotIndex = Number(slotIndex);
   const sanitizedUid = parseInt(numericUid, 10) || 0;
   if (!mongoose.Types.ObjectId.isValid(roomId) || !mongoose.Types.ObjectId.isValid(userId)) {
@@ -640,6 +958,7 @@ const reserveAudioMicSlot = async ({ roomId, userId, slotIndex, numericUid, isMu
       isLive: true,
       micSeatCount: { $gt: normalizedSlotIndex },
       $and: [
+        ...(normalizedSlotIndex === 0 ? [{ hostId: userObjectId }] : []),
         {
           $or: [
             { lockedSlots: { $ne: normalizedSlotIndex } },
@@ -673,6 +992,8 @@ const reserveAudioMicSlot = async ({ roomId, userId, slotIndex, numericUid, isMu
               },
               [{
                 userId: userObjectId,
+                username: username || '',
+                avatar: avatar || '',
                 slotIndex: normalizedSlotIndex,
                 numericUid: sanitizedUid,
                 isMuted: !!isMuted,
@@ -1431,6 +1752,149 @@ const emitRoomStats = async (roomId) => {
   });
 };
 
+const getUserIdFromAppSessionToken = async (token) => {
+  const cleanToken = String(token || '').trim();
+  if (!cleanToken) return '';
+
+  const session = await AuthSession.findOne({
+    tokenHash: hashToken(cleanToken),
+    expiresAt: { $gt: new Date() },
+  }).select('userId').lean();
+
+  return session?.userId?.toString?.() || '';
+};
+
+const processAudioRoomHostExit = async ({ roomId, requesterId, socketId = null }) => {
+  const stringRoomId = getStringRoomId(roomId);
+  if (!stringRoomId || !mongoose.Types.ObjectId.isValid(stringRoomId)) {
+    return { success: false, message: 'Invalid voice room exit request.' };
+  }
+
+  const cleanRequesterId = requesterId?.toString?.() || String(requesterId || '');
+  if (!cleanRequesterId) {
+    return { success: false, message: 'Voice room exit authentication failed.' };
+  }
+
+  const room = await AudioRoom.findById(stringRoomId);
+  if (!room || !room.isLive) {
+    return { success: false, message: 'Voice room is not live.' };
+  }
+  if (!room.hostId || String(room.hostId) !== cleanRequesterId) {
+    return { success: false, message: 'Only the room host can use host exit.' };
+  }
+
+  const remainingSpeakers = (Array.isArray(room.speakers) ? room.speakers : [])
+    .filter(speaker => speaker?.userId && String(speaker.userId) !== cleanRequesterId);
+  const remainingAudience = (Array.isArray(room.audience) ? room.audience : [])
+    .filter(userId => userId && String(userId) !== cleanRequesterId);
+  const hasGamePlayers = await hasFreshAudioRoomGamePlayers(stringRoomId);
+  const transferSpeaker = remainingSpeakers[remainingSpeakers.length - 1] || null;
+  const controllerUserId = transferSpeaker?.userId?.toString?.() || String(transferSpeaker?.userId || '');
+  const controllerUid = transferSpeaker?.numericUid ?? transferSpeaker?.uid ?? null;
+
+  if (!remainingSpeakers.length && !hasGamePlayers) {
+    await recordHostLiveSessionActivity({
+      hostId: room.hostId,
+      roomId: stringRoomId,
+      roomMode: 'audio',
+      startedAt: room.createdAt,
+      endedAt: new Date()
+    });
+
+    room.isLive = false;
+    room.speakers = [];
+    room.audience = [];
+    room.endedAt = new Date();
+    await room.save();
+
+    clearRoomDisconnectTimer(stringRoomId, cleanRequesterId);
+    clearRoomEmptyAudienceTimer(stringRoomId);
+    removeRoomPresence({ roomId: stringRoomId, userId: cleanRequesterId, socketId });
+    delete roomKeepOpenRooms[stringRoomId];
+    delete roomControllers[stringRoomId];
+
+    const closeMessage = 'This voice room closed because no mic users or game players are left.';
+    io.to(stringRoomId).emit('room_members_updated', []);
+    io.to(stringRoomId).emit('audio_room_ended', {
+      reason: 'empty_mic_and_game',
+      message: closeMessage
+    });
+
+    return {
+      success: true,
+      keptOpen: false,
+      closed: true,
+      hasMicUsers: false,
+      hasGamePlayers: false,
+      message: closeMessage,
+    };
+  }
+
+  const controllerProfile = controllerUserId
+    ? await User.findById(controllerUserId).select('name profilePic frameUrl').lean()
+    : null;
+  const controller = controllerUserId ? {
+    userId: controllerUserId,
+    uid: controllerUid,
+    username: controllerProfile?.name || transferSpeaker?.username || 'Mic user',
+    name: controllerProfile?.name || transferSpeaker?.username || 'Mic user',
+    avatar: controllerProfile?.profilePic || transferSpeaker?.avatar || null,
+    profilePic: controllerProfile?.profilePic || transferSpeaker?.avatar || null,
+    frameUrl: controllerProfile?.frameUrl || transferSpeaker?.frameUrl || null,
+  } : null;
+
+  room.isLive = true;
+  room.speakers = remainingSpeakers;
+  room.audience = remainingAudience;
+  room.lastHeartbeatAt = new Date();
+  room.endedAt = null;
+  await room.save();
+
+  roomKeepOpenRooms[stringRoomId] = {
+    userId: cleanRequesterId,
+    controllerUserId: controllerUserId || null,
+    controllerUid,
+    roomMode: 'audio',
+    closeWhen: 'no_mic_or_game',
+    updatedAt: Date.now(),
+  };
+
+  if (controller) roomControllers[stringRoomId] = controller;
+  else delete roomControllers[stringRoomId];
+
+  clearRoomDisconnectTimer(stringRoomId, cleanRequesterId);
+  removeRoomPresence({ roomId: stringRoomId, userId: cleanRequesterId, socketId });
+
+  const transferPayload = {
+    roomId: stringRoomId,
+    hostId: room.hostId?.toString?.() || cleanRequesterId,
+    fromUserId: cleanRequesterId,
+    transferToUserId: controllerUserId || null,
+    transferToUid: controllerUid,
+    controller,
+    message: controller
+      ? 'Room is staying open. Control moved to another mic user.'
+      : hasGamePlayers
+        ? 'Room is staying open while a game is being played.'
+        : 'Room is staying open while checking room activity.',
+  };
+
+  io.to(stringRoomId).emit('host_left_room', transferPayload);
+  io.to(stringRoomId).emit('room_control_transferred', transferPayload);
+  io.to(stringRoomId).emit('room_controller_changed', transferPayload);
+  await emitRoomSlotsSnapshot(stringRoomId);
+  await emitRoomStats(stringRoomId);
+  scheduleKeptOpenAudioRoomCloseCheck(stringRoomId, 'host_exit_ack');
+
+  return {
+    success: true,
+    keptOpen: true,
+    hasMicUsers: remainingSpeakers.length > 0,
+    hasGamePlayers,
+    controller,
+  };
+};
+
 const getUserSocketRoom = (userId) => `user:${String(userId || '').trim()}`;
 
 const joinUserSocketRoom = (socket, userId) => {
@@ -1513,6 +1977,7 @@ io.on('connection', (socket) => {
       const finalJoinName = userData?.name || name || 'User';
       const finalJoinProfilePic = userData?.profilePic || profilePic || '';
       const frameUrl = userData?.frameUrl || null;
+      const joinerDaimon = Number(userData?.daimon || 0);
       const joinerSentGiftCoins = Number(userData?.sentGiftCoins || 0);
       const joinerLevel = calculateUserLevelValue(joinerSentGiftCoins);
 
@@ -1553,7 +2018,7 @@ io.on('connection', (socket) => {
         });
       }
 
-      if (isJoiningRoomHost && roomKeepOpenRooms[stringRoomId]) {
+      if (isJoiningRoomHost && roomKeepOpenRooms[stringRoomId] && roomKeepOpenRooms[stringRoomId]?.closeWhen !== 'no_mic_or_game') {
         delete roomKeepOpenRooms[stringRoomId];
         delete roomControllers[stringRoomId];
         clearRoomEmptyAudienceTimer(stringRoomId);
@@ -1615,8 +2080,8 @@ io.on('connection', (socket) => {
                   ...completeLayoutMatrix[index],
                   userId: speaker.userId?._id?.toString?.() || speaker.userId?.toString?.() || null,
                   uid: speaker.numericUid || null,
-                  username: speaker.userId?.name || "Broadcaster",
-                  avatar: speaker.userId?.profilePic || null,
+                  username: speaker.userId?.name || speaker.username || "Broadcaster",
+                  avatar: speaker.userId?.profilePic || speaker.avatar || null,
                   frameUrl: speaker.frameUrl || speaker.userId?.frameUrl || null,
                   isMuted: speaker.isMuted || false
                 };
@@ -1633,7 +2098,10 @@ io.on('connection', (socket) => {
         const storedLockedSlots = Array.isArray(audioRoomLayout?.lockedSlots) ? audioRoomLayout.lockedSlots : [3, 12, 19];
         const lockedSlots = new Set(storedLockedSlots.map(Number));
         socket.emit('initialize_room_slots', {
-          slots: completeLayoutMatrix.map((slot, index) => ({ ...slot, locked: lockedSlots.has(index) })),
+          slots: completeLayoutMatrix.map((slot, index) => {
+            const hasSpeaker = !!slot?.userId || (slot?.uid !== null && slot?.uid !== undefined);
+            return { ...slot, locked: hasSpeaker ? false : lockedSlots.has(index) };
+          }),
           micSeatCount: audioRoomLayout?.micSeatCount || 15,
           micLayoutType: audioRoomLayout?.micLayoutType || 'chatroom',
           backgroundThemeId: audioRoomLayout?.backgroundThemeId || null,
@@ -1657,7 +2125,7 @@ io.on('connection', (socket) => {
   });
 
   // 2. EVENT: Request Slot Change
-  socket.on('request_slot_change', async ({ roomId, userId, name, profilePic, frameUrl, targetSlotIndex, numericUid, isMuted, cameraOn, locked, slotLocked }) => {
+  socket.on('request_slot_change', async ({ roomId, userId, name, profilePic, frameUrl, targetSlotIndex, targetSlotIndexes, numericUid, isMuted, cameraOn, locked, slotLocked, lockScope }) => {
     try {
 
       let finalFrameUrl = frameUrl;
@@ -1670,15 +2138,23 @@ io.on('connection', (socket) => {
 
       const stringRoomId = roomId ? roomId.toString() : '';
       const isVideoRoom = stringRoomId.startsWith('glix_');
+      const normalizedSlotIndexes = Array.isArray(targetSlotIndexes)
+        ? targetSlotIndexes
+          .map(index => Number(index))
+          .filter(index => Number.isInteger(index) && index >= 0)
+        : [];
+      const hasBulkSlotIndexes = normalizedSlotIndexes.length > 0;
       const normalizedSlotIndex = Number(targetSlotIndex);
       const isClearingSlotPayload = numericUid === null || numericUid === undefined;
-      if (!Number.isInteger(normalizedSlotIndex) || normalizedSlotIndex < 0) return;
+      const normalizedIsMuted = !isClearingSlotPayload && (isMuted === true || isMuted === 'true' || isMuted === 1 || isMuted === '1');
+      if (!hasBulkSlotIndexes && (!Number.isInteger(normalizedSlotIndex) || normalizedSlotIndex < 0)) return;
       if (process.env.NODE_ENV !== 'production') {
         console.log('[VoiceRoom SlotChange]', {
           roomId: stringRoomId,
           userId,
           socketUserId: socket.userId,
           slotIndex: normalizedSlotIndex,
+          slotIndexes: normalizedSlotIndexes,
           numericUid,
           isClearing: isClearingSlotPayload,
           locked,
@@ -1704,7 +2180,7 @@ io.on('connection', (socket) => {
         }
 
         if (!mongoose.Types.ObjectId.isValid(stringRoomId)) return;
-        const audioRoom = await AudioRoom.findById(stringRoomId).select('hostId lockedSlots');
+        const audioRoom = await AudioRoom.findById(stringRoomId).select('hostId lockedSlots speakers micSeatCount');
         if (!audioRoom) {
           socket.emit('error_notice', { message: 'Audio room not found.' });
           return;
@@ -1716,20 +2192,73 @@ io.on('connection', (socket) => {
           return;
         }
 
-        const lockedSlots = new Set((audioRoom.lockedSlots || []).map(Number));
-        if (locked) {
-          lockedSlots.add(normalizedSlotIndex);
-        } else {
-          lockedSlots.delete(normalizedSlotIndex);
+        if (hasBulkSlotIndexes) {
+          const occupiedIndexes = new Set(
+            (audioRoom.speakers || [])
+              .filter(speaker => !!speaker?.userId)
+              .map(speaker => Number(speaker.slotIndex))
+              .filter(index => Number.isInteger(index))
+          );
+          const slotsToUpdate = normalizedSlotIndexes
+            .filter(index => index < Number(audioRoom.micSeatCount || 15))
+            .filter(index => !(locked && lockScope === 'all_empty' && occupiedIndexes.has(index)));
+
+          if (slotsToUpdate.length > 0) {
+            await AudioRoom.updateOne(
+              { _id: stringRoomId },
+              locked
+                ? {
+                  $addToSet: { lockedSlots: { $each: slotsToUpdate } },
+                  $set: { lastHeartbeatAt: new Date() }
+                }
+                : {
+                  $pull: { lockedSlots: { $in: slotsToUpdate } },
+                  $set: { lastHeartbeatAt: new Date() }
+                }
+            );
+
+            slotsToUpdate.forEach(slotIndex => {
+              io.to(stringRoomId).emit('slot_lock_changed', {
+                slotIndex,
+                locked
+              });
+            });
+          }
+
+          await emitRoomSlotsSnapshot(stringRoomId);
+          return;
         }
-        audioRoom.lockedSlots = Array.from(lockedSlots).filter(Number.isInteger).sort((a, b) => a - b);
-        audioRoom.lastHeartbeatAt = new Date();
-        await audioRoom.save();
+
+        const hasSpeakerOnSlot = (audioRoom.speakers || []).some(speaker => (
+          Number(speaker?.slotIndex) === normalizedSlotIndex && !!speaker?.userId
+        ));
+        if (locked && lockScope === 'all_empty' && hasSpeakerOnSlot) {
+          io.to(stringRoomId).emit('slot_lock_changed', {
+            slotIndex: normalizedSlotIndex,
+            locked: false
+          });
+          await emitRoomSlotsSnapshot(stringRoomId);
+          return;
+        }
+
+        await AudioRoom.updateOne(
+          { _id: stringRoomId },
+          locked
+            ? {
+              $addToSet: { lockedSlots: normalizedSlotIndex },
+              $set: { lastHeartbeatAt: new Date() }
+            }
+            : {
+              $pull: { lockedSlots: normalizedSlotIndex },
+              $set: { lastHeartbeatAt: new Date() }
+            }
+        );
 
         io.to(stringRoomId).emit('slot_lock_changed', {
           slotIndex: normalizedSlotIndex,
           locked
         });
+        await emitRoomSlotsSnapshot(stringRoomId);
         return;
       }
 
@@ -1799,8 +2328,10 @@ io.on('connection', (socket) => {
             userId,
             slotIndex: normalizedSlotIndex,
             numericUid,
-            isMuted,
-            frameUrl: finalFrameUrl
+            isMuted: normalizedIsMuted,
+            frameUrl: finalFrameUrl,
+            username: name,
+            avatar: profilePic
           });
 
           if (!reservation.ok) {
@@ -1841,7 +2372,7 @@ io.on('connection', (socket) => {
           username: !isClearingSlotPayload ? name : null,
           avatar: !isClearingSlotPayload ? profilePic : null,
           frameUrl: !isClearingSlotPayload ? finalFrameUrl : null,
-          isMuted: !isClearingSlotPayload ? isMuted || false : false,
+          isMuted: normalizedIsMuted,
           locked: emittedSlotLocked,
           cameraOn: !!cameraOn
         }
@@ -1854,64 +2385,316 @@ io.on('connection', (socket) => {
     }
   });
 
-  const handleKeepRoomOpen = async (payload = {}) => {
-    try {
-      const stringRoomId = getStringRoomId(payload.roomId);
-      if (!stringRoomId) return;
+ const handleKeepRoomOpen = async (payload = {}) => {
+  try {
+    const stringRoomId = getStringRoomId(payload.roomId);
 
-      const controller = payload.controller || null;
-      const controllerUserId = payload.transferToUserId || payload.toUserId || controller?.userId || controller?.id || controller?._id || null;
-      const controllerUid = payload.transferToUid ?? payload.toUid ?? controller?.uid ?? controller?.numericUid ?? null;
-      const requesterId = payload.userId || payload.fromUserId || socket.userId || null;
-      const isVideoRoom = stringRoomId.startsWith('glix_');
+    if (!stringRoomId) return;
 
-      roomKeepOpenRooms[stringRoomId] = {
-        userId: requesterId ? requesterId.toString() : null,
-        controllerUserId: controllerUserId ? controllerUserId.toString() : null,
-        controllerUid,
-        roomMode: isVideoRoom ? 'video' : 'audio',
-        updatedAt: Date.now(),
+    const controller =
+      payload.controller || null;
+
+    const controllerUserId =
+      payload.transferToUserId ||
+      payload.toUserId ||
+      controller?.userId ||
+      controller?.id ||
+      controller?._id ||
+      null;
+
+    const controllerUid =
+      payload.transferToUid ??
+      payload.toUid ??
+      controller?.uid ??
+      controller?.numericUid ??
+      null;
+
+    const requesterId =
+      payload.userId ||
+      payload.fromUserId ||
+      socket.userId ||
+      null;
+
+    const isVideoRoom =
+      stringRoomId.startsWith('glix_');
+
+    // Host seat sent from frontend.
+    // Fallback = slot 0
+    const hostSlotIndex =
+      Number.isInteger(Number(payload.hostSlotIndex))
+        ? Number(payload.hostSlotIndex)
+        : 0;
+
+    // =====================================================
+    // KEEP ROOM OPEN STATE
+    // =====================================================
+
+    roomKeepOpenRooms[stringRoomId] = {
+      userId:
+        requesterId
+          ? requesterId.toString()
+          : null,
+
+      controllerUserId:
+        controllerUserId
+          ? controllerUserId.toString()
+          : null,
+
+      controllerUid,
+
+      roomMode:
+        isVideoRoom
+          ? 'video'
+          : 'audio',
+
+      hostAway: true,
+
+      updatedAt:
+        Date.now(),
+    };
+
+
+    // =====================================================
+    // SAVE TEMPORARY CONTROLLER
+    // =====================================================
+
+    if (
+      controllerUserId ||
+      controllerUid !== null &&
+      controllerUid !== undefined
+    ) {
+
+      roomControllers[stringRoomId] = {
+        ...(controller || {}),
+
+        userId:
+          controllerUserId,
+
+        uid:
+          controllerUid,
       };
 
-      if (controllerUserId || controllerUid !== null) {
-        roomControllers[stringRoomId] = {
-          ...(controller || {}),
-          userId: controllerUserId,
-          uid: controllerUid,
-        };
-      }
+    } else {
 
-      if (requesterId) clearRoomDisconnectTimer(stringRoomId, requesterId);
+      // No controller available
+      delete roomControllers[stringRoomId];
+    }
 
-      const transferPayload = {
-        roomId: stringRoomId,
-        hostId: payload.hostId || null,
-        fromUserId: requesterId,
-        transferToUserId: controllerUserId,
-        transferToUid: controllerUid,
-        controller: roomControllers[stringRoomId] || controller || null,
-        message: controllerUserId || controllerUid !== null
+
+    // =====================================================
+    // CANCEL HOST DISCONNECT TIMER
+    // =====================================================
+
+    if (requesterId) {
+
+      clearRoomDisconnectTimer(
+        stringRoomId,
+        requesterId
+      );
+
+    }
+
+
+    // =====================================================
+    // TRANSFER PAYLOAD
+    // =====================================================
+
+    const transferPayload = {
+      roomId:
+        stringRoomId,
+
+      hostId:
+        payload.hostId || null,
+
+      fromUserId:
+        requesterId,
+
+      userId:
+        requesterId,
+
+      hostAway:
+        true,
+
+      hostSlotIndex,
+
+      transferToUserId:
+        controllerUserId,
+
+      transferToUid:
+        controllerUid,
+
+      controller:
+        roomControllers[stringRoomId] ||
+        controller ||
+        null,
+
+      message:
+        controllerUserId ||
+        (
+          controllerUid !== null &&
+          controllerUid !== undefined
+        )
           ? 'Room is staying open. Control moved to another room user.'
           : 'Room is staying open while the host is away.',
-      };
+    };
 
-      io.to(stringRoomId).emit('host_left_room', transferPayload);
-      io.to(stringRoomId).emit('room_control_transferred', transferPayload);
-      io.to(stringRoomId).emit('room_controller_changed', transferPayload);
 
-      if (isVideoRoom && (controllerUserId || controllerUid !== null)) {
-        io.to(stringRoomId).emit('video_room_admin_assigned', {
-          controller: transferPayload.controller,
-          assignedMessage: 'You can manage this video room while the host is away.',
-        });
+    // =====================================================
+    // 1. TELL EVERYONE HOST LEFT
+    // =====================================================
+
+    io.to(stringRoomId).emit(
+      'host_left_room',
+      transferPayload
+    );
+
+
+    // =====================================================
+    // 2. CLEAR HOST MIC SLOT
+    // =====================================================
+
+    io.to(stringRoomId).emit(
+      'slot_state_changed',
+      {
+        slotIndex:
+          hostSlotIndex,
+
+        user: {
+          userId:
+            null,
+
+          id:
+            null,
+
+          uid:
+            null,
+
+          numericUid:
+            null,
+
+          username:
+            `${hostSlotIndex + 1}`,
+
+          name:
+            `${hostSlotIndex + 1}`,
+
+          avatar:
+            null,
+
+          profilePic:
+            null,
+
+          frameUrl:
+            null,
+
+          frame:
+            null,
+
+          isMuted:
+            false,
+
+          isMe:
+            false,
+
+          hostAway:
+            true,
+        },
+      }
+    );
+
+
+    // =====================================================
+    // 3. BROADCAST CONTROL TRANSFER
+    // =====================================================
+
+    io.to(stringRoomId).emit(
+      'room_control_transferred',
+      transferPayload
+    );
+
+    io.to(stringRoomId).emit(
+      'room_controller_changed',
+      transferPayload
+    );
+
+
+    // =====================================================
+    // VIDEO ROOM ADMIN
+    // =====================================================
+
+    if (
+      isVideoRoom &&
+      (
+        controllerUserId ||
+        (
+          controllerUid !== null &&
+          controllerUid !== undefined
+        )
+      )
+    ) {
+
+      io.to(stringRoomId).emit(
+        'video_room_admin_assigned',
+        {
+          controller:
+            transferPayload.controller,
+
+          assignedMessage:
+            'You can manage this video room while the host is away.',
+        }
+      );
+    }
+
+
+    // =====================================================
+    // UPDATE ROOM STATS
+    // =====================================================
+
+    await emitRoomStats(
+      stringRoomId
+    );
+
+  } catch (error) {
+
+    console.log(
+      'Keep room open event error:',
+      error
+    );
+
+    socket.emit(
+      'error_notice',
+      {
+        message:
+          'Unable to keep this room open.',
+      }
+    );
+  }
+};
+
+  socket.on('audio_room_host_exit', async (payload = {}, ack) => {
+    const respond = (response) => {
+      if (typeof ack === 'function') ack(response);
+      else socket.emit('audio_room_host_exit_result', response);
+    };
+
+    try {
+      const token = String(payload.token || payload.authToken || '').trim();
+      const requesterId = await getUserIdFromAppSessionToken(token);
+      if (!requesterId) {
+        respond({ success: false, message: 'Voice room exit authentication failed.' });
+        return;
       }
 
-      await emitRoomStats(stringRoomId);
+      respond(await processAudioRoomHostExit({
+        roomId: payload.roomId,
+        requesterId,
+        socketId: socket.id,
+      }));
     } catch (error) {
-      console.log('Keep room open event error:', error);
-      socket.emit('error_notice', { message: 'Unable to keep this room open.' });
+      console.log('Audio room host exit error:', error);
+      respond({ success: false, message: 'Unable to exit voice room.' });
     }
-  };
+  });
 
   socket.on('host_leave_keep_room_open', handleKeepRoomOpen);
   socket.on('controller_leave_keep_room_open', handleKeepRoomOpen);
@@ -2290,7 +3073,10 @@ io.on('connection', (socket) => {
 
       const lockedSlots = new Set((audioRoom.lockedSlots || []).map(Number));
       io.to(stringRoomId).emit('room_layout_changed', {
-        slots: completeLayoutMatrix.map((slot, index) => ({ ...slot, locked: lockedSlots.has(index) })),
+        slots: completeLayoutMatrix.map((slot, index) => {
+          const hasSpeaker = !!slot?.userId || (slot?.uid !== null && slot?.uid !== undefined);
+          return { ...slot, locked: hasSpeaker ? false : lockedSlots.has(index) };
+        }),
         micSeatCount: audioRoom.micSeatCount,
         micLayoutType: audioRoom.micLayoutType,
         backgroundThemeId: audioRoom.backgroundThemeId || null,
@@ -3085,6 +3871,42 @@ io.on('connection', (socket) => {
     }
   });
 
+  socket.on('room_game_player_joined', async (payload = {}) => {
+    try {
+      await updateRoomGamePlayerPresence(payload, {
+        roomId: socket.roomId,
+        userId: socket.userId,
+        socketId: socket.id,
+      }, 'joined');
+    } catch (error) {
+      console.log('Room game player joined error:', error);
+    }
+  });
+
+  socket.on('room_game_player_heartbeat', async (payload = {}) => {
+    try {
+      await updateRoomGamePlayerPresence(payload, {
+        roomId: socket.roomId,
+        userId: socket.userId,
+        socketId: socket.id,
+      }, 'heartbeat');
+    } catch (error) {
+      console.log('Room game player heartbeat error:', error);
+    }
+  });
+
+  socket.on('room_game_player_left', async (payload = {}) => {
+    try {
+      await updateRoomGamePlayerPresence(payload, {
+        roomId: socket.roomId,
+        userId: socket.userId,
+        socketId: socket.id,
+      }, 'left');
+    } catch (error) {
+      console.log('Room game player left error:', error);
+    }
+  });
+
   socket.on('room_app_background', ({ roomId, userId, roomMode }) => {
     const stringRoomId = roomId ? roomId.toString() : '';
     if (!stringRoomId || !userId) return;
@@ -3184,6 +4006,64 @@ io.on('connection', (socket) => {
               const latestRoom = await Room.findOne({ channelName: roomId });
               if (!latestRoom || latestRoom.hostId?.toString() !== currentUserId) return;
 
+              const hasGamePlayers = await hasFreshVideoRoomGamePlayers(roomId);
+              if (hasGamePlayers) {
+                latestRoom.isLive = true;
+                latestRoom.lastHeartbeatAt = new Date();
+                latestRoom.endedAt = null;
+                await latestRoom.save();
+
+                roomKeepOpenRooms[roomId] = {
+                  userId: currentUserId,
+                  controllerUserId: null,
+                  controllerUid: null,
+                  roomMode: 'video',
+                  updatedAt: Date.now(),
+                };
+
+                io.to(roomId).emit('host_left_room', {
+                  roomId,
+                  hostId: latestRoom.hostId?.toString?.() || currentUserId,
+                  fromUserId: currentUserId,
+                  transferToUserId: null,
+                  transferToUid: null,
+                  controller: null,
+                  message: 'Room is staying open while a game is being played.',
+                });
+                await emitRoomStats(roomId);
+                console.log(`Video room kept open after host disconnect because game players remain: ${roomId}`);
+                return;
+              }
+
+              const videoOccupancy = await getVideoRoomOccupancy(latestRoom, roomId, currentUserId);
+              if (videoOccupancy.hasUsersInside) {
+                latestRoom.isLive = true;
+                latestRoom.lastHeartbeatAt = new Date();
+                latestRoom.endedAt = null;
+                await latestRoom.save();
+
+                roomKeepOpenRooms[roomId] = {
+                  userId: currentUserId,
+                  controllerUserId: null,
+                  controllerUid: null,
+                  roomMode: 'video',
+                  updatedAt: Date.now(),
+                };
+
+                io.to(roomId).emit('host_left_room', {
+                  roomId,
+                  hostId: latestRoom.hostId?.toString?.() || currentUserId,
+                  fromUserId: currentUserId,
+                  transferToUserId: null,
+                  transferToUid: null,
+                  controller: null,
+                  message: 'Room is staying open while users are inside.',
+                });
+                await emitRoomStats(roomId);
+                console.log(`Video room kept open after host disconnect because users remain: ${roomId}`);
+                return;
+              }
+
               io.to(roomId).emit('room_closing', {
                 message: 'Host disconnected. Room closed.'
               });
@@ -3222,7 +4102,7 @@ io.on('connection', (socket) => {
       ) {
         if (roomKeepOpenRooms[roomId]) {
           removeRoomPresence({ roomId, userId: currentUserId, socketId: socket.id });
-          scheduleKeptOpenAudioRoomEmptyCheck(roomId, 'host_left_no_audience');
+          scheduleKeptOpenAudioRoomCloseCheck(roomId, 'host_left_no_audience');
           return;
         }
 
@@ -3292,8 +4172,72 @@ io.on('connection', (socket) => {
               io.to(roomId).emit('room_controller_changed', transferPayload);
               await emitRoomSlotsSnapshot(roomId);
               await emitRoomStats(roomId);
-              scheduleKeptOpenAudioRoomEmptyCheck(roomId, 'host_disconnected_mic_users_remaining');
+              scheduleKeptOpenAudioRoomCloseCheck(roomId, 'host_disconnected_mic_users_remaining');
               console.log(`Audio room kept open after host disconnect because mic users remain: ${roomId}`);
+              return;
+            }
+
+            const hasGamePlayers = await hasFreshAudioRoomGamePlayers(roomId);
+            if (hasGamePlayers) {
+              latestRoom.isLive = true;
+              latestRoom.lastHeartbeatAt = new Date();
+              latestRoom.endedAt = null;
+              await latestRoom.save();
+
+              roomKeepOpenRooms[roomId] = {
+                userId: currentUserId,
+                controllerUserId: null,
+                controllerUid: null,
+                roomMode: 'audio',
+                updatedAt: Date.now(),
+              };
+
+              io.to(roomId).emit('host_left_room', {
+                roomId,
+                hostId: latestRoom.hostId?.toString?.() || currentUserId,
+                fromUserId: currentUserId,
+                transferToUserId: null,
+                transferToUid: null,
+                controller: null,
+                message: 'Room is staying open while a game is being played.',
+              });
+              await emitRoomStats(roomId);
+              scheduleKeptOpenAudioRoomCloseCheck(roomId, 'host_disconnected_game_players_remaining');
+              console.log(`Audio room kept open after host disconnect because game players remain: ${roomId}`);
+              return;
+            }
+
+            const remainingAudience = (Array.isArray(latestRoom.audience) ? latestRoom.audience : [])
+              .filter(userId => userId && String(userId) !== currentUserId);
+            const remainingPresenceUsers = getRoomPresenceUserIds(roomId, currentUserId);
+
+            if (remainingAudience.length > 0 || remainingPresenceUsers.length > 0) {
+              latestRoom.isLive = true;
+              latestRoom.audience = remainingAudience;
+              latestRoom.lastHeartbeatAt = new Date();
+              latestRoom.endedAt = null;
+              await latestRoom.save();
+
+              roomKeepOpenRooms[roomId] = {
+                userId: currentUserId,
+                controllerUserId: null,
+                controllerUid: null,
+                roomMode: 'audio',
+                updatedAt: Date.now(),
+              };
+
+              io.to(roomId).emit('host_left_room', {
+                roomId,
+                hostId: latestRoom.hostId?.toString?.() || currentUserId,
+                fromUserId: currentUserId,
+                transferToUserId: null,
+                transferToUid: null,
+                controller: null,
+                message: 'Room is staying open while users are inside.',
+              });
+              await emitRoomStats(roomId);
+              scheduleKeptOpenAudioRoomCloseCheck(roomId, 'host_disconnected_users_remaining');
+              console.log(`Audio room kept open after host disconnect because audience remains: ${roomId}`);
               return;
             }
 
@@ -3356,7 +4300,7 @@ io.on('connection', (socket) => {
               }
             });
 
-            scheduleKeptOpenAudioRoomEmptyCheck(roomId, 'last_audience_left');
+            scheduleKeptOpenAudioRoomCloseCheck(roomId, 'last_audience_left');
 
             if (latestSlotIndex !== undefined) {
               io.to(roomId).emit("slot_state_changed", {
@@ -3390,7 +4334,7 @@ io.on('connection', (socket) => {
         }
       });
 
-      scheduleKeptOpenAudioRoomEmptyCheck(roomId, 'last_audience_left');
+      scheduleKeptOpenAudioRoomCloseCheck(roomId, 'last_audience_left');
 
       if (oldSlotIndex !== undefined) {
         io.to(roomId).emit("slot_state_changed", {
@@ -4103,14 +5047,14 @@ app.post('/create', async (req, res) => {
     const { title, hostId, numericUid } = req.body;
     const sanitizedUid = parseInt(numericUid, 10) || 0;
     const hostUser = mongoose.Types.ObjectId.isValid(hostId)
-      ? await User.findById(hostId).select('frameUrl').lean()
+      ? await User.findById(hostId).select('name profilePic frameUrl').lean()
       : null;
 
     const newRoom = new AudioRoom({
       title: title || "Live Audio Room",
       hostId,
       isLive: true,
-      speakers: [{ userId: hostId, isMuted: false, slotIndex: 0, numericUid: sanitizedUid, frameUrl: hostUser?.frameUrl || null }],
+      speakers: [{ userId: hostId, username: hostUser?.name || '', avatar: hostUser?.profilePic || '', isMuted: false, slotIndex: 0, numericUid: sanitizedUid, frameUrl: hostUser?.frameUrl || null }],
       audience: [],
       lockedSlots: [3, 12, 19]
     });
@@ -4141,7 +5085,7 @@ app.post('/create', async (req, res) => {
 
 app.post('/join', async (req, res) => {
   try {
-    const { roomId, userId, numericUid, roomPassword } = req.body;
+    const { roomId, userId, numericUid, roomPassword, previousSlotIndex } = req.body;
     if (!roomId || !userId || !numericUid) return res.status(400).json({ error: "Missing required fields" });
 
     const sanitizedUid = parseInt(numericUid, 10) || 0;
@@ -4192,19 +5136,29 @@ app.post('/join', async (req, res) => {
 
       const currentSpeakers = Array.isArray(roomObj.speakers) ? roomObj.speakers : [];
       const currentAudience = Array.isArray(roomObj.audience) ? roomObj.audience : [];
-      const validSpeakers = currentSpeakers.filter(s => s && s.userId);
-      const validAudience = currentAudience.filter(Boolean);
       const isRoomOwner = String(roomObj.hostId) === String(userId);
-      const joiningUser = await User.findById(userId).select('frameUrl').lean();
+      const isHostAwayOwner = isRoomOwner && String(roomKeepOpenRooms[stringRoomId]?.userId || '') === String(userId);
+      const validSpeakers = currentSpeakers.filter(s => {
+        if (!s || !s.userId) return false;
+        return !(isHostAwayOwner && String(s.userId) === String(userId));
+      });
+      const validAudience = currentAudience.filter(Boolean);
+      const micSeatCount = Number(roomObj.micSeatCount || 15);
+      const hasPreviousSlotIndexValue = previousSlotIndex !== null && previousSlotIndex !== undefined && previousSlotIndex !== '';
+      const normalizedPreviousSlotIndex = Number(previousSlotIndex);
+      const hasPreviousSlotIndex = hasPreviousSlotIndexValue &&
+        Number.isInteger(normalizedPreviousSlotIndex) &&
+        normalizedPreviousSlotIndex >= 0 &&
+        normalizedPreviousSlotIndex < micSeatCount;
+      const joiningUser = await User.findById(userId).select('name profilePic frameUrl').lean();
       const existingSpeakerIndex = validSpeakers.findIndex(s => String(s.userId) === String(userId));
       const isAlreadySpeaker = existingSpeakerIndex !== -1;
       roomObj.speakers = validSpeakers;
       roomObj.audience = validAudience.filter(id => String(id) !== String(userId));
       roomObj.lastHeartbeatAt = new Date();
 
-      if (isRoomOwner) {
+      if (isRoomOwner && !isHostAwayOwner) {
         const nonOwnerSpeakers = roomObj.speakers.filter(s => String(s.userId) !== String(userId));
-        const micSeatCount = Number(roomObj.micSeatCount || 15);
         const occupiedSlots = new Set(
           nonOwnerSpeakers
             .map(s => Number(s?.slotIndex))
@@ -4218,19 +5172,24 @@ app.post('/join', async (req, res) => {
           previousOwnerSlotIndex < micSeatCount &&
           !occupiedSlots.has(previousOwnerSlotIndex)
         );
+        const previousParamSlotAvailable = hasPreviousSlotIndex && !occupiedSlots.has(normalizedPreviousSlotIndex);
         const slotOneAvailable = !occupiedSlots.has(0);
         const firstFreeSlotIndex = Array.from({ length: micSeatCount }, (_, index) => index)
           .find(index => !occupiedSlots.has(index));
         const ownerSlotIndex = previousOwnerSlotAvailable
           ? previousOwnerSlotIndex
-          : slotOneAvailable
-            ? 0
-            : firstFreeSlotIndex;
+          : previousParamSlotAvailable
+            ? normalizedPreviousSlotIndex
+            : slotOneAvailable
+              ? 0
+              : firstFreeSlotIndex;
 
         roomObj.speakers = Number.isInteger(ownerSlotIndex)
           ? [
             {
               userId,
+              username: joiningUser?.name || previousOwnerSlot?.username || '',
+              avatar: joiningUser?.profilePic || previousOwnerSlot?.avatar || '',
               isMuted: false,
               slotIndex: ownerSlotIndex,
               numericUid: sanitizedUid,
@@ -4241,9 +5200,31 @@ app.post('/join', async (req, res) => {
           : nonOwnerSpeakers;
         userRole = RtcRole.PUBLISHER;
       } else if (isAlreadySpeaker) {
+        roomObj.speakers[existingSpeakerIndex].username = joiningUser?.name || roomObj.speakers[existingSpeakerIndex].username || '';
+        roomObj.speakers[existingSpeakerIndex].avatar = joiningUser?.profilePic || roomObj.speakers[existingSpeakerIndex].avatar || '';
         roomObj.speakers[existingSpeakerIndex].numericUid = sanitizedUid;
         roomObj.speakers[existingSpeakerIndex].frameUrl = joiningUser?.frameUrl || roomObj.speakers[existingSpeakerIndex].frameUrl || null;
         userRole = RtcRole.PUBLISHER;
+      } else if (!isHostAwayOwner && hasPreviousSlotIndex && normalizedPreviousSlotIndex !== 0) {
+        const lockedSlots = (roomObj.lockedSlots || []).map(Number);
+        const previousSlotOccupied = roomObj.speakers.some(s => (
+          Number(s?.slotIndex) === normalizedPreviousSlotIndex &&
+          String(s?.userId) !== String(userId)
+        ));
+        if (!previousSlotOccupied && !lockedSlots.includes(normalizedPreviousSlotIndex)) {
+          roomObj.speakers.push({
+            userId,
+            username: joiningUser?.name || '',
+            avatar: joiningUser?.profilePic || '',
+            isMuted: false,
+            slotIndex: normalizedPreviousSlotIndex,
+            numericUid: sanitizedUid,
+            frameUrl: joiningUser?.frameUrl || null
+          });
+          userRole = RtcRole.PUBLISHER;
+        } else {
+          roomObj.audience.push(userId);
+        }
       } else {
         roomObj.audience.push(userId);
       }
@@ -4333,6 +5314,8 @@ app.post('/audio-room/join-mic-slot', async (req, res) => {
       numericUid: sanitizedUid,
       isMuted: !!isMuted,
       frameUrl: user.frameUrl || null,
+      username: user.name || 'User',
+      avatar: user.profilePic || '',
     });
 
     if (!reservation.ok) {
@@ -4439,6 +5422,28 @@ app.post('/regenerate-token', async (req, res) => {
   }
 });
 
+app.post('/audio-room/host-exit', async (req, res) => {
+  try {
+    const authHeader = req.headers.authorization || '';
+    const headerToken = authHeader.startsWith('Bearer ') ? authHeader.slice(7).trim() : '';
+    const token = headerToken || String(req.body?.token || req.body?.authToken || '').trim();
+    const requesterId = await getUserIdFromAppSessionToken(token);
+    if (!requesterId) {
+      return res.status(401).json({ success: false, message: 'Voice room exit authentication failed.' });
+    }
+
+    const result = await processAudioRoomHostExit({
+      roomId: req.body?.roomId,
+      requesterId,
+    });
+
+    return res.status(result.success ? 200 : 400).json(result);
+  } catch (error) {
+    console.log('Audio room host exit endpoint error:', error);
+    return res.status(500).json({ success: false, message: 'Unable to exit voice room.' });
+  }
+});
+
 app.post('/rooms/end', async (req, res) => {
   try {
     const { roomId, hostId } = req.body;
@@ -4452,6 +5457,16 @@ app.post('/rooms/end', async (req, res) => {
       if (videoRoom) {
         if (!videoRoom.hostId || videoRoom.hostId.toString() !== String(hostId)) {
           return res.status(403).json({ success: false, error: 'Unauthorized' });
+        }
+
+        const videoRoomId = videoRoom.channelName || stringRoomId;
+        const occupancy = await getVideoRoomOccupancy(videoRoom, videoRoomId, hostId);
+        if (occupancy.hasUsersInside) {
+          return res.status(409).json({
+            success: false,
+            keptOpen: true,
+            error: 'Room has active users and cannot be closed yet.'
+          });
         }
 
         io.to(videoRoom.channelName).emit('room_closing', { message: 'The host has ended the video live stream.' });
@@ -4477,6 +5492,15 @@ app.post('/rooms/end', async (req, res) => {
     if (!room) return res.status(404).json({ success: false, error: 'Room not found' });
     if (!room.hostId || room.hostId.toString() !== String(hostId)) {
       return res.status(403).json({ success: false, error: 'Unauthorized' });
+    }
+
+    const occupancy = await getAudioRoomOccupancy(room, stringRoomId, hostId);
+    if (occupancy.hasUsersInside) {
+      return res.status(409).json({
+        success: false,
+        keptOpen: true,
+        error: 'Room has active users and cannot be closed yet.'
+      });
     }
 
     room.isLive = false;

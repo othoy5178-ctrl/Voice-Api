@@ -31,6 +31,12 @@ const RoomSchema = new mongoose.Schema({
   automaticSeatInvitation: { type: Boolean, default: true },
   enablePublicChat: { type: Boolean, default: true },
   autoEmojiEnabled: { type: Boolean, default: false },
+  activeGamePlayers: [{
+    userId: { type: String, default: '' },
+    gameId: { type: String, default: '' },
+    joinedAt: { type: Date, default: Date.now },
+    lastHeartbeatAt: { type: Date, default: Date.now }
+  }],
   slots: [SlotSchema] // Uses the sub-schema defined above
 });
 
