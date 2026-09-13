@@ -7134,6 +7134,40 @@ app.post('/auth/app-session', async (req, res) => {
   }
 });
 
+app.post('/auth/login', async (req, res) => {
+  try {
+    const email = String(req.body?.email || '').trim().toLowerCase();
+    const password = String(req.body?.password || '');
+    if (!email || !password) {
+      return res.status(400).json({ success: false, message: 'Email and password are required' });
+    }
+
+    const user = await User.findOne({ email }).select(`${officialUserProjection} password`);
+    if (!user || !user.password) {
+      return res.status(401).json({ success: false, message: 'Invalid email or password' });
+    }
+
+    const passwordMatches = await bcrypt.compare(password, user.password);
+    if (!passwordMatches) {
+      return res.status(401).json({ success: false, message: 'Invalid email or password' });
+    }
+
+    if ((user.accountStatus || 'active') !== 'active') {
+      return res.status(403).json({ success: false, message: `Your account is ${user.accountStatus}` });
+    }
+
+    user.lastLogin = new Date();
+    if (!user.glixId) user.glixId = await createUniqueUserPublicId();
+    await user.save();
+    await ensurePermanentAudioRoomForUser(user._id);
+
+    const token = await createOfficialSession(user._id);
+    return res.json({ success: true, token, user: serializeOfficialUser(user) });
+  } catch (error) {
+    return res.status(500).json({ success: false, message: error.message });
+  }
+});
+
 const requireOfficial = async (req, res, next) => {
   try {
     const authHeader = req.headers.authorization || '';
