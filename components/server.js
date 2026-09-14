@@ -22,7 +22,7 @@ import StoreItem from './StoreItem.js';
 import UserStoreItem from './UserStoreItem.js';
 import bcrypt from "bcryptjs";
 import crypto from "crypto";
-import { getApps, initializeApp } from "firebase-admin/app";
+import { cert, getApps, initializeApp } from "firebase-admin/app";
 import { getMessaging } from "firebase-admin/messaging";
 import AuthSession from "./AuthSession.js";
 import Withdrawal from "./Withdrawal.js";
@@ -10755,9 +10755,21 @@ app.patch('/admin/agency-targets/:targetId', requireOfficial, async (req, res) =
 
 const getFirebaseMessaging = () => {
   try {
-    if (!getApps().length) initializeApp();
+    if (!getApps().length) {
+      const rawServiceAccount = process.env.FIREBASE_SERVICE_ACCOUNT;
+      if (rawServiceAccount) {
+        const serviceAccount = JSON.parse(rawServiceAccount);
+        if (serviceAccount.private_key) {
+          serviceAccount.private_key = serviceAccount.private_key.replace(/\\n/g, '\n');
+        }
+        initializeApp({ credential: cert(serviceAccount) });
+      } else {
+        initializeApp();
+      }
+    }
     return getMessaging();
   } catch (error) {
+    console.error('Firebase Admin init failed:', error.message);
     return null;
   }
 };
