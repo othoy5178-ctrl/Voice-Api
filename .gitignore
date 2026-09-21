@@ -1,14 +1,22 @@
-# Ignore node_modules directory
+# Dependencies
 node_modules/
 
-# Ignore environment files
+# Environment files
 .env
+.env.*
+!.env.example
 
-# Ignore logs
+# Firebase Admin service account
+glix-live-3c1cb-firebase-adminsdk-fbsvc-308b61b849.json
+*-firebase-adminsdk-*.json
+
+# Secrets / private keys
+secret-config.json
+*.pem
+*.key
+
+# Logs
 *.log
 
-# Ignore build directory
-/dist
-
-# Ignore specific file
-secret-config.json
+# Build output
+dist/

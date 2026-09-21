@@ -1203,7 +1203,7 @@ const ensureDefaultStoreItems = async () => {
   const operations = DEFAULT_STORE_ITEMS.map(item => ({
     updateOne: {
       filter: { itemKey: item.itemKey },
-      update: { $set: item },
+      update: { $setOnInsert: item },
       upsert: true
     }
   }));
