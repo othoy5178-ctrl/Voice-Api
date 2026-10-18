@@ -37,6 +37,7 @@ import DiamondExchange from "./DiamondExchange.js";
 import CoinBag from "./CoinBag.js";
 import CoinBagClaim from "./CoinBagClaim.js";
 import CustomRoomTheme from "./CustomRoomTheme.js";
+import AppConfig from "./AppConfig.js";
 import { ROOM_BACKGROUND_THEMES } from "./roomBackgroundThemes.js";
 import cloudinary from "./utils/cloudinary.js";
 
@@ -7197,6 +7198,15 @@ const requireOfficial = async (req, res, next) => {
   }
 };
 
+app.get('/app-config', async (req, res) => {
+  try {
+    const roomGames = await AppConfig.findOne({ key: 'roomGamesEnabled' }).lean();
+    return res.json({ success: true, roomGamesEnabled: roomGames?.value === true });
+  } catch (error) {
+    return res.status(500).json({ success: false, message: error.message });
+  }
+});
+
 const detectGiftMediaType = (value = '') => {
   const source = String(value || '').toLowerCase();
   if (source.includes('video/') || source.endsWith('.mp4') || source.includes('/video/upload/')) return 'mp4';
@@ -8307,6 +8317,29 @@ app.get('/admin/dashboard', requireOfficial, async (req, res) => {
         weeklyGiftTransactions: weeklyGift.count || 0,
       }
     });
+  } catch (error) {
+    return res.status(500).json({ success: false, message: error.message });
+  }
+});
+
+app.get('/admin/app-config', requireOfficial, async (req, res) => {
+  try {
+    const roomGames = await AppConfig.findOne({ key: 'roomGamesEnabled' }).lean();
+    return res.json({ success: true, roomGamesEnabled: roomGames?.value === true });
+  } catch (error) {
+    return res.status(500).json({ success: false, message: error.message });
+  }
+});
+
+app.patch('/admin/app-config/room-games', requireOfficial, async (req, res) => {
+  try {
+    const roomGamesEnabled = req.body?.enabled === true;
+    await AppConfig.findOneAndUpdate(
+      { key: 'roomGamesEnabled' },
+      { $set: { value: roomGamesEnabled } },
+      { upsert: true, new: true, setDefaultsOnInsert: true }
+    );
+    return res.json({ success: true, roomGamesEnabled });
   } catch (error) {
     return res.status(500).json({ success: false, message: error.message });
   }
