@@ -927,9 +927,10 @@ const getAudioMicSlotFailure = async (roomId, userId, slotIndex) => {
   const isSameSpeaker = existingSlotSpeaker?.userId && String(existingSlotSpeaker.userId) === String(userId);
   const isHostSlotOwner = slotIndex === 0 && room.hostId && String(room.hostId) === String(userId);
 
-  if (slotIndex === 0 && !isHostSlotOwner) {
-    return { status: 403, message: 'The first mic slot is reserved for the host.' };
-  }
+  // if (slotIndex === 0 && !isHostSlotOwner) {
+  //   return { status: 403, message: 'The first mic slot is reserved for the host.' };
+  // }
+  
   if (lockedSlots.includes(slotIndex) && !isSameSpeaker && !isHostSlotOwner) {
     return { status: 423, message: 'This mic slot is locked.' };
   }
