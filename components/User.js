@@ -117,6 +117,11 @@ const userSchema = new mongoose.Schema({
     default: 'active',
     index: true
   },
+  official: {
+    type: Boolean,
+    default: false,
+    index: true
+  },
   adminNote: {
     type: String,
     trim: true,

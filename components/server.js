@@ -293,6 +293,21 @@ const calculateUserLevelValue = (value = 0) => {
 };
 
 const getStringRoomId = (roomId) => (roomId ? roomId.toString() : '');
+const isAssignedRoomController = (roomId, userId, numericUid = null) => {
+  const controller = roomControllers[getStringRoomId(roomId)] || null;
+  if (!controller) return false;
+
+  return (
+    (controller.userId && userId && String(controller.userId) === String(userId)) ||
+    (
+      controller.uid !== null &&
+      controller.uid !== undefined &&
+      numericUid !== null &&
+      numericUid !== undefined &&
+      String(controller.uid) === String(numericUid)
+    )
+  );
+};
 const getRoomDisconnectTimerKey = (roomId, userId) => `${getStringRoomId(roomId)}:${userId?.toString?.() || String(userId || '')}`;
 const getRoomEmptyAudienceTimerKey = (roomId) => getStringRoomId(roomId);
 
@@ -356,6 +371,7 @@ const buildRoomMemberPayload = (userId, fallback = {}) => ({
   glixId: fallback.glixId || '',
   daimon: fallback.daimon || 0,
   sentGiftCoins: fallback.sentGiftCoins || 0,
+  official: fallback.official === true,
   isVip: !!fallback.isVip,
   vipExpiresAt: fallback.vipExpiresAt || null,
   vipBadgeUrl: fallback.vipBadgeUrl || '',
@@ -388,7 +404,7 @@ const upsertRoomPresence = async ({ roomId, userId, socketId, name, profilePic, 
 
   if (mongoose.Types.ObjectId.isValid(userKey)) {
     dbUser = await User.findById(userKey)
-      .select('name profilePic glixId daimon sentGiftCoins isVip vipExpiresAt vipBadgeUrl')
+      .select('name profilePic glixId daimon sentGiftCoins official isVip vipExpiresAt vipBadgeUrl')
       .lean();
   }
 
@@ -401,6 +417,7 @@ const upsertRoomPresence = async ({ roomId, userId, socketId, name, profilePic, 
     glixId: dbUser?.glixId || existing.glixId || '',
     daimon: dbUser?.daimon ?? existing.daimon ?? 0,
     sentGiftCoins: dbUser?.sentGiftCoins ?? existing.sentGiftCoins ?? 0,
+    official: dbUser?.official === true,
     isVip: dbUser?.isVip ?? existing.isVip ?? false,
     vipExpiresAt: dbUser?.vipExpiresAt || existing.vipExpiresAt || null,
     vipBadgeUrl: dbUser?.vipBadgeUrl || existing.vipBadgeUrl || '',
@@ -1921,6 +1938,7 @@ const joinAuthenticatedUserSocketRoom = async (socket, payload = {}) => {
   if (!session) return false;
   socket.join(getUserSocketRoom(cleanUserId));
   joinUserSocketRoom(socket, cleanUserId);
+  socket.authenticatedUserId = cleanUserId;
   return true;
 };
 
@@ -2127,7 +2145,7 @@ io.on('connection', (socket) => {
   });
 
   // 2. EVENT: Request Slot Change
-  socket.on('request_slot_change', async ({ roomId, userId, name, profilePic, frameUrl, targetSlotIndex, targetSlotIndexes, numericUid, isMuted, cameraOn, locked, slotLocked, lockScope }) => {
+  socket.on('request_slot_change', async ({ roomId, userId, requesterId, managementAction, name, profilePic, frameUrl, targetSlotIndex, targetSlotIndexes, numericUid, isMuted, cameraOn, locked, slotLocked, lockScope }) => {
     try {
 
       let finalFrameUrl = frameUrl;
@@ -2175,6 +2193,65 @@ io.on('connection', (socket) => {
       );
       let emittedSlotLocked = typeof slotLocked === 'boolean' ? slotLocked : (typeof locked === 'boolean' ? locked : undefined);
 
+      if (managementAction === 'set_mute') {
+        const actorId = socket.authenticatedUserId;
+        const targetUserId = userId?.toString?.() || String(userId || '');
+        if (!actorId || !targetUserId || (requesterId && String(requesterId) !== String(actorId))) {
+          socket.emit('error_notice', { message: 'Unable to authenticate this microphone action.' });
+          return;
+        }
+
+        const managedRoom = isVideoRoom
+          ? await Room.findOne({ channelName: stringRoomId }).select('hostId slots')
+          : mongoose.Types.ObjectId.isValid(stringRoomId)
+            ? await AudioRoom.findById(stringRoomId).select('hostId speakers')
+            : null;
+        const actorIsHost = !!managedRoom && String(managedRoom.hostId || '') === String(actorId);
+        const actorIsController = isAssignedRoomController(stringRoomId, actorId, socket.numericUid);
+
+        if (!managedRoom || (!actorIsHost && !actorIsController)) {
+          socket.emit('error_notice', { message: 'Only the host or room admin can manage microphones.' });
+          return;
+        }
+        if (String(managedRoom.hostId || '') === targetUserId) {
+          socket.emit('error_notice', { message: 'The main host microphone cannot be managed from here.' });
+          return;
+        }
+
+        const managedSlot = isVideoRoom
+          ? (managedRoom.slots || []).find(slot => (
+            Number(slot?.id) === normalizedSlotIndex + 1 &&
+            String(slot?.userId || '') === targetUserId
+          ))
+          : (managedRoom.speakers || []).find(speaker => (
+            Number(speaker?.slotIndex) === normalizedSlotIndex &&
+            String(speaker?.userId || '') === targetUserId
+          ));
+
+        if (!managedSlot) {
+          socket.emit('error_notice', { message: 'This user is no longer active on that mic slot.' });
+          await emitRoomSlotsSnapshot(stringRoomId);
+          return;
+        }
+
+        managedSlot.isMuted = normalizedIsMuted;
+        await managedRoom.save();
+        io.to(stringRoomId).emit('slot_state_changed', {
+          slotIndex: normalizedSlotIndex,
+          user: {
+            uid: isVideoRoom ? managedSlot.uid : managedSlot.numericUid,
+            userId: targetUserId,
+            username: isVideoRoom ? managedSlot.username : name,
+            avatar: isVideoRoom ? managedSlot.avatar : profilePic,
+            frameUrl: managedSlot.frameUrl || finalFrameUrl || null,
+            isMuted: normalizedIsMuted,
+            cameraOn: isVideoRoom ? !!managedSlot.cameraOn : false
+          }
+        });
+        await emitRoomSlotsSnapshot(stringRoomId);
+        return;
+      }
+
       if (isLockOnlyRequest) {
         if (isVideoRoom) {
           socket.emit('error_notice', { message: 'Video slots cannot be locked from this action.' });
@@ -2188,9 +2265,13 @@ io.on('connection', (socket) => {
           return;
         }
 
-        const canLockSlot = String(audioRoom.hostId || '') === String(userId || '') || String(audioRoom.hostId || '') === String(socket.userId || '');
+        const actorId = socket.authenticatedUserId || socket.userId;
+        const canLockSlot = String(audioRoom.hostId || '') === String(actorId || '') || (
+          !!socket.authenticatedUserId &&
+          isAssignedRoomController(stringRoomId, socket.authenticatedUserId, socket.numericUid)
+        );
         if (!canLockSlot) {
-          socket.emit('error_notice', { message: 'Only the host can lock mic slots.' });
+          socket.emit('error_notice', { message: 'Only the host or room admin can lock mic slots.' });
           return;
         }
 
@@ -2704,8 +2785,11 @@ io.on('connection', (socket) => {
 
   const isRequesterRoomHost = async (roomId, requesterId) => {
     const stringRoomId = roomId ? roomId.toString() : '';
-    const actorId = requesterId || socket.userId;
+    const actorId = socket.authenticatedUserId;
     if (!stringRoomId || !actorId) return { allowed: false, stringRoomId, isVideoRoom: false, room: null };
+    if (requesterId && String(requesterId) !== String(actorId)) {
+      return { allowed: false, stringRoomId, isVideoRoom: false, room: null };
+    }
 
     const isVideoRoom = stringRoomId.startsWith('glix_');
     const room = isVideoRoom
@@ -2716,10 +2800,7 @@ io.on('connection', (socket) => {
 
     const controller = roomControllers[stringRoomId] || null;
     const actorIsHost = !!room && String(room.hostId || '') === String(actorId || '');
-    const actorIsController = !!controller && (
-      (controller.userId && String(controller.userId) === String(actorId || '')) ||
-      (controller.uid !== null && controller.uid !== undefined && String(controller.uid) === String(socket.numericUid || ''))
-    );
+    const actorIsController = isAssignedRoomController(stringRoomId, actorId, socket.numericUid);
     console.log('[RoomAdmin][Backend][permission-check]', {
       roomId: stringRoomId,
       requesterId,
@@ -2850,7 +2931,9 @@ io.on('connection', (socket) => {
         return;
       }
 
-      const targetSlotIndex = Number(payload.targetSlotIndex);
+      let targetSlotIndex = payload.targetSlotIndex === null || payload.targetSlotIndex === undefined
+        ? Number.NaN
+        : Number(payload.targetSlotIndex);
       const targetUid = payload.targetUid ?? payload.uid ?? null;
       let targetUserId = payload.targetUserId || null;
       if (!targetUserId && Number.isInteger(targetSlotIndex)) {
@@ -2870,6 +2953,17 @@ io.on('connection', (socket) => {
         }
       }
       targetUserId = targetUserId?.toString?.() || targetUserId;
+      if (targetUserId && (!Number.isInteger(targetSlotIndex) || targetSlotIndex < 0)) {
+        if (isVideoRoom) {
+          const matchingSlot = (room.slots || []).find(item => String(item?.userId || '') === String(targetUserId));
+          if (matchingSlot) targetSlotIndex = Number(matchingSlot.id) - 1;
+        } else {
+          const matchingSpeaker = (room.speakers || []).find(item => String(item?.userId || '') === String(targetUserId));
+          if (matchingSpeaker) targetSlotIndex = Number(matchingSpeaker.slotIndex);
+        }
+      }
+      const hasTargetSlot = Number.isInteger(targetSlotIndex) && targetSlotIndex >= 0;
+      const kickFromRoom = payload.kickFromRoom === true;
       console.log('[RoomAdmin][Backend][remove-resolved]', {
         mode,
         roomId: stringRoomId,
@@ -2890,7 +2984,7 @@ io.on('connection', (socket) => {
           username: item?.username,
         })) : undefined,
       });
-      if (!Number.isInteger(targetSlotIndex) || targetSlotIndex < 0) {
+      if (!hasTargetSlot && (!kickFromRoom || !targetUserId)) {
         console.log('[RoomAdmin][Backend][remove-rejected]', {
           reason: 'invalid_slot',
           mode,
@@ -2913,7 +3007,7 @@ io.on('connection', (socket) => {
         return;
       }
 
-      if (isVideoRoom) {
+      if (hasTargetSlot && isVideoRoom) {
         if (targetSlotIndex <= 0 || targetSlotIndex > 2) {
           console.log('[RoomAdmin][Backend][remove-rejected]', {
             reason: 'invalid_video_slot',
@@ -2939,33 +3033,38 @@ io.on('connection', (socket) => {
             }
           }
         );
-      } else {
+      } else if (hasTargetSlot) {
         await AudioRoom.findByIdAndUpdate(stringRoomId, {
           $pull: { speakers: { slotIndex: targetSlotIndex } },
           $set: { lastHeartbeatAt: new Date() }
         });
       }
 
-      io.to(stringRoomId).emit('slot_state_changed', {
-        slotIndex: targetSlotIndex,
-        user: {
-          uid: null,
-          userId: null,
-          username: isVideoRoom ? `Co-Host ${targetSlotIndex + 1}` : `${targetSlotIndex + 1}`,
-          avatar: null,
-          frameUrl: null,
-          isMuted: false,
-          cameraOn: false
-        }
-      });
+      if (hasTargetSlot) {
+        io.to(stringRoomId).emit('slot_state_changed', {
+          slotIndex: targetSlotIndex,
+          user: {
+            uid: null,
+            userId: null,
+            username: isVideoRoom ? `Co-Host ${targetSlotIndex + 1}` : `${targetSlotIndex + 1}`,
+            avatar: null,
+            frameUrl: null,
+            isMuted: false,
+            cameraOn: false
+          }
+        });
+      }
+      if (kickFromRoom && targetUserId) {
+        removeRoomPresence({ roomId: stringRoomId, userId: targetUserId });
+      }
       await emitRoomSlotsSnapshot(stringRoomId);
 
       const removalPayload = {
         roomId: stringRoomId,
         targetUserId,
         targetUid,
-        targetSlotIndex,
-        kickFromRoom: true,
+        targetSlotIndex: hasTargetSlot ? targetSlotIndex : null,
+        kickFromRoom,
         message: 'The host removed you from the room.'
       };
       console.log('[RoomAdmin][Backend][remove-broadcast]', {
@@ -3017,9 +3116,13 @@ io.on('connection', (socket) => {
         ? requestedSeatCount
         : Number(audioRoom.micSeatCount || 15);
 
-      const canUpdateLayout = String(audioRoom.hostId || '') === String(requesterId || '') || String(audioRoom.hostId || '') === String(socket.userId || '');
+      const actorId = socket.authenticatedUserId;
+      const canUpdateLayout = !!actorId && (!requesterId || String(requesterId) === String(actorId)) && (
+        String(audioRoom.hostId || '') === String(actorId) ||
+        isAssignedRoomController(stringRoomId, actorId, socket.numericUid)
+      );
       if (!canUpdateLayout) {
-        socket.emit('error_notice', { message: 'Only the host can change the mic arrangement.' });
+        socket.emit('error_notice', { message: 'Only the host or room admin can change the mic arrangement.' });
         return;
       }
 
@@ -3038,7 +3141,7 @@ io.on('connection', (socket) => {
 
         const customTheme = await CustomRoomTheme.findOne({
           _id: customThemeId,
-          userId: requesterId,
+          userId: audioRoom.hostId,
           status: 'approved',
           expiresAt: { $gt: new Date() },
         }).lean();
@@ -3142,8 +3245,12 @@ io.on('connection', (socket) => {
         hostId = videoRoom?.hostId?.toString?.() || '';
       }
 
-      if (!hostId || String(hostId) !== String(stringRequesterId)) {
-        socket.emit('error_notice', { message: 'Only the host can clean room chat.' });
+      const actorId = socket.authenticatedUserId;
+      if (!hostId || !actorId || String(actorId) !== String(stringRequesterId) || (
+        String(hostId) !== String(actorId) &&
+        !isAssignedRoomController(stringRoomId, actorId, socket.numericUid)
+      )) {
+        socket.emit('error_notice', { message: 'Only the host or room admin can clean room chat.' });
         return;
       }
 
@@ -5653,12 +5760,21 @@ app.get('/rooms/:roomId/settings', async (req, res) => {
 app.patch('/rooms/:roomId/settings', async (req, res) => {
   try {
     const requesterId = req.body?.requesterId?.toString?.() || String(req.body?.requesterId || '');
+    const authHeader = req.headers.authorization || '';
+    const token = authHeader.startsWith('Bearer ') ? authHeader.slice(7).trim() : '';
+    const authenticatedUserId = await getUserIdFromAppSessionToken(token);
+    if (!authenticatedUserId || (requesterId && String(requesterId) !== String(authenticatedUserId))) {
+      return res.status(401).json({ success: false, message: 'Room settings authentication failed.' });
+    }
     const { room, roomMode, socketRoomId } = await findRoomForSettings(req.params.roomId);
     if (!room) return res.status(404).json({ success: false, message: 'Room not found' });
 
     const hostId = room.hostId?.toString?.() || String(room.hostId || '');
-    if (!requesterId || requesterId !== hostId) {
-      return res.status(403).json({ success: false, message: 'Only the room host can update room settings.' });
+    if (
+      String(authenticatedUserId) !== hostId &&
+      !isAssignedRoomController(socketRoomId || req.params.roomId, authenticatedUserId)
+    ) {
+      return res.status(403).json({ success: false, message: 'Only the room host or room admin can update room settings.' });
     }
 
     const updates = buildRoomSettingsUpdate(req.body);
@@ -6458,7 +6574,7 @@ app.post('/rewards/claim', async (req, res) => {
   }
 });
 
-const PUBLIC_USER_FIELDS = 'name email profilePic glixId googleId createdAt lastLogin followersCount followingCount daimon chang sentGiftCoins frameUrl entryVideoUrl isVip vipExpiresAt vipBadgeUrl vipItemKey settings blacklistedUsers gender birthday countryRegion voiceSignature signature albumPhotos role roles accountStatus hostStatus agencyStatus agencyCode coinSellerStatus adminAccessRequest';
+const PUBLIC_USER_FIELDS = 'name email profilePic glixId googleId createdAt lastLogin followersCount followingCount daimon chang sentGiftCoins frameUrl entryVideoUrl official isVip vipExpiresAt vipBadgeUrl vipItemKey settings blacklistedUsers gender birthday countryRegion voiceSignature signature albumPhotos role roles accountStatus hostStatus agencyStatus agencyCode coinSellerStatus adminAccessRequest';
 
 const sanitizeUserSettings = (settings = {}) => {
   const allowedMessagesFrom = ['everyone', 'following', 'none'];
@@ -7086,7 +7202,7 @@ const removeUserRole = (user, role) => {
   user.roles = normalizeUserRoles(user).filter(item => item === 'user' || item !== clean);
 };
 
-const officialUserProjection = 'name email profilePic glixId role roles accountStatus createdAt lastLogin chang daimon sentGiftCoins hostStatus agencyStatus coinSellerStatus sellerBalance sellerTotalSold adminNote';
+const officialUserProjection = 'name email profilePic glixId role roles official accountStatus createdAt lastLogin chang daimon sentGiftCoins hostStatus agencyStatus coinSellerStatus sellerBalance sellerTotalSold adminNote';
 const officialAccountProjection = 'name email role status permissions sourceUserId note rejectionReason createdBy reviewedBy reviewedAt createdAt updatedAt lastLogin';
 
 const serializeOfficialUser = (user) => {
@@ -8453,13 +8569,14 @@ app.get('/admin/users', requireOfficial, async (req, res) => {
 
 app.patch('/admin/users/:userId', requireOfficial, async (req, res) => {
   try {
-    const allowed = ['role', 'accountStatus', 'hostStatus', 'agencyStatus', 'chang', 'daimon', 'adminNote'];
+    const allowed = ['role', 'official', 'accountStatus', 'hostStatus', 'agencyStatus', 'chang', 'daimon', 'adminNote'];
     const update = {};
     for (const key of allowed) {
       if (Object.prototype.hasOwnProperty.call(req.body, key)) update[key] = req.body[key];
     }
     if (update.chang !== undefined) update.chang = Math.max(0, Number(update.chang) || 0);
     if (update.daimon !== undefined) update.daimon = Math.max(0, Number(update.daimon) || 0);
+    if (update.official !== undefined) update.official = update.official === true;
 
     if (String(req.params.userId) === String(req.officialUser._id)) {
       if (update.role && update.role !== 'super_admin') return res.status(400).json({ success: false, message: 'You cannot remove your own Super Admin role' });
