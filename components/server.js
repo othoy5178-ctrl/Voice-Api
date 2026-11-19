@@ -345,6 +345,74 @@ const isAssignedRoomController = (roomId, userId, numericUid = null) => {
     )
   );
 };
+
+const getAudioRoomAdministratorIds = (room = {}) => (
+  Array.isArray(room.administrators)
+    ? room.administrators
+      .map(adminId => adminId?._id?.toString?.() || adminId?.toString?.() || String(adminId || ''))
+      .filter(Boolean)
+    : []
+);
+
+const getAudioRoomPermissionState = (room = {}, actorId = '', roomId = '') => {
+  const cleanActorId = actorId?.toString?.() || String(actorId || '');
+  const hostId = room.hostId?._id?.toString?.() || room.hostId?.toString?.() || String(room.hostId || '');
+  const administratorIds = getAudioRoomAdministratorIds(room);
+  const isOwner = !!cleanActorId && cleanActorId === hostId;
+  const isAdministrator = !!cleanActorId && administratorIds.includes(cleanActorId);
+  const isTemporaryController = !!cleanActorId && isAssignedRoomController(roomId || room._id, cleanActorId);
+  const canModerateRoom = isOwner || isAdministrator || isTemporaryController;
+
+  return {
+    roomRole: isOwner
+      ? 'owner'
+      : isAdministrator
+        ? 'administrator'
+        : isTemporaryController
+          ? 'temporary_controller'
+          : 'audience',
+    administratorIds,
+    permissions: {
+      isOwner,
+      isAdministrator,
+      isTemporaryController,
+      canManageMic: canModerateRoom,
+      canLockMic: canModerateRoom,
+      canManageLayout: canModerateRoom,
+      canRemoveUsers: canModerateRoom,
+      canCleanChat: canModerateRoom,
+      canUpdateSettings: canModerateRoom,
+      canChangePassword: isOwner,
+      canAssignAdministrators: isOwner,
+      canRemoveAdministrators: isOwner,
+      canEndLive: isOwner,
+      canTransferOwnership: isOwner,
+    }
+  };
+};
+
+const emitAudioRoomPermissionsToSocket = (socket, room, roomId = '') => {
+  const actorId = socket?.authenticatedUserId || '';
+  const state = getAudioRoomPermissionState(room, actorId, roomId || room?._id);
+  socket.emit('audio_room_permissions_updated', {
+    roomId: getStringRoomId(roomId || room?._id),
+    ...state,
+  });
+  return state;
+};
+
+const syncAudioRoomPermissions = async (roomId) => {
+  const stringRoomId = getStringRoomId(roomId);
+  if (!mongoose.Types.ObjectId.isValid(stringRoomId)) return;
+
+  const room = await AudioRoom.findById(stringRoomId).select('hostId administrators').lean();
+  if (!room) return;
+
+  const connectedSockets = await io.in(stringRoomId).fetchSockets();
+  connectedSockets.forEach(connectedSocket => {
+    emitAudioRoomPermissionsToSocket(connectedSocket, room, stringRoomId);
+  });
+};
 const getRoomDisconnectTimerKey = (roomId, userId) => `${getStringRoomId(roomId)}:${userId?.toString?.() || String(userId || '')}`;
 const getRoomEmptyAudienceTimerKey = (roomId) => getStringRoomId(roomId);
 
@@ -1479,6 +1547,15 @@ const getStoreEquipUpdate = (item) => {
   return null;
 };
 
+const getStoreFrameUrl = (item) => (
+  item?.frameUrl ||
+  item?.equipValue ||
+  item?.imageUrl ||
+  item?.previewUrl ||
+  item?.assetKey ||
+  ''
+);
+
 const generateSevenDigitUserId = () => Math.floor(1000000 + Math.random() * 9000000).toString();
 
 const createUniqueUserPublicId = async () => {
@@ -2049,6 +2126,7 @@ const processAudioRoomHostExit = async ({ roomId, requesterId, socketId = null }
   io.to(stringRoomId).emit('host_left_room', transferPayload);
   io.to(stringRoomId).emit('room_control_transferred', transferPayload);
   io.to(stringRoomId).emit('room_controller_changed', transferPayload);
+  await syncAudioRoomPermissions(stringRoomId);
   await emitRoomSlotsSnapshot(stringRoomId);
   await emitRoomStats(stringRoomId);
   if (!remainingSpeakers.length && !hasGamePlayers) {
@@ -2070,6 +2148,44 @@ const processAudioRoomHostExit = async ({ roomId, requesterId, socketId = null }
 
 const getUserSocketRoom = (userId) => `user:${String(userId || '').trim()}`;
 
+const syncUserFrameToRoomSlots = async (userId, frameUrl, storeItemId = null) => {
+  const cleanUserId = String(userId || '').trim();
+  if (!mongoose.Types.ObjectId.isValid(cleanUserId)) return;
+
+  const normalizedFrameUrl = String(frameUrl || '').trim();
+  const objectUserId = new mongoose.Types.ObjectId(cleanUserId);
+  const [audioRooms, videoRooms] = await Promise.all([
+    AudioRoom.find({ isLive: true, 'speakers.userId': objectUserId }).select('_id').lean(),
+    Room.find({ isLive: true, 'slots.userId': cleanUserId }).select('channelName').lean(),
+  ]);
+
+  await Promise.all([
+    AudioRoom.updateMany(
+      { 'speakers.userId': objectUserId },
+      { $set: { 'speakers.$[speaker].frameUrl': normalizedFrameUrl || null } },
+      { arrayFilters: [{ 'speaker.userId': objectUserId }] }
+    ),
+    Room.updateMany(
+      { 'slots.userId': cleanUserId },
+      { $set: { 'slots.$[slot].frameUrl': normalizedFrameUrl || null } },
+      { arrayFilters: [{ 'slot.userId': cleanUserId }] }
+    ),
+  ]);
+
+  const payload = {
+    userId: cleanUserId,
+    frameUrl: normalizedFrameUrl || null,
+    storeItemId: storeItemId ? String(storeItemId) : null,
+    updatedAt: new Date().toISOString(),
+  };
+
+  io.to(getUserSocketRoom(cleanUserId)).emit('user_frame_updated', payload);
+  audioRooms.forEach(room => io.to(String(room._id)).emit('user_frame_updated', payload));
+  videoRooms.forEach(room => {
+    if (room.channelName) io.to(String(room.channelName)).emit('user_frame_updated', payload);
+  });
+};
+
 const joinUserSocketRoom = (socket, userId) => {
   const cleanUserId = String(userId || '').trim();
   if (!cleanUserId) return false;
@@ -2081,19 +2197,45 @@ const joinUserSocketRoom = (socket, userId) => {
 const joinAuthenticatedUserSocketRoom = async (socket, payload = {}) => {
   const cleanUserId = String(payload?.userId || payload?.uid || '').trim();
   const token = String(payload?.token || payload?.authToken || '').trim();
-  if (!mongoose.Types.ObjectId.isValid(cleanUserId) || !token) return false;
+  if (!mongoose.Types.ObjectId.isValid(cleanUserId)) return false;
 
-  const session = await AuthSession.findOne({
-    userId: cleanUserId,
-    tokenHash: hashToken(token),
-    expiresAt: { $gt: new Date() },
-  }).select('_id').lean();
+  if (socket.authenticationPromise) {
+    await socket.authenticationPromise;
+    return String(socket.authenticatedUserId || '') === cleanUserId;
+  }
+  if (String(socket.authenticatedUserId || '') === cleanUserId) return true;
+  if (!token) return false;
 
-  if (!session) return false;
-  socket.join(getUserSocketRoom(cleanUserId));
-  joinUserSocketRoom(socket, cleanUserId);
-  socket.authenticatedUserId = cleanUserId;
-  return true;
+  const authenticationPromise = (async () => {
+    const session = await AuthSession.findOne({
+      userId: cleanUserId,
+      tokenHash: hashToken(token),
+      expiresAt: { $gt: new Date() },
+    }).select('_id').lean();
+
+    if (!session) return false;
+    socket.join(getUserSocketRoom(cleanUserId));
+    joinUserSocketRoom(socket, cleanUserId);
+    socket.authenticatedUserId = cleanUserId;
+    return true;
+  })();
+
+  socket.authenticationPromise = authenticationPromise;
+  try {
+    return await authenticationPromise;
+  } finally {
+    if (socket.authenticationPromise === authenticationPromise) {
+      socket.authenticationPromise = null;
+    }
+  }
+};
+
+const getAuthenticatedSocketActor = async (socket, claimedUserId = '') => {
+  if (socket.authenticationPromise) await socket.authenticationPromise;
+  const actorId = socket.authenticatedUserId?.toString?.() || String(socket.authenticatedUserId || '');
+  if (!actorId) return '';
+  if (claimedUserId && String(claimedUserId) !== actorId) return '';
+  return actorId;
 };
 
 const emitWalletUpdated = (userId, wallet = {}) => {
@@ -2144,8 +2286,19 @@ io.on('connection', (socket) => {
   console.log(`User connected to socket cluster: ${socket.id}`);
 
   // 1. EVENT: Join Room
-  socket.on('join_audio_room', async ({ roomId, userId, name, profilePic, entryVideoUrl }) => {
+  socket.on('join_audio_room', async ({ roomId, userId, name, profilePic, entryVideoUrl, token, authToken }, ack) => {
     try {
+      const authenticated = await joinAuthenticatedUserSocketRoom(socket, {
+        userId,
+        token: token || authToken,
+      });
+      if (!authenticated || String(socket.authenticatedUserId || '') !== String(userId || '')) {
+        const authError = { success: false, message: 'Room socket authentication failed.' };
+        if (typeof ack === 'function') ack(authError);
+        socket.emit('error_notice', { message: authError.message });
+        return;
+      }
+
       await clearExpiredStoreItems(userId);
       const userData = await User.findById(userId).select('name profilePic frameUrl entryVideoUrl daimon sentGiftCoins');
       const finalJoinName = userData?.name || name || 'User';
@@ -2226,7 +2379,15 @@ io.on('connection', (socket) => {
           userId,
           message: `${finalJoinName || 'Host'} reconnected.`,
         });
+        await syncAudioRoomPermissions(stringRoomId);
       }
+
+      if (!isVideoRoom) {
+        const permissionRoom = await AudioRoom.findById(stringRoomId).select('hostId administrators').lean();
+        if (permissionRoom) emitAudioRoomPermissionsToSocket(socket, permissionRoom, stringRoomId);
+      }
+
+      if (typeof ack === 'function') ack({ success: true });
 
       console.log(`${finalJoinName} joined real-time room channel: ${stringRoomId}`);
 
@@ -2291,9 +2452,14 @@ io.on('connection', (socket) => {
       if (isVideoRoom) {
         socket.emit('initialize_room_slots', completeLayoutMatrix);
       } else if (mongoose.Types.ObjectId.isValid(stringRoomId)) {
-        const audioRoomLayout = await AudioRoom.findById(stringRoomId).select('micSeatCount micLayoutType backgroundThemeId backgroundThemeUrl lockedSlots').lean();
+        const audioRoomLayout = await AudioRoom.findById(stringRoomId).select('hostId administrators micSeatCount micLayoutType backgroundThemeId backgroundThemeUrl lockedSlots').lean();
         const storedLockedSlots = Array.isArray(audioRoomLayout?.lockedSlots) ? audioRoomLayout.lockedSlots : [3, 12, 19];
         const lockedSlots = new Set(storedLockedSlots.map(Number));
+        const roomAccess = getAudioRoomPermissionState(
+          audioRoomLayout,
+          socket.authenticatedUserId,
+          stringRoomId
+        );
         socket.emit('initialize_room_slots', {
           slots: completeLayoutMatrix.map((slot, index) => {
             const hasSpeaker = !!slot?.userId || (slot?.uid !== null && slot?.uid !== undefined);
@@ -2303,6 +2469,9 @@ io.on('connection', (socket) => {
           micLayoutType: audioRoomLayout?.micLayoutType || 'chatroom',
           backgroundThemeId: audioRoomLayout?.backgroundThemeId || null,
           backgroundThemeUrl: audioRoomLayout?.backgroundThemeUrl || null,
+          roomRole: roomAccess.roomRole,
+          permissions: roomAccess.permissions,
+          administratorIds: roomAccess.administratorIds,
         });
       } else {
         socket.emit('initialize_room_slots', completeLayoutMatrix);
@@ -2371,9 +2540,9 @@ io.on('connection', (socket) => {
       let emittedSlotLocked = typeof slotLocked === 'boolean' ? slotLocked : (typeof locked === 'boolean' ? locked : undefined);
 
       if (managementAction === 'set_mute') {
-        const actorId = socket.authenticatedUserId;
+        const actorId = await getAuthenticatedSocketActor(socket, requesterId);
         const targetUserId = userId?.toString?.() || String(userId || '');
-        if (!actorId || !targetUserId || (requesterId && String(requesterId) !== String(actorId))) {
+        if (!actorId || !targetUserId) {
           socket.emit('error_notice', { message: 'Unable to authenticate this microphone action.' });
           return;
         }
@@ -2381,12 +2550,20 @@ io.on('connection', (socket) => {
         const managedRoom = isVideoRoom
           ? await Room.findOne({ channelName: stringRoomId }).select('hostId slots')
           : mongoose.Types.ObjectId.isValid(stringRoomId)
-            ? await AudioRoom.findById(stringRoomId).select('hostId speakers')
+            ? await AudioRoom.findById(stringRoomId).select('hostId administrators speakers')
             : null;
-        const actorIsHost = !!managedRoom && String(managedRoom.hostId || '') === String(actorId);
-        const actorIsController = isAssignedRoomController(stringRoomId, actorId, socket.numericUid);
+        const actorCanManageMic = isVideoRoom
+          ? !!managedRoom && (
+            String(managedRoom.hostId || '') === String(actorId) ||
+            isAssignedRoomController(stringRoomId, actorId, socket.numericUid)
+          )
+          : !!managedRoom && getAudioRoomPermissionState(
+            managedRoom,
+            actorId,
+            stringRoomId
+          ).permissions.canManageMic;
 
-        if (!managedRoom || (!actorIsHost && !actorIsController)) {
+        if (!managedRoom || !actorCanManageMic) {
           socket.emit('error_notice', { message: 'Only the host or room admin can manage microphones.' });
           return;
         }
@@ -2436,17 +2613,18 @@ io.on('connection', (socket) => {
         }
 
         if (!mongoose.Types.ObjectId.isValid(stringRoomId)) return;
-        const audioRoom = await AudioRoom.findById(stringRoomId).select('hostId lockedSlots speakers micSeatCount');
+        const audioRoom = await AudioRoom.findById(stringRoomId).select('hostId administrators lockedSlots speakers micSeatCount');
         if (!audioRoom) {
           socket.emit('error_notice', { message: 'Audio room not found.' });
           return;
         }
 
-        const actorId = socket.authenticatedUserId || socket.userId;
-        const canLockSlot = String(audioRoom.hostId || '') === String(actorId || '') || (
-          !!socket.authenticatedUserId &&
-          isAssignedRoomController(stringRoomId, socket.authenticatedUserId, socket.numericUid)
-        );
+        const actorId = await getAuthenticatedSocketActor(socket, requesterId || userId);
+        const canLockSlot = !!actorId && getAudioRoomPermissionState(
+          audioRoom,
+          actorId,
+          stringRoomId
+        ).permissions.canLockMic;
         if (!canLockSlot) {
           socket.emit('error_notice', { message: 'Only the host or room admin can lock mic slots.' });
           return;
@@ -2669,7 +2847,7 @@ io.on('connection', (socket) => {
       controller?.numericUid ??
       null;
 
-    const requesterId =
+    let requesterId =
       payload.userId ||
       payload.fromUserId ||
       socket.userId ||
@@ -2683,6 +2861,14 @@ io.on('connection', (socket) => {
     if (!isVideoRoom && mongoose.Types.ObjectId.isValid(stringRoomId)) {
       audioRoomState = await AudioRoom.findById(stringRoomId);
       if (!audioRoomState || !audioRoomState.isLive) return;
+
+      const actorId = await getAuthenticatedSocketActor(socket, requesterId);
+      const actorAccess = getAudioRoomPermissionState(audioRoomState, actorId, stringRoomId);
+      if (!actorId || (!actorAccess.permissions.isOwner && !actorAccess.permissions.isTemporaryController)) {
+        socket.emit('error_notice', { message: 'Only the original host or temporary controller can transfer room control.' });
+        return;
+      }
+      requesterId = actorId;
 
       activateAudioRoomLiveSession(audioRoomState);
       if (requesterId && String(audioRoomState.hostId || '') === String(requesterId)) {
@@ -2947,6 +3133,7 @@ io.on('connection', (socket) => {
     );
 
     if (!isVideoRoom && audioRoomState) {
+      await syncAudioRoomPermissions(stringRoomId);
       if (hasAudioMicOrGameActivity) {
         await cancelAudioRoomGracePeriod(stringRoomId, audioRoomState.liveSessionId || null);
       } else {
@@ -3006,11 +3193,8 @@ io.on('connection', (socket) => {
 
   const isRequesterRoomHost = async (roomId, requesterId) => {
     const stringRoomId = roomId ? roomId.toString() : '';
-    const actorId = socket.authenticatedUserId;
+    const actorId = await getAuthenticatedSocketActor(socket, requesterId);
     if (!stringRoomId || !actorId) return { allowed: false, stringRoomId, isVideoRoom: false, room: null };
-    if (requesterId && String(requesterId) !== String(actorId)) {
-      return { allowed: false, stringRoomId, isVideoRoom: false, room: null };
-    }
 
     const isVideoRoom = stringRoomId.startsWith('glix_');
     const room = isVideoRoom
@@ -3021,9 +3205,13 @@ io.on('connection', (socket) => {
 
     const controller = roomControllers[stringRoomId] || null;
     const actorIsHost = !!room && String(room.hostId || '') === String(actorId || '');
-    const actorIsController = isAssignedRoomController(stringRoomId, actorId, socket.numericUid);
-    const actorIsPersistentAdmin = !isVideoRoom && Array.isArray(room?.administrators)
-      && room.administrators.some(adminId => String(adminId || '') === String(actorId || ''));
+    const audioAccess = !isVideoRoom && room
+      ? getAudioRoomPermissionState(room, actorId, stringRoomId)
+      : null;
+    const actorIsController = isVideoRoom
+      ? isAssignedRoomController(stringRoomId, actorId, socket.numericUid)
+      : !!audioAccess?.permissions?.isTemporaryController;
+    const actorIsPersistentAdmin = !!audioAccess?.permissions?.isAdministrator;
     console.log('[RoomAdmin][Backend][permission-check]', {
       roomId: stringRoomId,
       requesterId,
@@ -3043,24 +3231,31 @@ io.on('connection', (socket) => {
       allowed: !!room && (actorIsHost || actorIsController || actorIsPersistentAdmin),
       isHost: actorIsHost,
       isController: actorIsController,
+      isPersistentAdmin: actorIsPersistentAdmin,
       stringRoomId,
       isVideoRoom,
-      room
+      room,
+      permissions: audioAccess?.permissions || null,
     };
   };
 
   const handleAssignRoomAdmin = async (payload = {}, mode = 'audio') => {
     try {
       console.log('[RoomAdmin][Backend][assign-received]', { mode, payload });
-      const { allowed, stringRoomId, room } = await isRequesterRoomHost(payload.roomId, payload.requesterId);
-      if (!allowed) {
+      const { allowed, isHost, stringRoomId, room } = await isRequesterRoomHost(payload.roomId, payload.requesterId);
+      const canAssignAdministrator = mode === 'audio' ? isHost : allowed;
+      if (!canAssignAdministrator) {
         console.log('[RoomAdmin][Backend][assign-rejected]', {
           reason: 'permission_denied',
           mode,
           roomId: payload.roomId,
           requesterId: payload.requesterId,
         });
-        socket.emit('error_notice', { message: 'Only the host or room admin can make a room admin.' });
+        socket.emit('error_notice', {
+          message: mode === 'audio'
+            ? 'Only the original room owner can assign administrators.'
+            : 'Only the host or room admin can assign a video room admin.'
+        });
         return;
       }
 
@@ -3102,7 +3297,9 @@ io.on('connection', (socket) => {
           username: item?.username,
         })) : undefined,
       });
-      if (!targetUserId || !Number.isInteger(targetSlotIndex) || targetUid === null || targetUid === undefined) {
+      const hasValidAudioTarget = mode === 'audio' && mongoose.Types.ObjectId.isValid(targetUserId);
+      const hasValidVideoTarget = mode === 'video' && targetUserId && Number.isInteger(targetSlotIndex) && targetUid !== null && targetUid !== undefined;
+      if (!hasValidAudioTarget && !hasValidVideoTarget) {
         console.log('[RoomAdmin][Backend][assign-rejected]', {
           reason: 'missing_target',
           mode,
@@ -3120,12 +3317,22 @@ io.on('connection', (socket) => {
         uid: targetUid,
         targetSlotIndex,
       };
-      roomControllers[stringRoomId] = controller;
       if (mode === 'audio' && mongoose.Types.ObjectId.isValid(targetUserId)) {
+        if (String(targetUserId) === String(room.hostId || '')) {
+          socket.emit('error_notice', { message: 'The room owner already has full permissions.' });
+          return;
+        }
+        const targetExists = await User.exists({ _id: targetUserId });
+        if (!targetExists) {
+          socket.emit('error_notice', { message: 'Selected user was not found.' });
+          return;
+        }
         await AudioRoom.updateOne(
           { _id: stringRoomId, isLive: true },
           { $addToSet: { administrators: targetUserId } }
         );
+      } else {
+        roomControllers[stringRoomId] = controller;
       }
       console.log('[RoomAdmin][Backend][assign-broadcast]', {
         mode,
@@ -3136,10 +3343,12 @@ io.on('connection', (socket) => {
 
       io.to(stringRoomId).emit(mode === 'video' ? 'video_room_admin_assigned' : 'audio_room_host_assigned', {
         controller,
+        administrator: mode === 'audio' ? controller : null,
         roomId: stringRoomId,
         hostId: room.hostId,
         message: 'Room admin assigned.'
       });
+      if (mode === 'audio') await syncAudioRoomPermissions(stringRoomId);
     } catch (error) {
       console.log('Assign room admin error:', error);
       socket.emit('error_notice', { message: 'Unable to assign room admin.' });
@@ -3314,6 +3523,7 @@ io.on('connection', (socket) => {
 
       io.to(stringRoomId).emit(isVideoRoom || mode === 'video' ? 'video_mic_user_removed' : 'audio_mic_user_removed', removalPayload);
       io.to(stringRoomId).emit('mic_user_removed', removalPayload);
+      if (!isVideoRoom && mode === 'audio') await syncAudioRoomPermissions(stringRoomId);
       console.log(removalPayload);
     } catch (error) {
       console.log('Remove slot user error:', error);
@@ -3321,7 +3531,40 @@ io.on('connection', (socket) => {
     }
   };
 
+  const handleRemoveAudioRoomAdmin = async (payload = {}) => {
+    try {
+      const { isHost, stringRoomId, room } = await isRequesterRoomHost(payload.roomId, payload.requesterId);
+      if (!isHost || !room || stringRoomId.startsWith('glix_')) {
+        socket.emit('error_notice', { message: 'Only the original room owner can remove administrators.' });
+        return;
+      }
+
+      const targetUserId = payload.targetUserId?.toString?.() || String(payload.targetUserId || '');
+      if (!mongoose.Types.ObjectId.isValid(targetUserId)) {
+        socket.emit('error_notice', { message: 'Invalid administrator selected.' });
+        return;
+      }
+
+      await AudioRoom.updateOne(
+        { _id: stringRoomId, hostId: socket.authenticatedUserId },
+        { $pull: { administrators: targetUserId } }
+      );
+
+      io.to(stringRoomId).emit('audio_room_admin_removed', {
+        roomId: stringRoomId,
+        targetUserId,
+        removedBy: socket.authenticatedUserId,
+        message: 'Room administrator permissions removed.',
+      });
+      await syncAudioRoomPermissions(stringRoomId);
+    } catch (error) {
+      console.log('Remove room administrator error:', error);
+      socket.emit('error_notice', { message: 'Unable to remove this room administrator.' });
+    }
+  };
+
   socket.on('assign_audio_room_host', payload => handleAssignRoomAdmin(payload, 'audio'));
+  socket.on('remove_audio_room_admin', handleRemoveAudioRoomAdmin);
   socket.on('assign_video_room_admin', payload => handleAssignRoomAdmin(payload, 'video'));
   socket.on('remove_audio_mic_user', payload => handleRemoveSlotUser(payload, 'audio'));
   socket.on('remove_video_mic_user', payload => handleRemoveSlotUser(payload, 'video'));
@@ -3346,11 +3589,12 @@ io.on('connection', (socket) => {
         ? requestedSeatCount
         : Number(audioRoom.micSeatCount || 15);
 
-      const actorId = socket.authenticatedUserId;
-      const canUpdateLayout = !!actorId && (!requesterId || String(requesterId) === String(actorId)) && (
-        String(audioRoom.hostId || '') === String(actorId) ||
-        isAssignedRoomController(stringRoomId, actorId, socket.numericUid)
-      );
+      const actorId = await getAuthenticatedSocketActor(socket, requesterId);
+      const canUpdateLayout = !!actorId && getAudioRoomPermissionState(
+        audioRoom,
+        actorId,
+        stringRoomId
+      ).permissions.canManageLayout;
       if (!canUpdateLayout) {
         socket.emit('error_notice', { message: 'Only the host or room admin can change the mic arrangement.' });
         return;
@@ -3464,8 +3708,9 @@ io.on('connection', (socket) => {
       }
 
       let hostId = '';
+      let audioRoom = null;
       if (roomMode === 'audio' && mongoose.Types.ObjectId.isValid(stringRoomId)) {
-        const audioRoom = await AudioRoom.findById(stringRoomId).select('hostId').lean();
+        audioRoom = await AudioRoom.findById(stringRoomId).select('hostId administrators').lean();
         hostId = audioRoom?.hostId?.toString?.() || '';
       } else {
         const videoQuery = mongoose.Types.ObjectId.isValid(stringRoomId)
@@ -3475,11 +3720,18 @@ io.on('connection', (socket) => {
         hostId = videoRoom?.hostId?.toString?.() || '';
       }
 
-      const actorId = socket.authenticatedUserId;
-      if (!hostId || !actorId || String(actorId) !== String(stringRequesterId) || (
-        String(hostId) !== String(actorId) &&
-        !isAssignedRoomController(stringRoomId, actorId, socket.numericUid)
-      )) {
+      const actorId = await getAuthenticatedSocketActor(socket, stringRequesterId);
+      const canCleanChat = roomMode === 'audio'
+        ? !!audioRoom && !!actorId && getAudioRoomPermissionState(
+          audioRoom,
+          actorId,
+          stringRoomId
+        ).permissions.canCleanChat
+        : !!hostId && !!actorId && (
+          String(hostId) === String(actorId) ||
+          isAssignedRoomController(stringRoomId, actorId, socket.numericUid)
+        );
+      if (!canCleanChat) {
         socket.emit('error_notice', { message: 'Only the host or room admin can clean room chat.' });
         return;
       }
@@ -4002,15 +4254,17 @@ io.on('connection', (socket) => {
     }
   });
 
-  socket.on('join_user_channel', async (payload = {}) => {
+  socket.on('join_user_channel', async (payload = {}, ack) => {
     try {
       const joined = await joinAuthenticatedUserSocketRoom(socket, payload);
       if (!joined) {
         socket.emit('wallet_channel_error', { message: 'Unable to join wallet channel.' });
       }
+      if (typeof ack === 'function') ack({ success: joined });
     } catch (error) {
       console.log('join_user_channel error:', error.message);
       socket.emit('wallet_channel_error', { message: 'Unable to join wallet channel.' });
+      if (typeof ack === 'function') ack({ success: false });
     }
   });
 
@@ -4520,6 +4774,7 @@ io.on('connection', (socket) => {
               io.to(roomId).emit('host_left_room', transferPayload);
               io.to(roomId).emit('room_control_transferred', transferPayload);
               io.to(roomId).emit('room_controller_changed', transferPayload);
+              await syncAudioRoomPermissions(roomId);
               await emitRoomSlotsSnapshot(roomId);
               await emitRoomStats(roomId);
               await cancelAudioRoomGracePeriod(roomId, latestRoom.liveSessionId || null);
@@ -4529,6 +4784,7 @@ io.on('connection', (socket) => {
 
             const hasGamePlayers = await hasFreshAudioRoomGamePlayers(roomId);
             if (hasGamePlayers) {
+              delete roomControllers[roomId];
               latestRoom.isLive = true;
               latestRoom.lastHeartbeatAt = new Date();
               latestRoom.endedAt = null;
@@ -4553,6 +4809,7 @@ io.on('connection', (socket) => {
                 controller: null,
                 message: 'Room is staying open while a game is being played.',
               });
+              await syncAudioRoomPermissions(roomId);
               await emitRoomStats(roomId);
               await cancelAudioRoomGracePeriod(roomId, latestRoom.liveSessionId || null);
               console.log(`Audio room kept open after host disconnect because game players remain: ${roomId}`);
@@ -4564,6 +4821,7 @@ io.on('connection', (socket) => {
             const remainingPresenceUsers = getRoomPresenceUserIds(roomId, currentUserId);
 
             if (remainingAudience.length > 0 || remainingPresenceUsers.length > 0) {
+              delete roomControllers[roomId];
               latestRoom.isLive = true;
               latestRoom.audience = remainingAudience;
               latestRoom.lastHeartbeatAt = new Date();
@@ -4589,6 +4847,7 @@ io.on('connection', (socket) => {
                 controller: null,
                 message: 'Room is staying open while users are inside.',
               });
+              await syncAudioRoomPermissions(roomId);
               await emitRoomStats(roomId);
               scheduleKeptOpenAudioRoomCloseCheck(
                 roomId,
@@ -4599,6 +4858,7 @@ io.on('connection', (socket) => {
               return;
             }
 
+            delete roomControllers[roomId];
             latestRoom.isLive = true;
             latestRoom.speakers = [];
             latestRoom.audience = [];
@@ -4621,6 +4881,7 @@ io.on('connection', (socket) => {
               'host_disconnected_empty_room',
               latestRoom.liveSessionId || null
             );
+            await syncAudioRoomPermissions(roomId);
 
             console.log(`Audio room grace period started after host disconnect: ${roomId}`);
           } catch (error) {
@@ -4666,6 +4927,37 @@ io.on('connection', (socket) => {
                 audience: currentUserId
               }
             });
+
+            const currentController = roomControllers[roomId] || null;
+            if (currentController?.userId && String(currentController.userId) === currentUserId) {
+              const nextControllerSpeaker = (latestRoom?.speakers || [])
+                .filter(item => item?.userId && String(item.userId) !== currentUserId)
+                .pop() || null;
+              if (nextControllerSpeaker) {
+                roomControllers[roomId] = {
+                  userId: nextControllerSpeaker.userId.toString(),
+                  uid: nextControllerSpeaker.numericUid ?? null,
+                  targetSlotIndex: nextControllerSpeaker.slotIndex,
+                };
+              } else {
+                delete roomControllers[roomId];
+              }
+              if (roomKeepOpenRooms[roomId]) {
+                roomKeepOpenRooms[roomId].controllerUserId = roomControllers[roomId]?.userId || null;
+                roomKeepOpenRooms[roomId].controllerUid = roomControllers[roomId]?.uid ?? null;
+                roomKeepOpenRooms[roomId].updatedAt = Date.now();
+              }
+              io.to(roomId).emit('room_controller_changed', {
+                roomId,
+                controller: roomControllers[roomId] || null,
+                transferToUserId: roomControllers[roomId]?.userId || null,
+                transferToUid: roomControllers[roomId]?.uid ?? null,
+                message: roomControllers[roomId]
+                  ? 'Temporary room control moved to another mic user.'
+                  : 'Temporary room control was released.',
+              });
+              await syncAudioRoomPermissions(roomId);
+            }
 
             scheduleKeptOpenAudioRoomCloseCheck(roomId, 'last_audience_left');
 
@@ -5469,6 +5761,7 @@ app.post('/create', async (req, res) => {
     const token = RtcTokenBuilder.buildTokenWithUid(appId, appCertificate, channelName, sanitizedUid, RtcRole.PUBLISHER, privilegeExpiredTs);
 
     await recordRewardActivity(hostId, 'create_audio_room', { roomId: channelName });
+    const roomAccess = getAudioRoomPermissionState(permanentRoom, hostId, channelName);
 
     return res.status(201).json({
       success: true,
@@ -5477,6 +5770,9 @@ app.post('/create', async (req, res) => {
       channelName: channelName,
       appId: appId,
       startedNewSession,
+      roomRole: roomAccess.roomRole,
+      permissions: roomAccess.permissions,
+      administratorIds: roomAccess.administratorIds,
     });
   } catch (error) {
     return res.status(500).json({ error: error.message });
@@ -5487,6 +5783,16 @@ app.post('/join', async (req, res) => {
   try {
     const { roomId, userId, numericUid, roomPassword, previousSlotIndex } = req.body;
     if (!roomId || !userId || !numericUid) return res.status(400).json({ error: "Missing required fields" });
+
+    const authHeader = req.headers.authorization || '';
+    const headerToken = authHeader.startsWith('Bearer ') ? authHeader.slice(7).trim() : '';
+    const requestToken = headerToken || String(req.body?.token || req.body?.authToken || '').trim();
+    const authenticatedJoinUserId = requestToken
+      ? await getUserIdFromAppSessionToken(requestToken)
+      : '';
+    if (requestToken && String(authenticatedJoinUserId || '') !== String(userId)) {
+      return res.status(401).json({ success: false, message: 'Room join authentication failed.' });
+    }
 
     const sanitizedUid = parseInt(numericUid, 10) || 0;
     const stringRoomId = roomId.toString();
@@ -5502,6 +5808,7 @@ app.post('/join', async (req, res) => {
     let channelName = stringRoomId;
     let userRole = RtcRole.SUBSCRIBER;
     let startedNewAudioSession = false;
+    let audioRoomAccess = null;
 
     const videoFilter = getVideoRoomFilter(stringRoomId);
     if (videoFilter) {
@@ -5648,6 +5955,11 @@ app.post('/join', async (req, res) => {
       }
 
       await roomObj.save();
+      audioRoomAccess = getAudioRoomPermissionState(
+        roomObj,
+        authenticatedJoinUserId,
+        stringRoomId
+      );
       if (isRoomOwner || userRole === RtcRole.PUBLISHER) {
         await cancelAudioRoomGracePeriod(stringRoomId, roomObj.liveSessionId || null);
       }
@@ -5703,6 +6015,9 @@ app.post('/join', async (req, res) => {
       channelName,
       appId: appId,
       startedNewSession: startedNewAudioSession,
+      roomRole: audioRoomAccess?.roomRole || 'audience',
+      permissions: audioRoomAccess?.permissions || null,
+      administratorIds: audioRoomAccess?.administratorIds || [],
       userRole: userRole === RtcRole.PUBLISHER ? 'speaker' : 'audience'
     });
   } catch (error) {
@@ -5916,7 +6231,15 @@ app.post('/rooms/end', async (req, res) => {
 
     const room = await AudioRoom.findById(stringRoomId);
     if (!room) return res.status(404).json({ success: false, error: 'Room not found' });
-    if (!room.hostId || room.hostId.toString() !== String(hostId)) {
+    const audioEndAuthHeader = req.headers.authorization || '';
+    const audioEndToken = audioEndAuthHeader.startsWith('Bearer ') ? audioEndAuthHeader.slice(7).trim() : '';
+    const authenticatedAudioEndUserId = await getUserIdFromAppSessionToken(audioEndToken);
+    if (
+      !authenticatedAudioEndUserId ||
+      !room.hostId ||
+      room.hostId.toString() !== String(hostId) ||
+      room.hostId.toString() !== String(authenticatedAudioEndUserId)
+    ) {
       return res.status(403).json({ success: false, error: 'Unauthorized' });
     }
 
@@ -6081,11 +6404,22 @@ app.patch('/rooms/:roomId/settings', async (req, res) => {
     if (!room) return res.status(404).json({ success: false, message: 'Room not found' });
 
     const hostId = room.hostId?.toString?.() || String(room.hostId || '');
-    if (
-      String(authenticatedUserId) !== hostId &&
-      !isAssignedRoomController(socketRoomId || req.params.roomId, authenticatedUserId)
-    ) {
+    const audioAccess = roomMode === 'audio'
+      ? getAudioRoomPermissionState(room, authenticatedUserId, socketRoomId || req.params.roomId)
+      : null;
+    const canUpdateSettings = roomMode === 'audio'
+      ? !!audioAccess?.permissions?.canUpdateSettings
+      : String(authenticatedUserId) === hostId || isAssignedRoomController(socketRoomId || req.params.roomId, authenticatedUserId);
+    if (!canUpdateSettings) {
       return res.status(403).json({ success: false, message: 'Only the room host or room admin can update room settings.' });
+    }
+
+    const passwordChangeRequested = (
+      Object.prototype.hasOwnProperty.call(req.body || {}, 'roomPassword') ||
+      req.body?.unlockRoom === true
+    );
+    if (passwordChangeRequested && String(authenticatedUserId) !== hostId) {
+      return res.status(403).json({ success: false, message: 'Only the original room owner can change the room password.' });
     }
 
     const updates = buildRoomSettingsUpdate(req.body);
@@ -7518,7 +7852,7 @@ const removeUserRole = (user, role) => {
   user.roles = normalizeUserRoles(user).filter(item => item === 'user' || item !== clean);
 };
 
-const officialUserProjection = 'name email profilePic glixId role roles official accountStatus createdAt lastLogin chang daimon sentGiftCoins hostStatus agencyStatus coinSellerStatus sellerBalance sellerTotalSold adminNote';
+const officialUserProjection = 'name email profilePic frameUrl glixId role roles official accountStatus createdAt lastLogin chang daimon sentGiftCoins hostStatus agencyStatus coinSellerStatus sellerBalance sellerTotalSold adminNote';
 const officialAccountProjection = 'name email role status permissions sourceUserId note rejectionReason createdBy reviewedBy reviewedAt createdAt updatedAt lastLogin';
 
 const serializeOfficialUser = (user) => {
@@ -8997,6 +9331,86 @@ app.patch('/admin/users/:userId', requireOfficial, async (req, res) => {
     const user = await User.findByIdAndUpdate(req.params.userId, write, { new: true, runValidators: true }).select(officialUserProjection);
     if (!user) return res.status(404).json({ success: false, message: 'User not found' });
     return res.json({ success: true, user });
+  } catch (error) {
+    return res.status(500).json({ success: false, message: error.message });
+  }
+});
+
+app.patch('/admin/users/:userId/equipped-frame', requireOfficial, async (req, res) => {
+  try {
+    const { userId } = req.params;
+    const requestedFrameItemId = String(req.body?.frameItemId || '').trim();
+    if (!mongoose.Types.ObjectId.isValid(userId)) {
+      return res.status(400).json({ success: false, message: 'Invalid user id' });
+    }
+
+    const targetUser = await User.findById(userId).select('_id');
+    if (!targetUser) return res.status(404).json({ success: false, message: 'User not found' });
+
+    let frameItem = null;
+    let frameUrl = '';
+
+    if (requestedFrameItemId) {
+      if (!mongoose.Types.ObjectId.isValid(requestedFrameItemId)) {
+        return res.status(400).json({ success: false, message: 'Invalid Store frame id' });
+      }
+
+      frameItem = await StoreItem.findOne({
+        _id: requestedFrameItemId,
+        type: 'frame',
+        isActive: true,
+      });
+      if (!frameItem) {
+        return res.status(404).json({ success: false, message: 'Active Store frame not found' });
+      }
+
+      frameUrl = getStoreFrameUrl(frameItem);
+      if (!frameUrl) {
+        return res.status(400).json({ success: false, message: 'This Store frame has no usable frame asset' });
+      }
+    }
+
+    await UserStoreItem.updateMany(
+      { userId, type: 'frame' },
+      { $set: { isEquipped: false } }
+    );
+
+    if (frameItem) {
+      await UserStoreItem.findOneAndUpdate(
+        { userId, itemKey: frameItem.itemKey },
+        {
+          $set: {
+            userId,
+            itemId: frameItem._id,
+            itemKey: frameItem.itemKey,
+            type: frameItem.type,
+            startedAt: new Date(),
+            expiresAt: getStoreExpiry(frameItem),
+            isEquipped: true,
+          },
+        },
+        { upsert: true, new: true, runValidators: true }
+      );
+    }
+
+    const user = await User.findByIdAndUpdate(
+      userId,
+      { $set: { frameUrl } },
+      { new: true, runValidators: true }
+    ).select(officialUserProjection);
+
+    await syncUserFrameToRoomSlots(userId, frameUrl, frameItem?._id || null);
+
+    return res.json({
+      success: true,
+      user: serializeOfficialUser(user),
+      frame: frameItem ? {
+        _id: frameItem._id,
+        itemKey: frameItem.itemKey,
+        name: frameItem.name,
+        frameUrl,
+      } : null,
+    });
   } catch (error) {
     return res.status(500).json({ success: false, message: error.message });
   }
