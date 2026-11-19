@@ -48,6 +48,8 @@ const audioRoomSchema = new mongoose.Schema({
   enablePublicChat: { type: Boolean, default: true },
   autoEmojiEnabled: { type: Boolean, default: false },
 
+  administrators: [{ type: mongoose.Schema.Types.ObjectId, ref: 'User' }],
+
   isPermanent: { type: Boolean, default: false, index: true },
   visibility: {
     type: String,
@@ -57,10 +59,23 @@ const audioRoomSchema = new mongoose.Schema({
   },
 
   isLive: { type: Boolean, default: true },
+  liveSessionId: { type: String, default: null, index: true },
+  liveStartedAt: { type: Date, default: null },
+  liveEndedAt: { type: Date, default: null },
+  gracePeriodEndsAt: { type: Date, default: null },
   lastHeartbeatAt: { type: Date, default: Date.now },
   endedAt: { type: Date, default: null },
   createdAt: { type: Date, default: Date.now },
 });
+
+audioRoomSchema.index(
+  { hostId: 1, isPermanent: 1 },
+  {
+    unique: true,
+    partialFilterExpression: { isPermanent: true },
+    name: 'one_permanent_audio_room_per_host'
+  }
+);
 
 const AudioRoom = mongoose.model('AudioRoom', audioRoomSchema);
 

@@ -208,31 +208,64 @@ const buildPermanentAudioRoomTitle = (user = {}) => {
   return name ? `${name}'s Room` : 'My Voice Room';
 };
 
+const createAudioLiveSessionId = () => (
+  typeof crypto.randomUUID === 'function'
+    ? crypto.randomUUID()
+    : crypto.randomBytes(16).toString('hex')
+);
+
+const activateAudioRoomLiveSession = (room, now = new Date()) => {
+  const startedNewSession = !room.isLive;
+
+  if (startedNewSession) {
+    room.liveSessionId = createAudioLiveSessionId();
+    room.liveStartedAt = now;
+    room.liveEndedAt = null;
+    room.gracePeriodEndsAt = null;
+    room.endedAt = null;
+    room.speakers = [];
+    room.audience = [];
+    room.activeGamePlayers = [];
+  } else if (!room.liveSessionId) {
+    room.liveSessionId = createAudioLiveSessionId();
+    room.liveStartedAt = room.liveStartedAt || room.createdAt || now;
+  }
+
+  room.isLive = true;
+  room.lastHeartbeatAt = now;
+  return startedNewSession;
+};
+
 const ensurePermanentAudioRoomForUser = async (userId) => {
   if (!mongoose.Types.ObjectId.isValid(userId)) return null;
 
   const user = await User.findById(userId).select('name profilePic glixId').lean();
   if (!user) return null;
 
-  let room = await AudioRoom.findOne({
-    hostId: userId,
-    isPermanent: true
-  }).sort({ createdAt: 1 });
-
-  if (!room) {
-    room = await AudioRoom.create({
-      title: buildPermanentAudioRoomTitle(user),
-      hostId: userId,
-      speakers: [],
-      audience: [],
-      lockedSlots: [3, 12, 19],
-      isPermanent: true,
-      visibility: 'followers',
-      isLive: false,
-      endedAt: null,
-      lastHeartbeatAt: new Date()
-    });
-  }
+  const room = await AudioRoom.findOneAndUpdate(
+    { hostId: userId, isPermanent: true },
+    {
+      $setOnInsert: {
+        title: buildPermanentAudioRoomTitle(user),
+        hostId: userId,
+        speakers: [],
+        audience: [],
+        activeGamePlayers: [],
+        lockedSlots: [3, 12, 19],
+        administrators: [],
+        isPermanent: true,
+        visibility: 'followers',
+        isLive: false,
+        liveSessionId: null,
+        liveStartedAt: null,
+        liveEndedAt: null,
+        gracePeriodEndsAt: null,
+        endedAt: null,
+        lastHeartbeatAt: new Date()
+      }
+    },
+    { new: true, upsert: true, setDefaultsOnInsert: true }
+  );
 
   return room;
 };
@@ -252,6 +285,10 @@ const serializePermanentAudioRoom = (room = {}) => {
     isPermanent: true,
     visibility: room.visibility || 'followers',
     isLive: !!room.isLive,
+    liveSessionId: room.liveSessionId || null,
+    liveStartedAt: room.liveStartedAt || null,
+    liveEndedAt: room.liveEndedAt || room.endedAt || null,
+    gracePeriodEndsAt: room.gracePeriodEndsAt || null,
     speakerCount: Array.isArray(room.speakers) ? room.speakers.length : 0,
     audienceCount: Array.isArray(room.audience) ? room.audience.length : 0,
     createdAt: room.createdAt,
@@ -394,7 +431,9 @@ const upsertRoomPresence = async ({ roomId, userId, socketId, name, profilePic, 
   const stringRoomId = getStringRoomId(roomId);
   if (!stringRoomId || !userId) return;
 
-  clearRoomEmptyAudienceTimer(stringRoomId);
+  if (stringRoomId.startsWith('glix_') || !roomKeepOpenRooms[stringRoomId]) {
+    clearRoomEmptyAudienceTimer(stringRoomId);
+  }
 
   const userKey = userId.toString();
   if (!roomPresence[stringRoomId]) roomPresence[stringRoomId] = {};
@@ -450,13 +489,103 @@ const removeRoomPresence = ({ roomId, userId, socketId }) => {
   emitRoomMembers(stringRoomId);
 };
 
-const closeKeptOpenAudioRoomIfNoAudience = async (roomId, reason = 'empty_audience') => {
+const clearAudioRoomDisconnectTimers = (roomId) => {
+  const stringRoomId = getStringRoomId(roomId);
+  if (!stringRoomId) return;
+
+  Array.from(roomDisconnectTimers.entries()).forEach(([key, timer]) => {
+    if (!key.startsWith(`${stringRoomId}:`)) return;
+    clearTimeout(timer);
+    roomDisconnectTimers.delete(key);
+  });
+};
+
+const cancelAudioRoomGracePeriod = async (roomId, expectedLiveSessionId = null) => {
+  const stringRoomId = getStringRoomId(roomId);
+  if (!mongoose.Types.ObjectId.isValid(stringRoomId)) return false;
+
+  clearRoomEmptyAudienceTimer(stringRoomId);
+  const query = { _id: stringRoomId, isLive: true };
+  if (expectedLiveSessionId) query.liveSessionId = expectedLiveSessionId;
+
+  const result = await AudioRoom.updateOne(query, { $set: { gracePeriodEndsAt: null } });
+  return (result?.matchedCount ?? result?.n ?? 0) > 0;
+};
+
+const markAudioRoomOffline = async ({
+  roomId,
+  reason = 'room_inactive',
+  message = 'The voice room is no longer live.',
+  expectedLiveSessionId = null,
+  notify = true,
+} = {}) => {
+  const stringRoomId = getStringRoomId(roomId);
+  if (!mongoose.Types.ObjectId.isValid(stringRoomId)) return false;
+
+  const endedAt = new Date();
+  const closeQuery = { _id: stringRoomId, isLive: true };
+  if (expectedLiveSessionId) closeQuery.liveSessionId = expectedLiveSessionId;
+
+  const room = await AudioRoom.findOneAndUpdate(
+    closeQuery,
+    {
+      $set: {
+        isLive: false,
+        speakers: [],
+        audience: [],
+        activeGamePlayers: [],
+        liveEndedAt: endedAt,
+        gracePeriodEndsAt: null,
+        endedAt,
+      }
+    },
+    { new: false }
+  );
+  if (!room) return false;
+
+  const endedLiveSessionId = room.liveSessionId || null;
+  await recordHostLiveSessionActivity({
+    hostId: room.hostId,
+    roomId: stringRoomId,
+    roomMode: 'audio',
+    startedAt: room.liveStartedAt || room.createdAt,
+    endedAt,
+  });
+
+  clearRoomEmptyAudienceTimer(stringRoomId);
+  clearAudioRoomDisconnectTimers(stringRoomId);
+  delete roomKeepOpenRooms[stringRoomId];
+  delete roomControllers[stringRoomId];
+  delete roomPresence[stringRoomId];
+  delete roomGamePlayers[stringRoomId];
+
+  if (notify) {
+    io.to(stringRoomId).emit('room_members_updated', []);
+    io.to(stringRoomId).emit('audio_room_ended', {
+      roomId: stringRoomId,
+      liveSessionId: endedLiveSessionId,
+      reason,
+      message,
+    });
+  }
+
+  const connectedSockets = await io.in(stringRoomId).fetchSockets();
+  connectedSockets.forEach(connectedSocket => {
+    if (String(connectedSocket.roomId || '') === stringRoomId) connectedSocket.roomId = null;
+    connectedSocket.leave(stringRoomId);
+  });
+
+  return true;
+};
+
+const closeKeptOpenAudioRoomIfNoAudience = async (roomId, reason = 'empty_audience', expectedLiveSessionId = null) => {
   const stringRoomId = getStringRoomId(roomId);
   if (!stringRoomId || stringRoomId.startsWith('glix_') || !roomKeepOpenRooms[stringRoomId]) return false;
   if (!mongoose.Types.ObjectId.isValid(stringRoomId)) return false;
 
-  const room = await AudioRoom.findById(stringRoomId).select('hostId isLive speakers audience createdAt');
+  const room = await AudioRoom.findById(stringRoomId).select('hostId isLive liveSessionId speakers audience createdAt');
   if (!room || !room.isLive) return false;
+  if (expectedLiveSessionId && String(room.liveSessionId || '') !== String(expectedLiveSessionId)) return false;
 
   const hostId = room.hostId ? room.hostId.toString() : '';
   const livePresenceUsers = Object.values(roomPresence[stringRoomId] || {})
@@ -469,56 +598,58 @@ const closeKeptOpenAudioRoomIfNoAudience = async (roomId, reason = 'empty_audien
     : [];
   const hasGamePlayers = await hasFreshAudioRoomGamePlayers(stringRoomId);
 
-  if (livePresenceUsers.length || dbAudience.length || dbSpeakers.length || hasGamePlayers) return false;
+  if (livePresenceUsers.length || dbAudience.length || dbSpeakers.length || hasGamePlayers) {
+    await cancelAudioRoomGracePeriod(stringRoomId, room.liveSessionId);
+    return false;
+  }
 
-  room.isLive = false;
-  room.speakers = [];
-  room.audience = [];
-  room.endedAt = new Date();
-  await room.save();
-
-  clearRoomEmptyAudienceTimer(stringRoomId);
-  delete roomKeepOpenRooms[stringRoomId];
-  delete roomControllers[stringRoomId];
-  delete roomPresence[stringRoomId];
-
-  io.to(stringRoomId).emit('room_members_updated', []);
-  io.to(stringRoomId).emit('audio_room_ended', {
+  await markAudioRoomOffline({
+    roomId: stringRoomId,
     reason,
-    message: 'The voice room closed because no audience is left.'
+    expectedLiveSessionId: room.liveSessionId,
+    message: 'The voice room closed because no audience is left.',
   });
 
   console.log(`Kept-open audio room closed because no audience is left: ${stringRoomId}`);
   return true;
 };
 
-const scheduleKeptOpenAudioRoomEmptyCheck = (roomId, reason = 'empty_audience') => {
+const scheduleKeptOpenAudioRoomEmptyCheck = (roomId, reason = 'empty_audience', expectedLiveSessionId = null, delayMs = KEPT_OPEN_EMPTY_AUDIENCE_GRACE_MS) => {
   const stringRoomId = getStringRoomId(roomId);
   if (!stringRoomId || stringRoomId.startsWith('glix_') || !roomKeepOpenRooms[stringRoomId]) return false;
   if (!mongoose.Types.ObjectId.isValid(stringRoomId)) return false;
 
   clearRoomEmptyAudienceTimer(stringRoomId);
 
+  const liveSessionId = expectedLiveSessionId || roomKeepOpenRooms[stringRoomId]?.liveSessionId || null;
+  const gracePeriodEndsAt = new Date(Date.now() + Math.max(0, delayMs));
+  const graceQuery = { _id: stringRoomId, isLive: true };
+  if (liveSessionId) graceQuery.liveSessionId = liveSessionId;
+  AudioRoom.updateOne(graceQuery, { $set: { gracePeriodEndsAt } }).catch(error => {
+    console.log('Unable to persist audio room grace period:', error);
+  });
+
   const timer = setTimeout(async () => {
     roomEmptyAudienceTimers.delete(stringRoomId);
     try {
-      await closeKeptOpenAudioRoomIfNoAudience(stringRoomId, reason);
+      await closeKeptOpenAudioRoomIfNoAudience(stringRoomId, reason, liveSessionId);
     } catch (error) {
       console.log('Delayed kept-open audio room empty check error:', error);
     }
-  }, KEPT_OPEN_EMPTY_AUDIENCE_GRACE_MS);
+  }, Math.max(0, delayMs));
 
   roomEmptyAudienceTimers.set(stringRoomId, timer);
   return true;
 };
 
-const closeKeptOpenAudioRoomIfNoMicOrGame = async (roomId, reason = 'empty_mic_and_game') => {
+const closeKeptOpenAudioRoomIfNoMicOrGame = async (roomId, reason = 'empty_mic_and_game', expectedLiveSessionId = null) => {
   const stringRoomId = getStringRoomId(roomId);
   if (!stringRoomId || stringRoomId.startsWith('glix_') || !roomKeepOpenRooms[stringRoomId]) return false;
   if (!mongoose.Types.ObjectId.isValid(stringRoomId)) return false;
 
-  const room = await AudioRoom.findById(stringRoomId).select('hostId isLive speakers audience createdAt');
+  const room = await AudioRoom.findById(stringRoomId).select('hostId isLive liveSessionId liveStartedAt speakers audience createdAt');
   if (!room || !room.isLive) return false;
+  if (expectedLiveSessionId && String(room.liveSessionId || '') !== String(expectedLiveSessionId)) return false;
 
   const hostId = room.hostId ? room.hostId.toString() : '';
   const dbSpeakers = Array.isArray(room.speakers)
@@ -526,61 +657,54 @@ const closeKeptOpenAudioRoomIfNoMicOrGame = async (roomId, reason = 'empty_mic_a
     : [];
   const hasGamePlayers = await hasFreshAudioRoomGamePlayers(stringRoomId);
 
-  if (dbSpeakers.length || hasGamePlayers) return false;
+  if (dbSpeakers.length || hasGamePlayers) {
+    await cancelAudioRoomGracePeriod(stringRoomId, room.liveSessionId);
+    return false;
+  }
 
-  await recordHostLiveSessionActivity({
-    hostId: room.hostId,
+  await markAudioRoomOffline({
     roomId: stringRoomId,
-    roomMode: 'audio',
-    startedAt: room.createdAt,
-    endedAt: new Date()
-  });
-
-  room.isLive = false;
-  room.speakers = [];
-  room.audience = [];
-  room.endedAt = new Date();
-  await room.save();
-
-  clearRoomEmptyAudienceTimer(stringRoomId);
-  delete roomKeepOpenRooms[stringRoomId];
-  delete roomControllers[stringRoomId];
-  delete roomPresence[stringRoomId];
-
-  io.to(stringRoomId).emit('room_members_updated', []);
-  io.to(stringRoomId).emit('audio_room_ended', {
     reason,
-    message: 'The voice room closed because no mic users or game players are left.'
+    expectedLiveSessionId: room.liveSessionId,
+    message: 'The voice room closed because no mic users or game players are left.',
   });
 
   console.log(`Kept-open audio room closed because no mic users or game players remain: ${stringRoomId}`);
   return true;
 };
 
-const scheduleKeptOpenAudioRoomMicGameCheck = (roomId, reason = 'empty_mic_and_game') => {
+const scheduleKeptOpenAudioRoomMicGameCheck = (roomId, reason = 'empty_mic_and_game', expectedLiveSessionId = null, delayMs = KEPT_OPEN_EMPTY_AUDIENCE_GRACE_MS) => {
   const stringRoomId = getStringRoomId(roomId);
   if (!stringRoomId || stringRoomId.startsWith('glix_') || !roomKeepOpenRooms[stringRoomId]) return false;
   if (!mongoose.Types.ObjectId.isValid(stringRoomId)) return false;
 
   clearRoomEmptyAudienceTimer(stringRoomId);
 
+  const liveSessionId = expectedLiveSessionId || roomKeepOpenRooms[stringRoomId]?.liveSessionId || null;
+  const gracePeriodEndsAt = new Date(Date.now() + Math.max(0, delayMs));
+  const graceQuery = { _id: stringRoomId, isLive: true };
+  if (liveSessionId) graceQuery.liveSessionId = liveSessionId;
+  AudioRoom.updateOne(graceQuery, { $set: { gracePeriodEndsAt } }).catch(error => {
+    console.log('Unable to persist audio room grace period:', error);
+  });
+
   const timer = setTimeout(async () => {
     roomEmptyAudienceTimers.delete(stringRoomId);
     try {
-      await closeKeptOpenAudioRoomIfNoMicOrGame(stringRoomId, reason);
+      await closeKeptOpenAudioRoomIfNoMicOrGame(stringRoomId, reason, liveSessionId);
     } catch (error) {
       console.log('Delayed kept-open audio room mic/game check error:', error);
     }
-  }, KEPT_OPEN_EMPTY_AUDIENCE_GRACE_MS);
+  }, Math.max(0, delayMs));
 
   roomEmptyAudienceTimers.set(stringRoomId, timer);
   return true;
 };
 
-const scheduleKeptOpenAudioRoomCloseCheck = (roomId, reason = 'empty_room') => (
+const scheduleKeptOpenAudioRoomCloseCheck = (roomId, reason = 'empty_room', expectedLiveSessionId = null, delayMs = KEPT_OPEN_EMPTY_AUDIENCE_GRACE_MS) => (
   roomKeepOpenRooms[getStringRoomId(roomId)]?.closeWhen === 'no_mic_or_game'
-    ? scheduleKeptOpenAudioRoomMicGameCheck(roomId, reason)
-    : scheduleKeptOpenAudioRoomEmptyCheck(roomId, reason)
+    ? scheduleKeptOpenAudioRoomMicGameCheck(roomId, reason, expectedLiveSessionId, delayMs)
+    : scheduleKeptOpenAudioRoomEmptyCheck(roomId, reason, expectedLiveSessionId, delayMs)
 );
 
 const LIVE_ROOM_STALE_MS = 5 * 60 * 1000;
@@ -719,7 +843,11 @@ const updateRoomGamePlayerPresence = async (payload = {}, socketContext = {}, ac
     lastHeartbeatAt: nowMs,
   };
 
-  clearRoomEmptyAudienceTimer(stringRoomId);
+  if (isVideoRoom) {
+    clearRoomEmptyAudienceTimer(stringRoomId);
+  } else {
+    await cancelAudioRoomGracePeriod(stringRoomId);
+  }
 
   if (isVideoRoom) {
     const videoFilter = getVideoRoomFilter(stringRoomId);
@@ -812,8 +940,8 @@ const resolveAgoraRoomChannel = async (roomId) => {
   }
 
   if (mongoose.Types.ObjectId.isValid(stringRoomId)) {
-    const audioRoom = await AudioRoom.findById(stringRoomId).select('_id hostId').lean();
-    if (audioRoom?._id) {
+    const audioRoom = await AudioRoom.findById(stringRoomId).select('_id hostId isLive liveSessionId').lean();
+    if (audioRoom?._id && audioRoom.isLive) {
       return {
         room: audioRoom,
         roomMode: 'audio',
@@ -844,7 +972,7 @@ const closeStaleLiveRooms = async () => {
   };
 
   const [staleAudioRooms, staleVideoRooms] = await Promise.all([
-    AudioRoom.find(staleFilter).select('_id hostId createdAt').lean(),
+    AudioRoom.find(staleFilter).select('_id hostId liveSessionId liveStartedAt createdAt').lean(),
     Room.find(staleFilter).select('_id channelName hostId createdAt').lean()
   ]);
 
@@ -859,9 +987,60 @@ const closeStaleLiveRooms = async () => {
   ]);
 
   await Promise.all([
-    AudioRoom.updateMany(staleFilter, { $set: { isLive: false, speakers: [], audience: [], endedAt: now } }),
+    ...staleAudioRooms.map(room => markAudioRoomOffline({
+      roomId: room._id,
+      reason: 'stale_live_session',
+      message: 'The voice room closed because its live session expired.',
+      expectedLiveSessionId: room.liveSessionId || null,
+    })),
     Room.updateMany(staleFilter, { $set: { isLive: false, endedAt: now } })
   ]);
+};
+
+const recoverAudioRoomGracePeriods = async () => {
+  const rooms = await AudioRoom.find({
+    isLive: true
+  }).select('_id hostId speakers activeGamePlayers liveSessionId gracePeriodEndsAt').lean();
+
+  for (const room of rooms) {
+    const stringRoomId = room._id.toString();
+    const hostId = room.hostId?.toString?.() || String(room.hostId || '');
+    const hostIsOnMic = (room.speakers || []).some(
+      speaker => String(speaker?.userId || '') === hostId
+    );
+    if (hostIsOnMic) continue;
+
+    roomKeepOpenRooms[stringRoomId] = {
+      userId: hostId,
+      controllerUserId: null,
+      controllerUid: null,
+      roomMode: 'audio',
+      closeWhen: 'no_mic_or_game',
+      liveSessionId: room.liveSessionId || null,
+      updatedAt: Date.now(),
+    };
+
+    if (room.gracePeriodEndsAt && !roomEmptyAudienceTimers.has(stringRoomId)) {
+      const remainingMs = Math.max(0, new Date(room.gracePeriodEndsAt).getTime() - Date.now());
+      scheduleKeptOpenAudioRoomCloseCheck(
+        stringRoomId,
+        'recovered_grace_period',
+        room.liveSessionId || null,
+        remainingMs
+      );
+      continue;
+    }
+
+    const hasMicUsers = (room.speakers || []).some(speaker => speaker?.userId);
+    const hasGamePlayers = await hasFreshAudioRoomGamePlayers(stringRoomId);
+    if (!hasMicUsers && !hasGamePlayers) {
+      scheduleKeptOpenAudioRoomCloseCheck(
+        stringRoomId,
+        'recovered_inactive_host_away_room',
+        room.liveSessionId || null
+      );
+    }
+  }
 };
 
 const createCleanSlotsBlueprint = () => Array.from({ length: 25 }, (_, i) => ({
@@ -1033,7 +1212,7 @@ const reserveAudioMicSlot = async ({ roomId, userId, slotIndex, numericUid, isMu
     ],
     {
       new: true,
-      projection: 'lockedSlots speakers hostId micSeatCount'
+      projection: 'lockedSlots speakers hostId micSeatCount liveSessionId'
     }
   ).lean();
 
@@ -1041,6 +1220,8 @@ const reserveAudioMicSlot = async ({ roomId, userId, slotIndex, numericUid, isMu
     const failure = await getAudioMicSlotFailure(roomObjectId, userObjectId, normalizedSlotIndex);
     return { ok: false, ...failure };
   }
+
+  await cancelAudioRoomGracePeriod(roomId, room.liveSessionId || null);
 
   return {
     ok: true,
@@ -1801,6 +1982,7 @@ const processAudioRoomHostExit = async ({ roomId, requesterId, socketId = null }
   if (!room.hostId || String(room.hostId) !== cleanRequesterId) {
     return { success: false, message: 'Only the room host can use host exit.' };
   }
+  activateAudioRoomLiveSession(room);
 
   const remainingSpeakers = (Array.isArray(room.speakers) ? room.speakers : [])
     .filter(speaker => speaker?.userId && String(speaker.userId) !== cleanRequesterId);
@@ -1810,44 +1992,6 @@ const processAudioRoomHostExit = async ({ roomId, requesterId, socketId = null }
   const transferSpeaker = remainingSpeakers[remainingSpeakers.length - 1] || null;
   const controllerUserId = transferSpeaker?.userId?.toString?.() || String(transferSpeaker?.userId || '');
   const controllerUid = transferSpeaker?.numericUid ?? transferSpeaker?.uid ?? null;
-
-  if (!remainingSpeakers.length && !hasGamePlayers) {
-    await recordHostLiveSessionActivity({
-      hostId: room.hostId,
-      roomId: stringRoomId,
-      roomMode: 'audio',
-      startedAt: room.createdAt,
-      endedAt: new Date()
-    });
-
-    room.isLive = false;
-    room.speakers = [];
-    room.audience = [];
-    room.endedAt = new Date();
-    await room.save();
-
-    clearRoomDisconnectTimer(stringRoomId, cleanRequesterId);
-    clearRoomEmptyAudienceTimer(stringRoomId);
-    removeRoomPresence({ roomId: stringRoomId, userId: cleanRequesterId, socketId });
-    delete roomKeepOpenRooms[stringRoomId];
-    delete roomControllers[stringRoomId];
-
-    const closeMessage = 'This voice room closed because no mic users or game players are left.';
-    io.to(stringRoomId).emit('room_members_updated', []);
-    io.to(stringRoomId).emit('audio_room_ended', {
-      reason: 'empty_mic_and_game',
-      message: closeMessage
-    });
-
-    return {
-      success: true,
-      keptOpen: false,
-      closed: true,
-      hasMicUsers: false,
-      hasGamePlayers: false,
-      message: closeMessage,
-    };
-  }
 
   const controllerProfile = controllerUserId
     ? await User.findById(controllerUserId).select('name profilePic frameUrl').lean()
@@ -1866,6 +2010,8 @@ const processAudioRoomHostExit = async ({ roomId, requesterId, socketId = null }
   room.speakers = remainingSpeakers;
   room.audience = remainingAudience;
   room.lastHeartbeatAt = new Date();
+  room.liveEndedAt = null;
+  room.gracePeriodEndsAt = null;
   room.endedAt = null;
   await room.save();
 
@@ -1875,6 +2021,7 @@ const processAudioRoomHostExit = async ({ roomId, requesterId, socketId = null }
     controllerUid,
     roomMode: 'audio',
     closeWhen: 'no_mic_or_game',
+    liveSessionId: room.liveSessionId || null,
     updatedAt: Date.now(),
   };
 
@@ -1891,6 +2038,7 @@ const processAudioRoomHostExit = async ({ roomId, requesterId, socketId = null }
     transferToUserId: controllerUserId || null,
     transferToUid: controllerUid,
     controller,
+    liveSessionId: room.liveSessionId || null,
     message: controller
       ? 'Room is staying open. Control moved to another mic user.'
       : hasGamePlayers
@@ -1903,13 +2051,19 @@ const processAudioRoomHostExit = async ({ roomId, requesterId, socketId = null }
   io.to(stringRoomId).emit('room_controller_changed', transferPayload);
   await emitRoomSlotsSnapshot(stringRoomId);
   await emitRoomStats(stringRoomId);
-  scheduleKeptOpenAudioRoomCloseCheck(stringRoomId, 'host_exit_ack');
+  if (!remainingSpeakers.length && !hasGamePlayers) {
+    scheduleKeptOpenAudioRoomCloseCheck(stringRoomId, 'host_exit_ack', room.liveSessionId || null);
+  } else {
+    await cancelAudioRoomGracePeriod(stringRoomId, room.liveSessionId || null);
+  }
 
   return {
     success: true,
     keptOpen: true,
     hasMicUsers: remainingSpeakers.length > 0,
     hasGamePlayers,
+    closingAfterGrace: !remainingSpeakers.length && !hasGamePlayers,
+    liveSessionId: room.liveSessionId || null,
     controller,
   };
 };
@@ -2002,11 +2156,30 @@ io.on('connection', (socket) => {
       const joinerLevel = calculateUserLevelValue(joinerSentGiftCoins);
 
       const stringRoomId = roomId ? roomId.toString() : '';
+      const isVideoRoom = stringRoomId.startsWith('glix_');
+      let audioRoomSession = null;
+      if (!isVideoRoom) {
+        if (!mongoose.Types.ObjectId.isValid(stringRoomId)) {
+          socket.emit('error_notice', { message: 'Audio room is not available.' });
+          return;
+        }
+        audioRoomSession = await AudioRoom.findById(stringRoomId).select('hostId isLive liveSessionId').lean();
+        if (!audioRoomSession?.isLive) {
+          socket.emit('audio_room_ended', {
+            roomId: stringRoomId,
+            reason: 'room_offline',
+            message: 'This voice room is currently offline.'
+          });
+          return;
+        }
+      }
+
       socket.join(stringRoomId);
       socket.roomId = stringRoomId;
       joinUserSocketRoom(socket, userId);
       socket.userName = finalJoinName;
       const hadReconnectTimer = clearRoomDisconnectTimer(stringRoomId, userId);
+      const hadExistingRoomPresence = !!roomPresence[stringRoomId]?.[userId?.toString?.() || String(userId || '')];
 
       await upsertRoomPresence({
         roomId: stringRoomId,
@@ -2019,15 +2192,13 @@ io.on('connection', (socket) => {
 
       // Map connection instance to verify host mappings directly on requests.
 
-      const isVideoRoom = stringRoomId.startsWith('glix_');
       let joinedRoomHostId = '';
 
       if (isVideoRoom) {
         const videoRoom = await Room.findOne(getVideoRoomFilter(stringRoomId)).select('hostId').lean();
         joinedRoomHostId = videoRoom?.hostId?.toString?.() || String(videoRoom?.hostId || '');
       } else if (mongoose.Types.ObjectId.isValid(stringRoomId)) {
-        const audioRoom = await AudioRoom.findById(stringRoomId).select('hostId').lean();
-        joinedRoomHostId = audioRoom?.hostId?.toString?.() || String(audioRoom?.hostId || '');
+        joinedRoomHostId = audioRoomSession?.hostId?.toString?.() || String(audioRoomSession?.hostId || '');
       }
 
       const isJoiningRoomHost = joinedRoomHostId && String(joinedRoomHostId) === String(userId || '');
@@ -2038,10 +2209,10 @@ io.on('connection', (socket) => {
         });
       }
 
-      if (isJoiningRoomHost && roomKeepOpenRooms[stringRoomId] && roomKeepOpenRooms[stringRoomId]?.closeWhen !== 'no_mic_or_game') {
+      if (isJoiningRoomHost && roomKeepOpenRooms[stringRoomId]) {
         delete roomKeepOpenRooms[stringRoomId];
         delete roomControllers[stringRoomId];
-        clearRoomEmptyAudienceTimer(stringRoomId);
+        await cancelAudioRoomGracePeriod(stringRoomId, audioRoomSession?.liveSessionId || null);
 
         io.to(stringRoomId).emit('host_control_restored', {
           roomId: stringRoomId,
@@ -2061,25 +2232,31 @@ io.on('connection', (socket) => {
 
       const finalEntryVideoUrl = userData?.entryVideoUrl || entryVideoUrl || null;
 
-      socket.to(stringRoomId).emit('user_joined_channel', {
-        userId,
-        name: finalJoinName,
-        profilePic: finalJoinProfilePic,
-        avatar: finalJoinProfilePic,
-        avatarUrl: finalJoinProfilePic,
-        entryVideoUrl: finalEntryVideoUrl,
-        frameUrl: frameUrl || null,
-        daimon: joinerDaimon,
-        level: joinerLevel,
-        user: {
+      if (!hadExistingRoomPresence) {
+        io.to(stringRoomId).emit('user_joined_channel', {
+          userId,
+          name: finalJoinName,
+          profilePic: finalJoinProfilePic,
+          avatar: finalJoinProfilePic,
+          avatarUrl: finalJoinProfilePic,
+          entryVideoUrl: finalEntryVideoUrl,
+          liveSessionId: audioRoomSession?.liveSessionId || null,
+          frameUrl: frameUrl || null,
           daimon: joinerDaimon,
-          level: joinerLevel
-        },
-        message: `${finalJoinName} entered the room.`
-      });
+          level: joinerLevel,
+          user: {
+            daimon: joinerDaimon,
+            level: joinerLevel
+          },
+          message: `${finalJoinName} entered the room.`
+        });
+      }
 
       if (finalEntryVideoUrl) {
-        socket.emit('play_my_own_entry_effect', { entryVideoUrl: finalEntryVideoUrl });
+        socket.emit('play_my_own_entry_effect', {
+          entryVideoUrl: finalEntryVideoUrl,
+          liveSessionId: audioRoomSession?.liveSessionId || null,
+        });
       }
 
       let completeLayoutMatrix = createCleanSlotsBlueprint();
@@ -2501,6 +2678,27 @@ io.on('connection', (socket) => {
     const isVideoRoom =
       stringRoomId.startsWith('glix_');
 
+    let audioRoomState = null;
+    let hasAudioMicOrGameActivity = false;
+    if (!isVideoRoom && mongoose.Types.ObjectId.isValid(stringRoomId)) {
+      audioRoomState = await AudioRoom.findById(stringRoomId);
+      if (!audioRoomState || !audioRoomState.isLive) return;
+
+      activateAudioRoomLiveSession(audioRoomState);
+      if (requesterId && String(audioRoomState.hostId || '') === String(requesterId)) {
+        audioRoomState.speakers = (audioRoomState.speakers || [])
+          .filter(speaker => String(speaker?.userId || '') !== String(requesterId));
+        audioRoomState.audience = (audioRoomState.audience || [])
+          .filter(userId => String(userId || '') !== String(requesterId));
+      }
+      audioRoomState.gracePeriodEndsAt = null;
+      await audioRoomState.save();
+
+      const hasMicUsers = (audioRoomState.speakers || []).some(speaker => speaker?.userId);
+      const hasGamePlayers = await hasFreshAudioRoomGamePlayers(stringRoomId);
+      hasAudioMicOrGameActivity = hasMicUsers || hasGamePlayers;
+    }
+
     // Host seat sent from frontend.
     // Fallback = slot 0
     const hostSlotIndex =
@@ -2529,6 +2727,14 @@ io.on('connection', (socket) => {
         isVideoRoom
           ? 'video'
           : 'audio',
+
+      closeWhen:
+        isVideoRoom
+          ? undefined
+          : 'no_mic_or_game',
+
+      liveSessionId:
+        audioRoomState?.liveSessionId || null,
 
       hostAway: true,
 
@@ -2610,6 +2816,9 @@ io.on('connection', (socket) => {
         roomControllers[stringRoomId] ||
         controller ||
         null,
+
+      liveSessionId:
+        audioRoomState?.liveSessionId || null,
 
       message:
         controllerUserId ||
@@ -2737,6 +2946,18 @@ io.on('connection', (socket) => {
       stringRoomId
     );
 
+    if (!isVideoRoom && audioRoomState) {
+      if (hasAudioMicOrGameActivity) {
+        await cancelAudioRoomGracePeriod(stringRoomId, audioRoomState.liveSessionId || null);
+      } else {
+        scheduleKeptOpenAudioRoomCloseCheck(
+          stringRoomId,
+          'host_leave_keep_room_open',
+          audioRoomState.liveSessionId || null
+        );
+      }
+    }
+
   } catch (error) {
 
     console.log(
@@ -2801,6 +3022,8 @@ io.on('connection', (socket) => {
     const controller = roomControllers[stringRoomId] || null;
     const actorIsHost = !!room && String(room.hostId || '') === String(actorId || '');
     const actorIsController = isAssignedRoomController(stringRoomId, actorId, socket.numericUid);
+    const actorIsPersistentAdmin = !isVideoRoom && Array.isArray(room?.administrators)
+      && room.administrators.some(adminId => String(adminId || '') === String(actorId || ''));
     console.log('[RoomAdmin][Backend][permission-check]', {
       roomId: stringRoomId,
       requesterId,
@@ -2812,11 +3035,12 @@ io.on('connection', (socket) => {
       controller,
       actorIsHost,
       actorIsController,
-      allowed: !!room && (actorIsHost || actorIsController),
+      actorIsPersistentAdmin,
+      allowed: !!room && (actorIsHost || actorIsController || actorIsPersistentAdmin),
     });
 
     return {
-      allowed: !!room && (actorIsHost || actorIsController),
+      allowed: !!room && (actorIsHost || actorIsController || actorIsPersistentAdmin),
       isHost: actorIsHost,
       isController: actorIsController,
       stringRoomId,
@@ -2897,6 +3121,12 @@ io.on('connection', (socket) => {
         targetSlotIndex,
       };
       roomControllers[stringRoomId] = controller;
+      if (mode === 'audio' && mongoose.Types.ObjectId.isValid(targetUserId)) {
+        await AudioRoom.updateOne(
+          { _id: stringRoomId, isLive: true },
+          { $addToSet: { administrators: targetUserId } }
+        );
+      }
       console.log('[RoomAdmin][Backend][assign-broadcast]', {
         mode,
         roomId: stringRoomId,
@@ -3972,7 +4202,14 @@ io.on('connection', (socket) => {
 
       if (!mongoose.Types.ObjectId.isValid(stringRoomId)) return;
       await AudioRoom.updateOne(
-        { _id: stringRoomId, hostId: userId, isLive: true },
+        {
+          _id: stringRoomId,
+          isLive: true,
+          $or: [
+            { hostId: userId },
+            { speakers: { $elemMatch: { userId } } }
+          ]
+        },
         { $set: { lastHeartbeatAt: now } }
       );
     } catch (error) {
@@ -4230,6 +4467,8 @@ io.on('connection', (socket) => {
 
             const latestRoom = await AudioRoom.findById(roomId);
             if (!latestRoom || latestRoom.hostId?.toString() !== currentUserId) return;
+            if (!latestRoom.isLive) return;
+            activateAudioRoomLiveSession(latestRoom);
 
             const remainingSpeakers = (Array.isArray(latestRoom.speakers) ? latestRoom.speakers : [])
               .filter(speaker => speaker?.userId && String(speaker.userId) !== currentUserId);
@@ -4262,6 +4501,8 @@ io.on('connection', (socket) => {
                 controllerUserId,
                 controllerUid,
                 roomMode: 'audio',
+                closeWhen: 'no_mic_or_game',
+                liveSessionId: latestRoom.liveSessionId || null,
                 updatedAt: Date.now(),
               };
               roomControllers[roomId] = controller;
@@ -4281,7 +4522,7 @@ io.on('connection', (socket) => {
               io.to(roomId).emit('room_controller_changed', transferPayload);
               await emitRoomSlotsSnapshot(roomId);
               await emitRoomStats(roomId);
-              scheduleKeptOpenAudioRoomCloseCheck(roomId, 'host_disconnected_mic_users_remaining');
+              await cancelAudioRoomGracePeriod(roomId, latestRoom.liveSessionId || null);
               console.log(`Audio room kept open after host disconnect because mic users remain: ${roomId}`);
               return;
             }
@@ -4298,6 +4539,8 @@ io.on('connection', (socket) => {
                 controllerUserId: null,
                 controllerUid: null,
                 roomMode: 'audio',
+                closeWhen: 'no_mic_or_game',
+                liveSessionId: latestRoom.liveSessionId || null,
                 updatedAt: Date.now(),
               };
 
@@ -4311,7 +4554,7 @@ io.on('connection', (socket) => {
                 message: 'Room is staying open while a game is being played.',
               });
               await emitRoomStats(roomId);
-              scheduleKeptOpenAudioRoomCloseCheck(roomId, 'host_disconnected_game_players_remaining');
+              await cancelAudioRoomGracePeriod(roomId, latestRoom.liveSessionId || null);
               console.log(`Audio room kept open after host disconnect because game players remain: ${roomId}`);
               return;
             }
@@ -4332,6 +4575,8 @@ io.on('connection', (socket) => {
                 controllerUserId: null,
                 controllerUid: null,
                 roomMode: 'audio',
+                closeWhen: 'no_mic_or_game',
+                liveSessionId: latestRoom.liveSessionId || null,
                 updatedAt: Date.now(),
               };
 
@@ -4345,26 +4590,39 @@ io.on('connection', (socket) => {
                 message: 'Room is staying open while users are inside.',
               });
               await emitRoomStats(roomId);
-              scheduleKeptOpenAudioRoomCloseCheck(roomId, 'host_disconnected_users_remaining');
+              scheduleKeptOpenAudioRoomCloseCheck(
+                roomId,
+                'host_disconnected_users_remaining',
+                latestRoom.liveSessionId || null
+              );
               console.log(`Audio room kept open after host disconnect because audience remains: ${roomId}`);
               return;
             }
 
-            latestRoom.isLive = false;
+            latestRoom.isLive = true;
             latestRoom.speakers = [];
             latestRoom.audience = [];
-            latestRoom.endedAt = new Date();
-
+            latestRoom.lastHeartbeatAt = new Date();
+            latestRoom.liveEndedAt = null;
+            latestRoom.endedAt = null;
             await latestRoom.save();
-            clearRoomEmptyAudienceTimer(roomId);
-            delete roomKeepOpenRooms[roomId];
-            delete roomControllers[roomId];
 
-            io.to(roomId).emit('audio_room_ended', {
-              message: 'Host disconnected. Room closed.'
-            });
+            roomKeepOpenRooms[roomId] = {
+              userId: currentUserId,
+              controllerUserId: null,
+              controllerUid: null,
+              roomMode: 'audio',
+              closeWhen: 'no_mic_or_game',
+              liveSessionId: latestRoom.liveSessionId || null,
+              updatedAt: Date.now(),
+            };
+            scheduleKeptOpenAudioRoomCloseCheck(
+              roomId,
+              'host_disconnected_empty_room',
+              latestRoom.liveSessionId || null
+            );
 
-            console.log(`Audio room closed after reconnect grace expired: ${roomId}`);
+            console.log(`Audio room grace period started after host disconnect: ${roomId}`);
           } catch (error) {
             console.log('Audio room delayed disconnect cleanup error:', error);
           }
@@ -5155,19 +5413,51 @@ app.post('/create', async (req, res) => {
   try {
     const { title, hostId, numericUid } = req.body;
     const sanitizedUid = parseInt(numericUid, 10) || 0;
+    if (!mongoose.Types.ObjectId.isValid(hostId) || !sanitizedUid) {
+      return res.status(400).json({ success: false, error: 'Invalid audio room host.' });
+    }
     const hostUser = mongoose.Types.ObjectId.isValid(hostId)
       ? await User.findById(hostId).select('name profilePic frameUrl').lean()
       : null;
+    if (!hostUser) return res.status(404).json({ success: false, error: 'Host not found.' });
 
-    const newRoom = new AudioRoom({
-      title: title || "Live Audio Room",
-      hostId,
-      isLive: true,
-      speakers: [{ userId: hostId, username: hostUser?.name || '', avatar: hostUser?.profilePic || '', isMuted: false, slotIndex: 0, numericUid: sanitizedUid, frameUrl: hostUser?.frameUrl || null }],
-      audience: [],
-      lockedSlots: [3, 12, 19]
-    });
-    await newRoom.save();
+    const permanentRoom = await ensurePermanentAudioRoomForUser(hostId);
+    if (!permanentRoom) return res.status(500).json({ success: false, error: 'Unable to prepare permanent room.' });
+
+    const now = new Date();
+    const startedNewSession = activateAudioRoomLiveSession(permanentRoom, now);
+    const requestedTitle = String(title || '').trim();
+    if (requestedTitle) permanentRoom.title = requestedTitle.slice(0, 40);
+
+    const existingHostSpeaker = (permanentRoom.speakers || []).find(speaker => String(speaker?.userId || '') === String(hostId));
+    const otherSpeakers = (permanentRoom.speakers || []).filter(speaker => String(speaker?.userId || '') !== String(hostId));
+    const occupiedSlots = new Set(otherSpeakers.map(speaker => Number(speaker?.slotIndex)).filter(Number.isInteger));
+    const preferredHostSlot = Number(existingHostSpeaker?.slotIndex);
+    const hostSlotIndex = Number.isInteger(preferredHostSlot) && !occupiedSlots.has(preferredHostSlot)
+      ? preferredHostSlot
+      : !occupiedSlots.has(0)
+        ? 0
+        : Array.from({ length: Number(permanentRoom.micSeatCount || 15) }, (_, index) => index).find(index => !occupiedSlots.has(index));
+
+    permanentRoom.speakers = Number.isInteger(hostSlotIndex)
+      ? [{
+        userId: hostId,
+        username: hostUser.name || existingHostSpeaker?.username || '',
+        avatar: hostUser.profilePic || existingHostSpeaker?.avatar || '',
+        isMuted: existingHostSpeaker?.isMuted ?? false,
+        slotIndex: hostSlotIndex,
+        numericUid: sanitizedUid,
+        frameUrl: hostUser.frameUrl || existingHostSpeaker?.frameUrl || null,
+      }, ...otherSpeakers]
+      : otherSpeakers;
+    permanentRoom.audience = (permanentRoom.audience || []).filter(userId => String(userId || '') !== String(hostId));
+    permanentRoom.gracePeriodEndsAt = null;
+    await permanentRoom.save();
+
+    clearRoomEmptyAudienceTimer(permanentRoom._id);
+    clearRoomDisconnectTimer(permanentRoom._id, hostId);
+    delete roomKeepOpenRooms[permanentRoom._id.toString()];
+    delete roomControllers[permanentRoom._id.toString()];
 
     const appId = process.env.AGORA_APP_ID;
     const appCertificate = process.env.AGORA_APP_CERTIFICATE;
@@ -5175,17 +5465,18 @@ app.post('/create', async (req, res) => {
     const currentTimestamp = Math.floor(Date.now() / 1000);
     const privilegeExpiredTs = currentTimestamp + expirationTimeInSeconds;
 
-    const channelName = newRoom._id.toString();
+    const channelName = permanentRoom._id.toString();
     const token = RtcTokenBuilder.buildTokenWithUid(appId, appCertificate, channelName, sanitizedUid, RtcRole.PUBLISHER, privilegeExpiredTs);
 
     await recordRewardActivity(hostId, 'create_audio_room', { roomId: channelName });
 
     return res.status(201).json({
       success: true,
-      room: newRoom,
+      room: permanentRoom,
       agoraToken: token,
       channelName: channelName,
-      appId: appId
+      appId: appId,
+      startedNewSession,
     });
   } catch (error) {
     return res.status(500).json({ error: error.message });
@@ -5210,6 +5501,7 @@ app.post('/join', async (req, res) => {
     let isVideoRoom = false;
     let channelName = stringRoomId;
     let userRole = RtcRole.SUBSCRIBER;
+    let startedNewAudioSession = false;
 
     const videoFilter = getVideoRoomFilter(stringRoomId);
     if (videoFilter) {
@@ -5238,15 +5530,31 @@ app.post('/join', async (req, res) => {
         return res.status(403).json({ success: false, requiresPassword: true, message: 'Room password is required.' });
       }
       if (!roomObj.isLive && !roomObj.isPermanent) return res.status(400).json({ error: "This room has already ended" });
-      if (!roomObj.isLive && roomObj.isPermanent) {
-        roomObj.isLive = true;
-        roomObj.endedAt = null;
+      const isRoomOwner = String(roomObj.hostId) === String(userId);
+      if (!roomObj.isLive && !isRoomOwner) {
+        return res.status(409).json({
+          success: false,
+          roomOffline: true,
+          message: 'This voice room is currently offline.'
+        });
+      }
+
+      const startedNewSession = activateAudioRoomLiveSession(roomObj);
+      startedNewAudioSession = startedNewSession;
+      if (startedNewSession) {
+        clearRoomEmptyAudienceTimer(stringRoomId);
+        clearAudioRoomDisconnectTimers(stringRoomId);
+        delete roomKeepOpenRooms[stringRoomId];
+        delete roomControllers[stringRoomId];
+        delete roomPresence[stringRoomId];
+        delete roomGamePlayers[stringRoomId];
       }
 
       const currentSpeakers = Array.isArray(roomObj.speakers) ? roomObj.speakers : [];
       const currentAudience = Array.isArray(roomObj.audience) ? roomObj.audience : [];
-      const isRoomOwner = String(roomObj.hostId) === String(userId);
-      const isHostAwayOwner = isRoomOwner && String(roomKeepOpenRooms[stringRoomId]?.userId || '') === String(userId);
+      const isHostAwayOwner = isRoomOwner
+        && !startedNewSession
+        && !currentSpeakers.some(speaker => String(speaker?.userId || '') === String(userId));
       const validSpeakers = currentSpeakers.filter(s => {
         if (!s || !s.userId) return false;
         return !(isHostAwayOwner && String(s.userId) === String(userId));
@@ -5265,6 +5573,7 @@ app.post('/join', async (req, res) => {
       roomObj.speakers = validSpeakers;
       roomObj.audience = validAudience.filter(id => String(id) !== String(userId));
       roomObj.lastHeartbeatAt = new Date();
+      roomObj.gracePeriodEndsAt = null;
 
       if (isRoomOwner && !isHostAwayOwner) {
         const nonOwnerSpeakers = roomObj.speakers.filter(s => String(s.userId) !== String(userId));
@@ -5339,6 +5648,9 @@ app.post('/join', async (req, res) => {
       }
 
       await roomObj.save();
+      if (isRoomOwner || userRole === RtcRole.PUBLISHER) {
+        await cancelAudioRoomGracePeriod(stringRoomId, roomObj.liveSessionId || null);
+      }
       await emitRoomSlotsSnapshot(stringRoomId);
     }
 
@@ -5381,11 +5693,16 @@ app.post('/join', async (req, res) => {
         settings: serializeRoomSettings(roomObj),
         isPermanent: !!roomObj.isPermanent,
         visibility: roomObj.visibility || 'public',
-        isLive: !!roomObj.isLive
+        isLive: !!roomObj.isLive,
+        liveSessionId: roomObj.liveSessionId || null,
+        liveStartedAt: roomObj.liveStartedAt || null,
+        liveEndedAt: roomObj.liveEndedAt || roomObj.endedAt || null,
+        gracePeriodEndsAt: roomObj.gracePeriodEndsAt || null
       },
       agoraToken: token,
       channelName,
       appId: appId,
+      startedNewSession: startedNewAudioSession,
       userRole: userRole === RtcRole.PUBLISHER ? 'speaker' : 'audience'
     });
   } catch (error) {
@@ -5555,7 +5872,7 @@ app.post('/audio-room/host-exit', async (req, res) => {
 
 app.post('/rooms/end', async (req, res) => {
   try {
-    const { roomId, hostId } = req.body;
+    const { roomId, hostId, forceEndSession = false } = req.body;
     if (!roomId || !hostId) return res.status(400).json({ success: false, error: "Missing properties context" });
 
     const stringRoomId = roomId.toString();
@@ -5604,7 +5921,7 @@ app.post('/rooms/end', async (req, res) => {
     }
 
     const occupancy = await getAudioRoomOccupancy(room, stringRoomId, hostId);
-    if (occupancy.hasUsersInside) {
+    if (occupancy.hasUsersInside && forceEndSession !== true) {
       return res.status(409).json({
         success: false,
         keptOpen: true,
@@ -5612,17 +5929,11 @@ app.post('/rooms/end', async (req, res) => {
       });
     }
 
-    room.isLive = false;
-    room.speakers = [];
-    room.audience = [];
-    room.endedAt = new Date();
-    await room.save();
-    clearRoomEmptyAudienceTimer(stringRoomId);
-    delete roomKeepOpenRooms[stringRoomId];
-    delete roomControllers[stringRoomId];
-
-    io.to(stringRoomId).emit('audio_room_ended', {
-      message: "The live audio room has been closed by the host."
+    await markAudioRoomOffline({
+      roomId: stringRoomId,
+      reason: 'host_ended_live_session',
+      expectedLiveSessionId: room.liveSessionId || null,
+      message: 'The live audio room has been closed by the host.',
     });
 
     return res.status(200).json({ success: true, message: "Room closed cleanly." });
@@ -5908,6 +6219,9 @@ app.get('/live-rooms', async (req, res) => {
       host: room.hostId || null,
       isPermanent: !!room.isPermanent,
       visibility: room.visibility || 'public',
+      isLive: !!room.isLive,
+      liveSessionId: room.liveSessionId || null,
+      liveStartedAt: room.liveStartedAt || null,
       speakerCount: Array.isArray(room.speakers) ? room.speakers.length : 0,
       audienceCount: Array.isArray(room.audience) ? room.audience.length : 0,
       createdAt: room.createdAt,
@@ -5982,6 +6296,8 @@ app.get('/rooms', async (req, res) => {
       roomTag: room.roomTag || '',
       host: room.hostId,
       hostId: room.hostId?._id || room.hostId,
+      isLive: !!room.isLive,
+      liveSessionId: room.liveSessionId || null,
       speakerCount: room.speakers.length,
       audienceCount: room.audience.length,
       createdAt: room.createdAt
@@ -7315,10 +7631,54 @@ const requireOfficial = async (req, res, next) => {
   }
 };
 
+const DEFAULT_HOME_PROMO_BANNERS = [
+  { id: 'default-home-banner-1', url: 'https://lh3.googleusercontent.com/u/0/d/135A9cpqQqO3dt5b4ITKeKKDRKtmJlM1c', active: true, sortOrder: 0 },
+  { id: 'default-home-banner-2', url: 'https://picsum.photos/200/300?3', active: true, sortOrder: 1 },
+];
+
+const normalizeHomePromoBanners = (value, { activeOnly = false } = {}) => {
+  const banners = Array.isArray(value) ? value : [];
+  return banners
+    .map((banner, index) => ({
+      id: String(banner?.id || `home-banner-${index + 1}`),
+      url: String(banner?.url || '').trim(),
+      active: banner?.active !== false,
+      sortOrder: Number.isFinite(Number(banner?.sortOrder)) ? Number(banner.sortOrder) : index,
+    }))
+    .filter(banner => banner.url && (!activeOnly || banner.active))
+    .sort((a, b) => a.sortOrder - b.sortOrder);
+};
+
+const uploadHomePromoBanner = async (dataUri) => {
+  const cleanDataUri = String(dataUri || '').trim();
+  if (!cleanDataUri.startsWith('data:image/')) {
+    throw new Error('Invalid banner image.');
+  }
+
+  const result = await cloudinary.uploader.upload(cleanDataUri, {
+    folder: 'official-home-banners',
+    resource_type: 'image',
+    overwrite: false,
+    transformation: [
+      { width: 1200, height: 480, crop: 'fill', gravity: 'auto', quality: 'auto', fetch_format: 'auto' }
+    ],
+  });
+
+  return result.secure_url || result.url || '';
+};
+
 app.get('/app-config', async (req, res) => {
   try {
-    const roomGames = await AppConfig.findOne({ key: 'roomGamesEnabled' }).lean();
-    return res.json({ success: true, roomGamesEnabled: roomGames?.value === true });
+    const [roomGames, homePromoBannersConfig] = await Promise.all([
+      AppConfig.findOne({ key: 'roomGamesEnabled' }).lean(),
+      AppConfig.findOne({ key: 'homePromoBanners' }).lean(),
+    ]);
+    const bannerSource = homePromoBannersConfig ? homePromoBannersConfig.value : DEFAULT_HOME_PROMO_BANNERS;
+    return res.json({
+      success: true,
+      roomGamesEnabled: roomGames?.value === true,
+      homePromoBanners: normalizeHomePromoBanners(bannerSource, { activeOnly: true }),
+    });
   } catch (error) {
     return res.status(500).json({ success: false, message: error.message });
   }
@@ -8441,8 +8801,16 @@ app.get('/admin/dashboard', requireOfficial, async (req, res) => {
 
 app.get('/admin/app-config', requireOfficial, async (req, res) => {
   try {
-    const roomGames = await AppConfig.findOne({ key: 'roomGamesEnabled' }).lean();
-    return res.json({ success: true, roomGamesEnabled: roomGames?.value === true });
+    const [roomGames, homePromoBannersConfig] = await Promise.all([
+      AppConfig.findOne({ key: 'roomGamesEnabled' }).lean(),
+      AppConfig.findOne({ key: 'homePromoBanners' }).lean(),
+    ]);
+    const bannerSource = homePromoBannersConfig ? homePromoBannersConfig.value : DEFAULT_HOME_PROMO_BANNERS;
+    return res.json({
+      success: true,
+      roomGamesEnabled: roomGames?.value === true,
+      homePromoBanners: normalizeHomePromoBanners(bannerSource),
+    });
   } catch (error) {
     return res.status(500).json({ success: false, message: error.message });
   }
@@ -8457,6 +8825,45 @@ app.patch('/admin/app-config/room-games', requireOfficial, async (req, res) => {
       { upsert: true, new: true, setDefaultsOnInsert: true }
     );
     return res.json({ success: true, roomGamesEnabled });
+  } catch (error) {
+    return res.status(500).json({ success: false, message: error.message });
+  }
+});
+
+app.patch('/admin/app-config/home-banners', requireOfficial, async (req, res) => {
+  try {
+    if (!Array.isArray(req.body?.banners)) {
+      return res.status(400).json({ success: false, message: 'Banners must be an array.' });
+    }
+    if (req.body.banners.length > 10) {
+      return res.status(400).json({ success: false, message: 'A maximum of 10 home banners is allowed.' });
+    }
+
+    const savedBanners = [];
+    for (let index = 0; index < req.body.banners.length; index += 1) {
+      const banner = req.body.banners[index] || {};
+      const uploadedUrl = banner.imageData ? await uploadHomePromoBanner(banner.imageData) : '';
+      const url = uploadedUrl || String(banner.url || '').trim();
+      if (!url || !/^https?:\/\//i.test(url)) {
+        return res.status(400).json({ success: false, message: `Banner ${index + 1} requires a valid image URL or file.` });
+      }
+
+      savedBanners.push({
+        id: String(banner.id || `home-banner-${Date.now()}-${index + 1}`),
+        url,
+        active: banner.active !== false,
+        sortOrder: Number.isFinite(Number(banner.sortOrder)) ? Number(banner.sortOrder) : index,
+      });
+    }
+
+    const normalizedBanners = normalizeHomePromoBanners(savedBanners);
+    await AppConfig.findOneAndUpdate(
+      { key: 'homePromoBanners' },
+      { $set: { value: normalizedBanners } },
+      { upsert: true, new: true, setDefaultsOnInsert: true }
+    );
+
+    return res.json({ success: true, homePromoBanners: normalizedBanners });
   } catch (error) {
     return res.status(500).json({ success: false, message: error.message });
   }
@@ -11149,6 +11556,29 @@ app.use((req, res) => {
 server.listen(PORT, () => {
   console.log(`Server listening on port ${PORT}`);
 });
+
+const initializeAudioRoomLifecycleRecovery = async () => {
+  try {
+    await recoverAudioRoomGracePeriods();
+    await closeStaleLiveRooms();
+  } catch (error) {
+    console.log('Audio room lifecycle recovery error:', error);
+  }
+};
+
+if (mongoose.connection.readyState === 1) {
+  initializeAudioRoomLifecycleRecovery();
+} else {
+  mongoose.connection.once('connected', initializeAudioRoomLifecycleRecovery);
+}
+
+const audioRoomLifecycleSweep = setInterval(() => {
+  if (mongoose.connection.readyState !== 1) return;
+  closeStaleLiveRooms().catch(error => {
+    console.log('Audio room lifecycle sweep error:', error);
+  });
+}, 60000);
+audioRoomLifecycleSweep.unref?.();
 
 
 
